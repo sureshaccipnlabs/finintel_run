@@ -1,0 +1,19 @@
+employee,project,date,hours,billing_rate,cost_rate
+Alice Johnson,Website Redesign,2024-01-08,8,150,80
+Alice Johnson,Website Redesign,2024-01-15,6,150,80
+Alice Johnson,Mobile App,2024-01-22,8,150,80
+Bob Smith,Mobile App,2024-01-09,9,120,70
+Bob Smith,Mobile App,2024-01-16,8,120,70
+Bob Smith,Data Pipeline,2024-01-23,7,120,70
+Carol White,Website Redesign,2024-01-10,7,180,95
+Carol White,Data Pipeline,2024-01-17,8,180,95
+Carol White,Data Pipeline,2024-01-24,9,180,95
+Dave Brown,Mobile App,2024-02-05,10,100,60
+Dave Brown,Website Redesign,2024-02-12,8,100,60
+Eve Davis,Data Pipeline,2024-02-06,7,160,85
+Eve Davis,Mobile App,2024-02-13,8,160,85
+Eve Davis,Website Redesign,2024-02-20,6,160,85
+Frank Lee,Data Pipeline,2024-03-04,9,140,75
+Frank Lee,Mobile App,2024-03-11,8,140,75
+Grace Kim,Website Redesign,2024-03-05,7,170,90
+Grace Kim,Data Pipeline,2024-03-12,8,170,90

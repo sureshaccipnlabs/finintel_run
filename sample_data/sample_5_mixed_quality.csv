@@ -1,0 +1,13 @@
+staff,account,service_date,time_spent,charge_rate,resource_cost
+Alice Johnson,Acme Corp,Jan 08 2024,8,150,80
+Bob Smith,Globex Ltd,Jan 09 2024,9,120,70
+Carol White,Acme Corp,Jan 10 2024,7,180,95
+Dave Brown,Initech,Jan 11 2024,8,100,60
+,Umbrella Co,Jan 12 2024,8,160,85
+Frank Lee,,Jan 13 2024,9,140,75
+Grace Kim,Acme Corp,BAD DATE,8,170,90
+Henry Park,Globex Ltd,Jan 15 2024,-3,130,72
+Iris Chen,Initech,Jan 16 2024,8,145,78
+Jack Wilson,Umbrella Co,Jan 17 2024,8,155,83
+Karen Zhang,Acme Corp,Jan 18 2024,8,165,88
+Leo Martinez,Globex Ltd,Jan 19 2024,7,125,67

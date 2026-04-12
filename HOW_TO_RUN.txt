@@ -1,0 +1,111 @@
+=========================================
+  FinIntel AI — How to Run (Beginner Guide)
+=========================================
+
+STEP 1 — Make sure Python is installed
+---------------------------------------
+Open your Terminal (Mac/Linux) or Command Prompt (Windows) and type:
+    python --version
+    
+You should see something like "Python 3.10.x"
+If not, download Python from: https://www.python.org/downloads/
+
+
+STEP 2 — Install required libraries
+--------------------------------------
+In your terminal, run this one command:
+
+    pip install pandas openpyxl pdfplumber chardet
+
+Wait for it to finish (takes ~30 seconds).
+
+
+STEP 3 — Download and place the files
+--------------------------------------
+Make sure your folder looks like this:
+
+    finintel_run/
+    ├── run.py                        ← the script you run
+    ├── ingestion/
+    │   ├── __init__.py
+    │   ├── field_config.py
+    │   ├── field_mapper.py
+    │   ├── file_reader.py
+    │   ├── ingest.py
+    │   └── record_parser.py
+    └── sample_data/
+        ├── sample_1_consulting_clean.csv
+        ├── sample_2_messy_realworld.csv
+        ├── sample_3_european_format.csv
+        ├── sample_4_days_format.csv
+        └── sample_5_mixed_quality.csv
+
+
+STEP 4 — Run the program
+--------------------------
+Open terminal, go to the finintel_run folder:
+
+    cd finintel_run
+
+Then run:
+
+    python run.py
+
+That's it! You'll see results for all 5 sample files.
+
+
+STEP 5 — Test YOUR OWN file
+------------------------------
+Put your CSV or Excel file inside the finintel_run folder, then:
+
+    python run.py yourfile.csv
+    python run.py yourfile.xlsx
+
+Results are saved as JSON in:  finintel_run/output/
+
+
+=========================================
+  SAMPLE FILES EXPLAINED
+=========================================
+
+sample_1_consulting_clean.csv
+  → Standard clean data, perfect column names
+  → 18 records, all valid ✓
+
+sample_2_messy_realworld.csv
+  → "Emp Name", "Hrs Worked", "$150" rate format
+  → Has 1 record with 26 hours (flagged as INVALID)
+  → Has 1 record with missing hours (flagged)
+
+sample_3_european_format.csv
+  → Semicolon (;) delimited
+  → Dates in DD.MM.YYYY format (01.02.2024)
+  → All detected and parsed correctly ✓
+
+sample_4_days_format.csv
+  → Column is "days" not "hours"
+  → 1 day = 8 hours (auto-converted)
+  → "consultant" mapped to employee, "engagement" to project ✓
+
+sample_5_mixed_quality.csv
+  → Mix of good and bad records
+  → 1 row with missing employee name
+  → 1 row with bad date ("BAD DATE")
+  → 1 row with negative hours (-3)
+  → All flagged but kept in output ✓
+
+
+=========================================
+  COMMON ERRORS AND FIXES
+=========================================
+
+Error: "ModuleNotFoundError: No module named 'pandas'"
+Fix:   Run:  pip install pandas openpyxl pdfplumber chardet
+
+Error: "No such file or directory"
+Fix:   Make sure you're inside the finintel_run folder
+       Run: cd finintel_run  first
+
+Error: "python not found"
+Fix:   Try:  python3 run.py  instead of  python run.py
+
