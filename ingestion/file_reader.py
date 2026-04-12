@@ -153,3 +153,26 @@ def _clean_rows(rows: list[dict]) -> list[dict]:
         cleaned.append(clean)
     return cleaned
 
+if __name__ == "__main__":
+    import json
+    from pathlib import Path
+
+    BASE_DIR = Path(__file__).resolve().parent.parent
+    filepath = BASE_DIR / "sample_data/sample_2_messy_realworld.csv"
+
+    rows, meta = read_file(filepath)
+
+    result = {
+        "file_meta": meta,
+        "rows": rows[:5]
+    }
+
+    print(json.dumps(result, indent=2))
+
+    out_dir = Path("output")
+    out_dir.mkdir(exist_ok=True)
+
+    out_file = out_dir / "file_reader_output.json"
+    out_file.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+    print(f"\nSaved to: {out_file}")
