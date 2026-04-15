@@ -10,17 +10,63 @@ from .file_reader import read_file
 from .field_mapper import build_column_mapping, mapping_report, apply_mapping
 from .record_parser import parse_record
 
-
-def ingest_file(filepath: str, time_range: Optional[str] = None) -> dict:
+def ingest_file(filepath: str, time_range=None) -> dict:
     errors = []
 
+    # 🔥 STEP 1: Handle Excel Timesheet (NEW FLOW)
+    if filepath.lower().endswith((".xlsx", ".xls")):
+        try:
+            from .timesheet_parser import parse_timesheet
+
+            ts_result = parse_timesheet(filepath)
+
+            all_records = []
+
+            sheets = ts_result.get("sheets", {})
+            for sheet in sheets.values():
+                employees = sheet.get("employees", [])
+                all_records.extend(employees)
+
+            return {
+                "file_meta": {
+                    "type": "timesheet_excel",
+                    "file": ts_result.get("file"),
+                },
+                "column_mapping": {},
+                "records": all_records,
+                "summary": {},  # we will improve later
+                "errors": [],
+            }
+
+        except Exception as e:
+            return {
+                "errors": [str(e)],
+                "records": [],
+                "file_meta": {},
+                "column_mapping": {},
+                "summary": {},
+            }
+
+    # 🔥 STEP 2: OLD FLOW (CSV ONLY)
     try:
         raw_rows, file_meta = read_file(filepath)
     except Exception as e:
-        return {"errors": [str(e)], "records": [], "file_meta": {}, "column_mapping": {}, "summary": {}}
+        return {
+            "errors": [str(e)],
+            "records": [],
+            "file_meta": {},
+            "column_mapping": {},
+            "summary": {},
+        }
 
     if not raw_rows:
-        return {"errors": ["File is empty or no data rows found."], "records": [], "file_meta": file_meta, "column_mapping": {}, "summary": {}}
+        return {
+            "errors": ["File is empty or no data rows found."],
+            "records": [],
+            "file_meta": file_meta,
+            "column_mapping": {},
+            "summary": {},
+        }
 
     raw_columns = list(raw_rows[0].keys())
     mapping = build_column_mapping(raw_columns)
@@ -37,6 +83,7 @@ def ingest_file(filepath: str, time_range: Optional[str] = None) -> dict:
 
     records = []
     parse_errors = 0
+
     for i, row in enumerate(mapped_rows):
         try:
             parsed = parse_record(row)
@@ -44,10 +91,11 @@ def ingest_file(filepath: str, time_range: Optional[str] = None) -> dict:
             records.append(parsed)
         except Exception as e:
             parse_errors += 1
-            errors.append({"type": "PARSE_ERROR", "row": i + 2, "detail": str(e)})
-
-    if time_range and records:
-        records = _apply_time_filter(records, time_range)
+            errors.append({
+                "type": "PARSE_ERROR",
+                "row": i + 2,
+                "detail": str(e)
+            })
 
     summary = _build_summary(records, file_meta, report, parse_errors, time_range)
 
@@ -58,7 +106,6 @@ def ingest_file(filepath: str, time_range: Optional[str] = None) -> dict:
         "summary": summary,
         "errors": errors,
     }
-
 
 def _apply_time_filter(records, time_range):
     import datetime as dt

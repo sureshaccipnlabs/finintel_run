@@ -172,11 +172,8 @@ def main():
 
     # Otherwise run all 5 sample files
     sample_files = [
-        ("sample_data/sample_1_consulting_clean.csv",  "Clean standard data"),
-        ("sample_data/sample_2_messy_realworld.csv",   "Messy column names + bad data"),
-        ("sample_data/sample_3_european_format.csv",   "European format (semicolons + dot-dates)"),
-        ("sample_data/sample_4_days_format.csv",       "Days-based timesheet"),
-        ("sample_data/sample_5_mixed_quality.csv",     "Mixed quality data"),
+        ("sample_data/Proofpoint - Timesheet for MARCH-2026.xlsx", "ProofPoint Timesheet"),
+        ("sample_data/TMV_Timesheet_March_2026.xlsx", "TMV Timesheet"),
     ]
 
     print(bold("\n  FinIntel AI — Ingestion Engine Test Runner"))

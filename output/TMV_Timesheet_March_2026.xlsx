@@ -1,0 +1,9 @@
+{
+  "errors": [
+    "'int' object has no attribute 'strip'"
+  ],
+  "records": [],
+  "file_meta": {},
+  "column_mapping": {},
+  "summary": {}
+}

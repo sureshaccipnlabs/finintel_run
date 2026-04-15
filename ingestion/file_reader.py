@@ -8,6 +8,7 @@ import io
 import re
 from pathlib import Path
 from typing import Optional
+from .timesheet_parser import parse_timesheet
 
 import chardet
 import pandas as pd
@@ -39,10 +40,18 @@ def read_file(filepath: str) -> tuple[list[dict], dict]:
     if ext in (".csv", ".tsv", ".txt"):
         return _read_delimited(path, ext)
     elif ext in (".xlsx", ".xls"):
-        return _read_excel(path)
+        return _read_timesheet(path)
     elif ext == ".pdf":
         return _read_pdf(path)
 
+
+def _read_timesheet(path):
+    records = parse_timesheet(str(path))  # already list of dicts
+
+    return records, {
+        "type": "timesheet_excel",
+        "sheets": ["parsed"]  # or keep actual if needed
+    }
 
 def _read_delimited(path: Path, ext: str) -> tuple[list[dict], dict]:
     raw = path.read_bytes()
