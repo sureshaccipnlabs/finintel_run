@@ -9,6 +9,7 @@ from typing import Optional
 from .file_reader import read_file
 from .field_mapper import build_column_mapping, mapping_report, apply_mapping
 from .record_parser import parse_record
+from .dataset import append_records
 
 def ingest_file(filepath: str, time_range: Optional[str] = None, original_filename: Optional[str] = None) -> dict:
     errors = []
@@ -31,6 +32,12 @@ def ingest_file(filepath: str, time_range: Optional[str] = None, original_filena
                 target_month = f"{month_match.group(1)}'{month_match.group(2)[-2:]}"
 
             ts_result = parse_timesheet(filepath, target_month=target_month)
+
+            all_employees = []
+            for sheet in ts_result.get("sheets", {}).values():
+                all_employees.extend(sheet.get("employees", []))
+            append_records(all_employees, filename=original_filename or filepath)
+
             return ts_result
 
         except Exception as e:
@@ -76,6 +83,8 @@ def ingest_file(filepath: str, time_range: Optional[str] = None, original_filena
 
     if time_range and records:
         records = _apply_time_filter(records, time_range)
+
+    append_records(records, filename=original_filename or filepath)
 
     summary = _build_summary(records, file_meta, report, parse_errors, time_range)
 
