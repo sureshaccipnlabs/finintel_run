@@ -9,6 +9,8 @@ from ingestion.dataset import (
     build_top_performers, build_risks, get_months_available,
     clear as clear_dataset,
 )
+from ingestion.qa_engine import ask as qa_ask
+from ingestion.risk_engine import get_risks_and_recommendations
 import tempfile
 import os
 
@@ -128,15 +130,21 @@ def get_risks():
     }
 
 
-# ── POST /ask — Natural language Q&A ────────────────────────────────────
+# ── GET /risks-recommendations — Risk analysis + AI recommendations ──────
+@app.get("/risks-recommendations")
+def risks_and_recommendations(range: Optional[str] = None):
+    return get_risks_and_recommendations(time_range=range)
+
+
+# ── POST /ask — Natural language Q&A (LLM-powered) ──────────────────────
 class AskRequest(BaseModel):
     query: str
+    time_range: Optional[str] = None
 
 
 @app.post("/ask")
 def ask_question(req: AskRequest):
-    answer, sources = _handle_qa(req.query)
-    return {"answer": answer, "sources": sources}
+    return qa_ask(req.query, time_range=req.time_range)
 
 
 # ── DELETE /dataset — Reset ─────────────────────────────────────────────
@@ -146,86 +154,3 @@ def reset_dataset():
     return {"status": "cleared", "records": 0}
 
 
-# ── Q&A Engine (deterministic keyword-based) ────────────────────────────
-def _handle_qa(query: str):
-    q = query.lower()
-    records = GLOBAL_DATASET
-
-    if not records:
-        return "No data loaded. Please upload timesheets first via POST /ingest.", []
-
-    if "risk" in q or "at risk" in q:
-        risks = build_risks(records)
-        if not risks:
-            return "No risks detected. All employees are profitable with healthy metrics.", []
-        summary_lines = []
-        for r in risks[:10]:
-            summary_lines.append(f"- {r['employee']} ({r.get('month', '')}): {r['issue']}")
-        return f"Found {len(risks)} risk(s):\n" + "\n".join(summary_lines), risks[:10]
-
-    if "underperform" in q or "low perform" in q or "worst" in q:
-        emp_profit = {}
-        for r in records:
-            name = r.get("employee", "")
-            emp_profit[name] = emp_profit.get(name, 0) + r.get("profit", 0)
-        ranked = sorted(emp_profit.items(), key=lambda x: x[1])
-        bottom = ranked[:5]
-        lines = [f"- {name}: ${pft:,.2f} profit" for name, pft in bottom]
-        return "Lowest performing employees by profit:\n" + "\n".join(lines), [{"employee": n, "profit": round(p, 2)} for n, p in bottom]
-
-    if "top perform" in q or "best" in q:
-        top = build_top_performers(records, limit=5)
-        lines = [f"- {t['employee']}: ${t['total_profit']:,.2f} profit" for t in top]
-        return "Top performing employees:\n" + "\n".join(lines), top
-
-    if "project" in q:
-        projects = build_projects(records)
-        lines = []
-        for name, data in sorted(projects.items(), key=lambda x: x[1]["profit"], reverse=True):
-            lines.append(f"- {name}: Revenue ${data['revenue']:,.2f}, Cost ${data['cost']:,.2f}, Profit ${data['profit']:,.2f}")
-        return "Project summary:\n" + "\n".join(lines), projects
-
-    if any(w in q for w in ["last 3 month", "3m", "3 month", "quarter"]):
-        filtered = filter_by_range(records, "3M")
-        summary = build_overall_summary(filtered)
-        months = get_months_available(filtered)
-        return (
-            f"Last 3 months ({', '.join(months)}):\n"
-            f"- Revenue: ${summary['total_revenue']:,.2f}\n"
-            f"- Cost: ${summary['total_cost']:,.2f}\n"
-            f"- Profit: ${summary['total_profit']:,.2f}\n"
-            f"- Margin: {summary['avg_margin_pct']}%\n"
-            f"- Employees: {summary['total_employees']}"
-        ), summary
-
-    if any(w in q for w in ["revenue", "cost", "profit", "margin", "summary", "overall"]):
-        summary = build_overall_summary(records)
-        months = get_months_available(records)
-        return (
-            f"Overall summary ({len(months)} months):\n"
-            f"- Revenue: ${summary['total_revenue']:,.2f}\n"
-            f"- Cost: ${summary['total_cost']:,.2f}\n"
-            f"- Profit: ${summary['total_profit']:,.2f}\n"
-            f"- Margin: {summary['avg_margin_pct']}%\n"
-            f"- Employees: {summary['total_employees']}"
-        ), summary
-
-    if "employee" in q or "who" in q:
-        unique = sorted({r.get("employee", "") for r in records})
-        return f"Employees in dataset ({len(unique)}):\n" + "\n".join(f"- {e}" for e in unique), unique
-
-    if "month" in q:
-        months = get_months_available(records)
-        return f"Available months ({len(months)}):\n" + "\n".join(f"- {m}" for m in months), months
-
-    return (
-        "I can answer questions about:\n"
-        "- 'Which project is at risk?'\n"
-        "- 'Who is underperforming?'\n"
-        "- 'Show top performers'\n"
-        "- 'Show last 3 months performance'\n"
-        "- 'What is the overall revenue?'\n"
-        "- 'List all employees'\n"
-        "- 'Show project summary'\n"
-        "\nPlease rephrase your question."
-    ), []
