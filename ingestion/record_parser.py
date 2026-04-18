@@ -1,175 +1,123 @@
 """
-record_parser.py — type-cast and clean each mapped record.
-Handles: date parsing (many formats), numeric coercion, days→hours conversion,
-         missing value defaults, per-record validation flags.
+record_parser.py — Parses a single mapped row into canonical format.
 """
 
-import re
-from datetime import date, datetime
-from typing import Optional
-
-from .field_config import DATE_FORMATS, OPTIONAL_FIELDS, REQUIRED_FIELDS
+from typing import Dict, Any, List
+from datetime import datetime
 
 
-# ── Date parsing ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-def parse_date(raw: str) -> Optional[date]:
-    if not raw or raw.strip() == "":
-        return None
-    raw = raw.strip()
-
-    # Try standard formats
-    for fmt in DATE_FORMATS:
-        try:
-            return datetime.strptime(raw, fmt).date()
-        except ValueError:
-            continue
-
-    # Try pandas as fallback (handles many ambiguous formats)
+def to_float(v):
     try:
-        import pandas as pd
-        return pd.to_datetime(raw, dayfirst=False).date()
-    except Exception:
-        pass
-
-    return None
-
-
-# ── Numeric parsing ───────────────────────────────────────────────────────────
-
-def parse_float(raw: str) -> Optional[float]:
-    if not raw or raw.strip() == "":
+        return float(v) if v is not None else None
+    except:
         return None
-    # Strip currency symbols, commas, percent signs
-    cleaned = re.sub(r"[£$€¥,% ]", "", str(raw).strip())
+
+
+def normalize_employee(name: str) -> str:
+    if not name:
+        return None
+    return " ".join(str(name).strip().title().split())
+
+
+def normalize_project(name: str) -> str:
+    if not name:
+        return None
+    return str(name).replace("-", "").replace(" ", "").lower()
+
+
+def normalize_month(m):
+    if not m:
+        return None
     try:
-        return float(cleaned)
-    except ValueError:
-        return None
+        return datetime.strptime(m, "%B %Y").strftime("%Y-%m")
+    except:
+        return str(m)
 
 
-def parse_hours(raw: str, field_name: str = "hours") -> Optional[float]:
-    """Parse hours — if original column looked like 'days', convert ×8."""
-    val = parse_float(raw)
-    if val is None:
-        return None
-    # If column name suggested days (captured in extra_ prefix earlier),
-    # days flag is passed in via field_name hint
-    if "day" in field_name.lower():
-        val = val * 8.0
-    return val
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Parser
+# ─────────────────────────────────────────────────────────────────────────────
 
+def parse_record(row: Dict[str, Any]) -> Dict[str, Any]:
+    flags: List[str] = []
 
-# ── Per-record validation flags ───────────────────────────────────────────────
+    # Extract fields
+    employee = normalize_employee(row.get("employee"))
+    project = normalize_project(row.get("project"))
+    month = normalize_month(row.get("month"))
 
-def validate_record(record: dict) -> list[str]:
-    flags = []
+    hours = to_float(row.get("hours"))
+    billing_rate = to_float(row.get("billing_rate"))
+    cost_rate = to_float(row.get("cost_rate"))
 
-    hours = record.get("hours")
-    if hours is None:
-        flags.append("MISSING_HOURS")
-    elif hours > 24:
-        flags.append("INVALID_HOURS")
-    elif hours <= 0:
-        flags.append("ZERO_OR_NEGATIVE_HOURS")
+    # Defaults
+    actual_hours = hours or 0
+    billable_hours = hours or 0
+    working_days = round(actual_hours / 8, 2) if actual_hours else 0
+    vacation_days = 0
 
-    if record.get("billing_rate") is None:
-        flags.append("MISSING_BILLING")
+    # ─────────────────────────────────────────
+    # Financial Calculations
+    # ─────────────────────────────────────────
 
-    if record.get("cost_rate") is None:
-        flags.append("MISSING_COST")
+    # Revenue
+    if billing_rate:
+        revenue = round(billable_hours * billing_rate, 2)
+    else:
+        revenue = None
+        flags.append("MISSING_BILLING_RATE")
 
-    if record.get("date") is None:
-        flags.append("MISSING_DATE")
+    # Cost
+    if cost_rate and cost_rate != 0:
+        cost = round(actual_hours * cost_rate, 2)
+    else:
+        cost = None
+        flags.append("MISSING_COST_RATE")
 
-    if not record.get("employee"):
-        flags.append("MISSING_EMPLOYEE")
+    # Profit
+    if revenue is not None and cost is not None:
+        profit = round(revenue - cost, 2)
+    else:
+        profit = None
 
-    if not record.get("project"):
-        flags.append("MISSING_PROJECT")
+    # Margin
+    if revenue and profit is not None and revenue > 0:
+        margin_pct = round((profit / revenue) * 100, 2)
+    else:
+        margin_pct = None
 
-    return flags
+    # Utilisation
+    utilisation_pct = round((actual_hours / (actual_hours or 1)) * 100, 2) if actual_hours else 0
 
+    # Flags
+    if margin_pct is not None and margin_pct < 10:
+        flags.append("LOW_MARGIN")
+    if margin_pct is not None and margin_pct < 0:
+        flags.append("LOSS_MAKING")
 
-# ── Metrics computation ───────────────────────────────────────────────────────
-
-def compute_metrics(record: dict) -> dict:
-    hours = record.get("hours") or 0.0
-    br = record.get("billing_rate")
-    cr = record.get("cost_rate")
-
-    revenue = round(hours * br, 2) if br is not None else None
-    cost = round(hours * cr, 2) if cr is not None else None
-    profit = round(revenue - cost, 2) if (revenue is not None and cost is not None) else None
-    margin = round((profit / revenue) * 100, 2) if (profit is not None and revenue and revenue > 0) else None
+    # ─────────────────────────────────────────
+    # Final Record
+    # ─────────────────────────────────────────
 
     return {
+        "employee": employee,
+        "project": project,
+        "month": month,
+        "actual_hours": actual_hours,
+        "billable_hours": billable_hours,
+        "working_days": working_days,
+        "vacation_days": vacation_days,
+        "billing_rate": billing_rate,
+        "cost_rate": cost_rate,
         "revenue": revenue,
         "cost": cost,
         "profit": profit,
-        "margin_pct": margin,
-    }
-
-
-# ── Time features ─────────────────────────────────────────────────────────────
-
-def time_features(d: Optional[date]) -> dict:
-    if d is None:
-        return {"month": None, "quarter": None, "year": None,
-                "month_label": None, "quarter_label": None}
-    q = (d.month - 1) // 3 + 1
-    return {
-        "month": d.month,
-        "year": d.year,
-        "quarter": q,
-        "month_label": d.strftime("%Y-%m"),
-        "quarter_label": f"{d.year}-Q{q}",
-    }
-
-
-# ── Main record parser ────────────────────────────────────────────────────────
-
-def parse_record(raw_record: dict) -> dict:
-    """
-    Take a single mapped row dict and return a fully typed, validated,
-    metrics-enriched record dict.
-    """
-    # Parse each canonical field
-    employee = (raw_record.get("employee") or "").strip() or None
-    project = (raw_record.get("project") or "").strip() or None
-    date_val = parse_date(raw_record.get("date") or "")
-    # Find the original raw column name that was mapped to hours (stored as extra hint)
-    hours_raw_key = raw_record.get("_hours_original_col", "hours")
-    hours = parse_hours(raw_record.get("hours") or "", hours_raw_key)
-    billing_rate = parse_float(raw_record.get("billing_rate") or "")
-    cost_rate = parse_float(raw_record.get("cost_rate") or "")
-
-    # Collect any extra_ columns
-    extras = {k: v for k, v in raw_record.items() if k.startswith("extra_")}
-
-    base = {
-        "employee": employee,
-        "project": project,
-        "date": date_val.isoformat() if date_val else None,
-        "hours": hours,
-        "billing_rate": billing_rate,
-        "cost_rate": cost_rate,
-    }
-
-    # Validate
-    flags = validate_record({**base, "date": date_val})
-
-    # Metrics
-    metrics = compute_metrics(base)
-
-    # Time features
-    tf = time_features(date_val)
-
-    return {
-        **base,
-        **metrics,
-        **tf,
+        "margin_pct": margin_pct,
+        "utilisation_pct": utilisation_pct,
         "validation_flags": flags,
-        "is_valid": len([f for f in flags if "MISSING_BILLING" not in f and "MISSING_COST" not in f]) == 0,
-        **extras,
+        "is_profitable": profit > 0 if profit is not None else None,
     }

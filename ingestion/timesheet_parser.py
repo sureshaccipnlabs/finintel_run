@@ -3,6 +3,8 @@ from datetime import datetime, date
 import os
 import re
 
+from .normalizer import normalize_record
+
 try:
     from .ai_mapper import ai_map_columns, ai_analyze_sheet, is_ollama_available
     _AI_AVAILABLE = True
@@ -522,7 +524,7 @@ def parse_timesheet(filepath, target_month=None):
             continue
 
         employees = [
-            _build_employee_record(name, data, month_label)
+            normalize_record(_build_employee_record(name, data, month_label))
             for name, data in merged.items()
         ]
 
