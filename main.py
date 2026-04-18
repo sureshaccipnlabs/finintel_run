@@ -6,7 +6,7 @@ from ingestion.ingest import ingest_file
 from ingestion.dataset import (
     GLOBAL_DATASET, transform_to_api_format, filter_by_range,
     build_projects, build_monthly, build_overall_summary,
-    build_top_performers, build_risks, get_months_available,
+    build_top_performers, get_months_available,
     clear as clear_dataset,
 )
 from ingestion.qa_engine import ask as qa_ask
@@ -120,14 +120,6 @@ def get_employees(range: Optional[str] = Query(None), project: Optional[str] = Q
         "employees": employees,
     }
 
-
-# ── GET /risks — All risk flags ─────────────────────────────────────────
-@app.get("/risks")
-def get_risks():
-    return {
-        "total_records": len(GLOBAL_DATASET),
-        "risks": build_risks(GLOBAL_DATASET),
-    }
 
 
 # ── GET /risks-recommendations — Risk analysis + AI recommendations ──────
