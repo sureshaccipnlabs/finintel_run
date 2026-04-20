@@ -24,14 +24,28 @@ def clear():
 def append_records(records: List[dict], filename: str = ""):
     if filename and filename not in _FILES_PROCESSED:
         _FILES_PROCESSED.append(filename)
+    skipped = 0
     for r in records:
+        emp  = r.get("employee") or ""
+        proj = r.get("project") or ""
+        mon  = r.get("month") or ""
+
+        # Skip records with no identifiable employee
+        if not emp or emp.lower() in ("unknown", "none", ""):
+            skipped += 1
+            continue
+
+        # Dedup: skip if identical employee+month+project already exists
         if not any(
-            existing["employee"] == r["employee"]
-            and existing["month"] == r["month"]
-            and existing["project"] == r["project"]
+            (existing.get("employee") or "") == emp
+            and (existing.get("month") or "") == mon
+            and (existing.get("project") or "") == proj
             for existing in GLOBAL_DATASET
         ):
             GLOBAL_DATASET.append(r)
+
+    if skipped:
+        print(f"[dataset] Skipped {skipped} records with missing employee name")
 
 
 def _parse_month_date(month_str: str) -> Optional[dt.date]:

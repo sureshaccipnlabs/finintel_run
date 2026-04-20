@@ -1,5 +1,11 @@
 """
 ingest.py — main entry point for FinIntel AI file ingestion.
+
+Supported formats:
+    .xlsx, .xls  → timesheet_parser (smart sheet analysis + AI column mapping)
+    .csv, .tsv   → file_reader → field_mapper (fuzzy + AI fallback) → record_parser
+    .txt         → auto-detect: delimited → CSV flow, freeform → LLM extraction
+    .pdf         → pdfplumber table extraction → field_mapper → record_parser
 """
 
 import json
@@ -10,11 +16,16 @@ from .file_reader import read_file
 from .field_mapper import build_column_mapping, mapping_report, apply_mapping
 from .record_parser import parse_record
 from .dataset import append_records
+from .text_parser import parse_freeform_text, is_freeform_text
 
 def ingest_file(filepath: str, time_range: Optional[str] = None, original_filename: Optional[str] = None) -> dict:
     errors = []
 
-    # 🔥 STEP 1: Handle Excel Timesheet (NEW FLOW)
+    # ── STEP 0: Freeform text detection (.txt that isn't delimited) ──────
+    if filepath.lower().endswith(".txt") and is_freeform_text(filepath):
+        return _ingest_freeform(filepath, time_range, original_filename)
+
+    # ── STEP 1: Excel Timesheet (.xlsx, .xls) ───────────────────────────
     if filepath.lower().endswith((".xlsx", ".xls")):
         try:
             import re as _re
@@ -48,7 +59,7 @@ def ingest_file(filepath: str, time_range: Optional[str] = None, original_filena
                 "errors": [str(e)],
             }
 
-    # 🔥 STEP 2: OLD FLOW (CSV ONLY)
+    # ── STEP 2: Delimited files (CSV, TSV, tabular TXT, PDF) ───────────
     try:
         raw_rows, file_meta = read_file(filepath)
     except Exception as e:
@@ -81,6 +92,21 @@ def ingest_file(filepath: str, time_range: Optional[str] = None, original_filena
             parse_errors += 1
             errors.append({"type": "PARSE_ERROR", "row": i + 2, "detail": str(e)})
 
+    # Report records missing required fields
+    invalid_count = sum(1 for r in records if not r.get("is_valid", True))
+    missing_emp = sum(1 for r in records if "MISSING_EMPLOYEE" in r.get("validation_flags", []))
+    missing_hrs = sum(1 for r in records if "MISSING_HOURS" in r.get("validation_flags", []))
+    if missing_emp:
+        errors.append({
+            "type": "MISSING_DATA_WARNING",
+            "details": f"{missing_emp} records have no employee name — these will be skipped",
+        })
+    if missing_hrs:
+        errors.append({
+            "type": "MISSING_DATA_WARNING",
+            "details": f"{missing_hrs} records have no hours data — financial calculations will be zero",
+        })
+
     if time_range and records:
         records = _apply_time_filter(records, time_range)
 
@@ -94,6 +120,65 @@ def ingest_file(filepath: str, time_range: Optional[str] = None, original_filena
         "records": records,
         "summary": summary,
         "errors": errors,
+    }
+
+
+def _ingest_freeform(filepath: str, time_range: Optional[str], original_filename: Optional[str]) -> dict:
+    """Parse freeform/unstructured text via LLM extraction."""
+    try:
+        with open(filepath, "r", errors="replace") as f:
+            raw_text = f.read()
+    except Exception as e:
+        return {"errors": [f"Could not read file: {e}"], "records": [], "file_meta": {}, "summary": {}}
+
+    records = parse_freeform_text(raw_text)
+
+    if not records:
+        return {
+            "errors": ["No employee records could be extracted from the text. "
+                       "Make sure the text contains financial/timesheet data."],
+            "records": [],
+            "file_meta": {
+                "filename": original_filename or filepath,
+                "file_type": "FREEFORM_TEXT",
+                "char_count": len(raw_text),
+            },
+            "summary": {},
+        }
+
+    if time_range:
+        records = _apply_time_filter(records, time_range)
+
+    append_records(records, filename=original_filename or filepath)
+
+    file_meta = {
+        "filename": original_filename or filepath,
+        "file_type": "FREEFORM_TEXT",
+        "char_count": len(raw_text),
+        "row_count": len(records),
+    }
+
+    revenues = [r["revenue"] for r in records if r.get("revenue")]
+    costs = [r["cost"] for r in records if r.get("cost")]
+    profits = [r["profit"] for r in records if r.get("profit")]
+    total_rev = round(sum(revenues), 2) if revenues else 0
+    total_cost = round(sum(costs), 2) if costs else 0
+    total_profit = round(sum(profits), 2) if profits else 0
+
+    return {
+        "file_meta": file_meta,
+        "column_mapping": {"method": "LLM_EXTRACTION"},
+        "records": records,
+        "summary": {
+            "total_records": len(records),
+            "projects": sorted({r["project"] for r in records if r.get("project")}),
+            "employees": sorted({r["employee"] for r in records if r.get("employee")}),
+            "total_revenue": total_rev,
+            "total_cost": total_cost,
+            "total_profit": total_profit,
+            "extraction_method": "freeform_llm",
+        },
+        "errors": [],
     }
 
 

@@ -54,6 +54,18 @@ def parse_record(row: Dict[str, Any]) -> Dict[str, Any]:
     billing_rate = to_float(row.get("billing_rate"))
     cost_rate = to_float(row.get("cost_rate"))
 
+    # Flag missing required fields
+    if not employee:
+        flags.append("MISSING_EMPLOYEE")
+        employee = "Unknown"
+    if not project:
+        flags.append("MISSING_PROJECT")
+        project = "unknown"
+    if not month:
+        flags.append("MISSING_MONTH")
+    if hours is None or hours == 0:
+        flags.append("MISSING_HOURS")
+
     # Defaults
     actual_hours = hours or 0
     billable_hours = hours or 0
@@ -120,4 +132,6 @@ def parse_record(row: Dict[str, Any]) -> Dict[str, Any]:
         "utilisation_pct": utilisation_pct,
         "validation_flags": flags,
         "is_profitable": profit > 0 if profit is not None else None,
+        "is_valid": len(flags) == 0,
+        "_source": "csv_parser",
     }
