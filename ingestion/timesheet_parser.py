@@ -54,7 +54,8 @@ FIELD_PATTERNS = {
 FIELD_EXCLUSIONS = {
     "name":          ["project", "client", "account", "engagement", "program",
                       "sow", "role"],
-    "project":       ["rate", "hour", "cost", "amount", "days", "billing"],
+    "project":       ["rate", "hour", "cost", "amount", "days", "billing",
+                      "role", "sow", "designation", "title"],
     "billing_rate":  ["final", "amount", "total", "cost", "ctc"],
     "cost_rate":     ["billing", "bill", "charge", "sell"],
     "actual_hours":  ["max", "approved", "budgeted", "billable"],
@@ -150,9 +151,11 @@ def _map_columns(header, fields=None):
             if key not in _ai_col_cache:
                 already = {f: i for f, i in mapped.items() if i is not None}
                 _ai_col_cache[key] = ai_map_columns(header, already_mapped=already)
+            claimed_indices = {i for i in mapped.values() if i is not None}
             for f, idx in _ai_col_cache[key].items():
-                if mapped.get(f) is None:
+                if mapped.get(f) is None and idx not in claimed_indices:
                     mapped[f] = idx
+                    claimed_indices.add(idx)
 
     return mapped
 
@@ -218,10 +221,25 @@ def _extract_project_from_metadata(rows):
 
 
 def _extract_month_label(rows, sheet_name):
+    # 1. Look for MONTH / YEAR label-value pairs in metadata rows
+    for i, row in enumerate(rows[:6]):
+        for j, v in enumerate(row):
+            label = clean(v).lower()
+            if label in ("month", "month name", "period", "billing month"):
+                month_val = _label_value(rows, i, j)
+                if month_val:
+                    year_val = _find_year_near(rows, i)
+                    if year_val:
+                        return f"{month_val.capitalize()} {year_val}"
+                    return month_val.capitalize()
+
+    # 2. Look for date objects in first few rows
     for row in rows[:5]:
         for cell in row:
             if is_date(cell):
                 return cell.strftime("%B %Y")
+
+    # 3. Regex on sheet name
     m = re.search(r"([A-Z]+)['\s\-]*(\d{2,4})", sheet_name, re.IGNORECASE)
     if m:
         yr = m.group(2)
@@ -229,6 +247,50 @@ def _extract_month_label(rows, sheet_name):
             yr = "20" + yr
         return f"{m.group(1).capitalize()} {yr}"
     return sheet_name
+
+
+def _label_value(rows, label_row, label_col):
+    """Get the value for a label — check cell below, then cell to the right."""
+    # Cell below
+    if label_row + 1 < len(rows):
+        below = rows[label_row + 1]
+        if label_col < len(below) and below[label_col]:
+            val = clean(below[label_col])
+            if val and val.lower() not in ("month", "year", "period", ""):
+                return val
+    # Cell to the right
+    row = rows[label_row]
+    for k in range(label_col + 1, min(label_col + 3, len(row))):
+        if row[k]:
+            val = clean(row[k])
+            if val and val.lower() not in ("year", ""):
+                return val
+    return None
+
+
+def _find_year_near(rows, label_row):
+    """Find a year value near a MONTH label row."""
+    row = rows[label_row]
+    for j, v in enumerate(row):
+        if clean(v).lower() in ("year", "yr", "calendar year"):
+            val = _label_value(rows, label_row, j)
+            if val:
+                try:
+                    yr = int(float(val))
+                    if 2000 <= yr <= 2100:
+                        return str(yr)
+                except (ValueError, TypeError):
+                    pass
+    # Also check if there's a plain number that looks like a year in the value row
+    if label_row + 1 < len(rows):
+        for cell in rows[label_row + 1]:
+            try:
+                yr = int(float(clean(str(cell)))) if cell else 0
+                if 2000 <= yr <= 2100:
+                    return str(yr)
+            except (ValueError, TypeError):
+                continue
+    return None
 
 
 # ── Unified data extractor ───────────────────────────────────────────────
@@ -494,93 +556,116 @@ def parse_timesheet(filepath, target_month=None):
         "sheets": {}
     }
 
-    for sheet_name in wb.sheetnames:
-        if target_month and not _match_target_month(sheet_name, target_month):
-            continue
-        ws = wb[sheet_name]
-        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    # Two-phase sheet selection:
+    #   Phase 1: Only sheets matching target_month (fast, precise)
+    #   Phase 2: ALL sheets (fallback if Phase 1 found nothing — handles
+    #            templates where sheet names don't match the actual month)
+    for phase in (1, 2):
+        if phase == 2 and result["sheets"]:
+            break  # Phase 1 found data, no need for Phase 2
 
-        if len(rows) < 3:
-            continue
+        for sheet_name in wb.sheetnames:
+            if sheet_name in result["sheets"]:
+                continue  # already processed
 
-        month_label = _extract_month_label(rows, sheet_name)
+            # Phase 1: skip non-matching sheets
+            if phase == 1 and target_month and not _match_target_month(sheet_name, target_month):
+                continue
 
-        # ── STRATEGY 1: Pattern-based parsing ─────────────────────────
-        merged = _parse_with_patterns(rows)
+            ws = wb[sheet_name]
+            rows = [list(r) for r in ws.iter_rows(values_only=True)]
 
-        # ── STRATEGY 2: AI fallback if patterns found nothing ─────────
-        if not merged:
-            merged = _parse_with_ai(rows, sheet_name)
+            if len(rows) < 3:
+                continue
 
-        if not merged:
-            continue
+            # Extract month from sheet CONTENT first (template-agnostic),
+            # fall back to sheet name, then to target_month from filename.
+            month_label = _extract_month_label(rows, sheet_name)
+            if target_month and month_label == sheet_name:
+                # Content extraction didn't find anything, use filename hint
+                mt = re.match(r"([A-Za-z]+)\D*(\d{2,4})", target_month)
+                if mt:
+                    yr = mt.group(2)
+                    if len(yr) == 2:
+                        yr = "20" + yr
+                    month_label = f"{mt.group(1).capitalize()} {yr}"
 
-        # Quality check: discard if no employee has meaningful data
-        has_data = any(
-            d.get("actual_hours") or d.get("expected_hours") or d.get("billing_rate")
-            for d in merged.values()
-        )
-        if not has_data:
-            continue
+            # ── STRATEGY 1: Pattern-based parsing ─────────────────────
+            merged = _parse_with_patterns(rows)
 
-        employees = [
-            normalize_record(_build_employee_record(name, data, month_label))
-            for name, data in merged.items()
-        ]
+            # ── STRATEGY 2: AI fallback if patterns found nothing ─────
+            if not merged:
+                merged = _parse_with_ai(rows, sheet_name)
 
-        # ── Per-sheet analytics ───────────────────────────────────────
-        projects = {}
-        for emp in employees:
-            proj = emp["project"] or "Unknown"
-            if proj not in projects:
-                projects[proj] = {"revenue": 0, "cost": 0, "profit": 0, "employees": 0}
-            projects[proj]["revenue"] += emp["revenue"]
-            projects[proj]["cost"]    += emp["cost"]
-            projects[proj]["profit"]  += emp["profit"]
-            projects[proj]["employees"] += 1
-        for p in projects.values():
-            p["revenue"] = round(p["revenue"], 2)
-            p["cost"]    = round(p["cost"], 2)
-            p["profit"]  = round(p["profit"], 2)
+            if not merged:
+                continue
 
-        total_revenue = round(sum(e["revenue"] for e in employees), 2)
-        total_cost    = round(sum(e["cost"] for e in employees), 2)
-        total_profit  = round(sum(e["profit"] for e in employees), 2)
-        avg_margin    = round((total_profit / total_revenue) * 100, 2) if total_revenue > 0 else 0
+            # Quality check: discard if no employee has meaningful data
+            has_data = any(
+                d.get("actual_hours") or d.get("expected_hours") or d.get("billing_rate")
+                for d in merged.values()
+            )
+            if not has_data:
+                continue
 
-        sorted_by_profit = sorted(employees, key=lambda e: e["profit"], reverse=True)
-        top_performers = [{"employee": e["employee"], "profit": e["profit"]}
-                          for e in sorted_by_profit if e["profit"] > 0][:3]
-        low_performers = [{"employee": e["employee"], "profit": e["profit"]}
-                          for e in sorted_by_profit if e["profit"] <= 0]
+            employees = [
+                normalize_record(_build_employee_record(name, data, month_label))
+                for name, data in merged.items()
+            ]
 
-        risks = []
-        for e in employees:
-            if e["profit"] < 0:
-                risks.append({"employee": e["employee"], "issue": "LOSS_MAKING"})
-            if e["vacation_days"] >= LEAVE_THRESHOLD:
-                risks.append({"employee": e["employee"], "issue": "HIGH_LEAVE"})
-            if e["utilisation_pct"] < UTILISATION_LOW_THRESHOLD:
-                risks.append({"employee": e["employee"], "issue": "LOW_UTILISATION"})
+            # ── Per-sheet analytics ───────────────────────────────────
+            projects = {}
+            for emp in employees:
+                proj = emp["project"] or "Unknown"
+                if proj not in projects:
+                    projects[proj] = {"revenue": 0, "cost": 0, "profit": 0, "employees": 0}
+                projects[proj]["revenue"] += emp["revenue"]
+                projects[proj]["cost"]    += emp["cost"]
+                projects[proj]["profit"]  += emp["profit"]
+                projects[proj]["employees"] += 1
+            for p in projects.values():
+                p["revenue"] = round(p["revenue"], 2)
+                p["cost"]    = round(p["cost"], 2)
+                p["profit"]  = round(p["profit"], 2)
 
-        result["sheets"][sheet_name] = {
-            "template": "generic",
-            "summary": {
-                "total_employees": len(employees),
-                "total_revenue": total_revenue,
-                "total_cost": total_cost,
-                "total_profit": total_profit,
-                "avg_margin_pct": avg_margin,
-                "total_actual_hours": round(sum(e["actual_hours"] for e in employees), 2),
-                "total_billable_hours": round(sum(e["billable_hours"] for e in employees), 2),
-                "total_working_days": sum(e["working_days"] for e in employees),
-            },
-            "projects": projects,
-            "employees": employees,
-            "top_performers": top_performers,
-            "low_performers": low_performers,
-            "risks": risks,
-        }
+            total_revenue = round(sum(e["revenue"] for e in employees), 2)
+            total_cost    = round(sum(e["cost"] for e in employees), 2)
+            total_profit  = round(sum(e["profit"] for e in employees), 2)
+            avg_margin    = round((total_profit / total_revenue) * 100, 2) if total_revenue > 0 else 0
+
+            sorted_by_profit = sorted(employees, key=lambda e: e["profit"], reverse=True)
+            top_performers = [{"employee": e["employee"], "profit": e["profit"]}
+                              for e in sorted_by_profit if e["profit"] > 0][:3]
+            low_performers = [{"employee": e["employee"], "profit": e["profit"]}
+                              for e in sorted_by_profit if e["profit"] <= 0]
+
+            risks = []
+            for e in employees:
+                if e["profit"] < 0:
+                    risks.append({"employee": e["employee"], "issue": "LOSS_MAKING"})
+                if e["vacation_days"] >= LEAVE_THRESHOLD:
+                    risks.append({"employee": e["employee"], "issue": "HIGH_LEAVE"})
+                if e["utilisation_pct"] < UTILISATION_LOW_THRESHOLD:
+                    risks.append({"employee": e["employee"], "issue": "LOW_UTILISATION"})
+
+            result["sheets"][sheet_name] = {
+                "template": "generic",
+                "summary": {
+                    "total_employees": len(employees),
+                    "total_revenue": total_revenue,
+                    "total_cost": total_cost,
+                    "total_profit": total_profit,
+                    "avg_margin_pct": avg_margin,
+                    "total_actual_hours": round(sum(e["actual_hours"] for e in employees), 2),
+                    "total_billable_hours": round(sum(e["billable_hours"] for e in employees), 2),
+                    "total_working_days": sum(e["working_days"] for e in employees),
+                },
+                "projects": projects,
+                "employees": employees,
+                "top_performers": top_performers,
+                "low_performers": low_performers,
+                "risks": risks,
+            }
 
     total_rev = sum(s["summary"]["total_revenue"] for s in result["sheets"].values())
     total_cst = sum(s["summary"]["total_cost"] for s in result["sheets"].values())
