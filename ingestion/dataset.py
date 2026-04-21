@@ -116,10 +116,7 @@ def filter_by_range(records: List[dict], time_range: Optional[str] = None) -> Li
         return records
 
     days_map = {"1M": 30, "3M": 90, "6M": 180, "12M": 365}
-    key = time_range.upper().strip()
-    if key.isdigit():
-        key = key + "M"
-    cutoff_days = days_map.get(key)
+    cutoff_days = days_map.get(time_range.upper())
     if not cutoff_days:
         return records
 
