@@ -4,8 +4,10 @@ dataset.py — Global in-memory dataset and analytics transforms.
 
 import datetime as dt
 import re
+import threading
 from typing import Optional, List
 
+_LOCK = threading.Lock()
 GLOBAL_DATASET: List[dict] = []
 
 MONTH_ORDER = [
@@ -14,24 +16,79 @@ MONTH_ORDER = [
 ]
 
 _FILES_PROCESSED: List[str] = []
+_DEDUP_KEYS: set = set()
+
+
+def _normalize_key(s: str) -> str:
+    """Normalize a string for dedup comparison: lowercase, strip all non-alphanumeric."""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
 def clear():
-    GLOBAL_DATASET.clear()
-    _FILES_PROCESSED.clear()
+    with _LOCK:
+        GLOBAL_DATASET.clear()
+        _FILES_PROCESSED.clear()
+        _DEDUP_KEYS.clear()
 
 
 def append_records(records: List[dict], filename: str = ""):
-    if filename and filename not in _FILES_PROCESSED:
-        _FILES_PROCESSED.append(filename)
-    for r in records:
-        if not any(
-            existing["employee"] == r["employee"]
-            and existing["month"] == r["month"]
-            and existing["project"] == r["project"]
-            for existing in GLOBAL_DATASET
-        ):
-            GLOBAL_DATASET.append(r)
+    from .normalizer import normalize_month_label
+    with _LOCK:
+        if filename and filename not in _FILES_PROCESSED:
+            _FILES_PROCESSED.append(filename)
+        skipped = 0
+        for r in records:
+            emp  = r.get("employee") or ""
+            proj = r.get("project") or ""
+            mon  = r.get("month") or ""
+
+            # Skip records with no identifiable employee
+            if not emp or emp.lower() in ("unknown", "none", ""):
+                skipped += 1
+                continue
+
+            # Normalize month on ingest for consistency
+            norm_month = normalize_month_label(mon)
+            if norm_month and norm_month != mon:
+                r["month"] = norm_month
+                mon = norm_month
+
+            # Tag record with source file for audit trail
+            if filename and "_source_file" not in r:
+                r["_source_file"] = filename
+
+            # O(1) dedup with fuzzy key: "Proof point" == "proofpoint", case-insensitive names
+            key = (_normalize_key(emp), _normalize_key(mon), _normalize_key(proj))
+            if key not in _DEDUP_KEYS:
+                _DEDUP_KEYS.add(key)
+                GLOBAL_DATASET.append(r)
+
+        if skipped:
+            print(f"[dataset] Skipped {skipped} records with missing employee name")
+
+
+def remove_by_file(filename: str) -> int:
+    """Remove all records from a specific source file. Returns count removed."""
+    with _LOCK:
+        before = len(GLOBAL_DATASET)
+        remaining = [r for r in GLOBAL_DATASET if r.get("_source_file") != filename]
+        removed = before - len(remaining)
+        GLOBAL_DATASET.clear()
+        GLOBAL_DATASET.extend(remaining)
+        # Rebuild dedup keys
+        _DEDUP_KEYS.clear()
+        for r in GLOBAL_DATASET:
+            emp = r.get("employee") or ""
+            mon = r.get("month") or ""
+            proj = r.get("project") or ""
+            _DEDUP_KEYS.add((_normalize_key(emp), _normalize_key(mon), _normalize_key(proj)))
+        if filename in _FILES_PROCESSED:
+            _FILES_PROCESSED.remove(filename)
+        return removed
+
+
+def get_files_processed() -> List[str]:
+    return list(_FILES_PROCESSED)
 
 
 def _parse_month_date(month_str: str) -> Optional[dt.date]:
@@ -59,23 +116,25 @@ def filter_by_range(records: List[dict], time_range: Optional[str] = None) -> Li
         return records
 
     days_map = {"1M": 30, "3M": 90, "6M": 180, "12M": 365}
-    cutoff_days = days_map.get(time_range.upper())
+    key = time_range.upper().strip()
+    if key.isdigit():
+        key = key + "M"
+    cutoff_days = days_map.get(key)
     if not cutoff_days:
         return records
 
-    dated = []
+    today = dt.date.today()
+    cutoff = today - dt.timedelta(days=cutoff_days)
+
+    result = []
     for r in records:
         d = _parse_month_date(r.get("month", ""))
-        if d:
-            dated.append((r, d))
+        if d and d >= cutoff:
+            result.append(r)
+        elif not d:
+            result.append(r)
 
-    if not dated:
-        return records
-
-    max_date = max(d for _, d in dated)
-    cutoff = max_date - dt.timedelta(days=cutoff_days)
-
-    return [r for r, d in dated if d >= cutoff]
+    return result
 
 
 def get_months_available(records: List[dict] = None) -> List[str]:
@@ -105,9 +164,9 @@ def build_projects(records: List[dict]) -> dict:
                 "revenue": 0, "cost": 0, "profit": 0,
                 "employees": set(),
             }
-        projects[proj]["revenue"] += r.get("revenue", 0)
-        projects[proj]["cost"] += r.get("cost", 0)
-        projects[proj]["profit"] += r.get("profit", 0)
+        projects[proj]["revenue"] += r.get("revenue") or 0
+        projects[proj]["cost"] += r.get("cost") or 0
+        projects[proj]["profit"] += r.get("profit") or 0
         projects[proj]["employees"].add(r.get("employee", ""))
 
     for p in projects.values():
@@ -128,9 +187,9 @@ def build_monthly(records: List[dict]) -> dict:
                 "total_revenue": 0, "total_cost": 0, "total_profit": 0,
                 "employees": set(),
             }
-        monthly[m]["total_revenue"] += r.get("revenue", 0)
-        monthly[m]["total_cost"] += r.get("cost", 0)
-        monthly[m]["total_profit"] += r.get("profit", 0)
+        monthly[m]["total_revenue"] += r.get("revenue") or 0
+        monthly[m]["total_cost"] += r.get("cost") or 0
+        monthly[m]["total_profit"] += r.get("profit") or 0
         monthly[m]["employees"].add(r.get("employee", ""))
 
     for v in monthly.values():
@@ -146,9 +205,9 @@ def build_monthly(records: List[dict]) -> dict:
 
 
 def build_overall_summary(records: List[dict]) -> dict:
-    total_rev = round(sum(r.get("revenue", 0) for r in records), 2)
-    total_cost = round(sum(r.get("cost", 0) for r in records), 2)
-    total_profit = round(sum(r.get("profit", 0) for r in records), 2)
+    total_rev = round(sum(r.get("revenue") or 0 for r in records), 2)
+    total_cost = round(sum(r.get("cost") or 0 for r in records), 2)
+    total_profit = round(sum(r.get("profit") or 0 for r in records), 2)
     unique_employees = len({r.get("employee") for r in records if r.get("employee")})
     return {
         "total_revenue": total_rev,
@@ -163,7 +222,7 @@ def build_top_performers(records: List[dict], limit: int = 5) -> List[dict]:
     emp_profit = {}
     for r in records:
         name = r.get("employee", "")
-        emp_profit[name] = emp_profit.get(name, 0) + r.get("profit", 0)
+        emp_profit[name] = emp_profit.get(name, 0) + (r.get("profit") or 0)
     ranked = sorted(emp_profit.items(), key=lambda x: x[1], reverse=True)
     return [{"employee": name, "total_profit": round(pft, 2)} for name, pft in ranked[:limit]]
 
@@ -171,12 +230,12 @@ def build_top_performers(records: List[dict], limit: int = 5) -> List[dict]:
 def build_risks(records: List[dict]) -> List[dict]:
     risks = []
     for r in records:
-        if r.get("profit", 0) < 0:
-            risks.append({"employee": r["employee"], "month": r.get("month"), "issue": "LOSS_MAKING", "profit": r["profit"]})
-        if r.get("vacation_days", 0) >= 3:
-            risks.append({"employee": r["employee"], "month": r.get("month"), "issue": "HIGH_LEAVE", "vacation_days": r["vacation_days"]})
-        if r.get("utilisation_pct", 100) < 80:
-            risks.append({"employee": r["employee"], "month": r.get("month"), "issue": "LOW_UTILISATION", "utilisation_pct": r["utilisation_pct"]})
+        if (r.get("profit") or 0) < 0:
+            risks.append({"employee": r["employee"], "month": r.get("month"), "issue": "LOSS_MAKING", "profit": r.get("profit") or 0})
+        if (r.get("vacation_days") or 0) >= 3:
+            risks.append({"employee": r["employee"], "month": r.get("month"), "issue": "HIGH_LEAVE", "vacation_days": r.get("vacation_days") or 0})
+        if (r.get("utilisation_pct") or 0) < 80:
+            risks.append({"employee": r["employee"], "month": r.get("month"), "issue": "LOW_UTILISATION", "utilisation_pct": r.get("utilisation_pct") or 0})
     return risks
 
 
@@ -185,18 +244,18 @@ def _clean_record_for_api(r: dict) -> dict:
         "employee": r.get("employee", ""),
         "project": r.get("project", ""),
         "month": r.get("month", ""),
-        "actual_hours": r.get("actual_hours", 0),
-        "billable_hours": r.get("billable_hours", 0),
-        "working_days": r.get("working_days", 0),
-        "vacation_days": r.get("vacation_days", 0),
-        "billing_rate": r.get("billing_rate", 0),
-        "cost_rate": r.get("cost_rate", 0),
-        "revenue": r.get("revenue", 0),
-        "cost": r.get("cost", 0),
-        "profit": r.get("profit", 0),
-        "margin_pct": r.get("margin_pct", 0),
-        "utilisation_pct": r.get("utilisation_pct", 0),
-        "is_profitable": r.get("is_profitable", True),
+        "actual_hours": r.get("actual_hours") or 0,
+        "billable_hours": r.get("billable_hours") or 0,
+        "working_days": r.get("working_days") or 0,
+        "vacation_days": r.get("vacation_days") or 0,
+        "billing_rate": r.get("billing_rate"),
+        "cost_rate": r.get("cost_rate"),
+        "revenue": r.get("revenue"),
+        "cost": r.get("cost"),
+        "profit": r.get("profit"),
+        "margin_pct": r.get("margin_pct"),
+        "utilisation_pct": r.get("utilisation_pct"),
+        "is_profitable": r.get("is_profitable"),
     }
 
 

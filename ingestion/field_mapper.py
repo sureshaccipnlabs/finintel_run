@@ -1,6 +1,8 @@
 """
 field_mapper.py — maps raw column names (whatever the user uploaded)
 to canonical FinIntel field names using alias lookup + fuzzy matching.
+
+Falls back to Ollama AI mapping when required fields are still unmapped.
 """
 
 import re
@@ -8,6 +10,14 @@ from difflib import SequenceMatcher
 from typing import Optional
 
 from .field_config import FIELD_ALIASES, OPTIONAL_FIELDS, REQUIRED_FIELDS
+
+try:
+    from .ai_mapper import ai_map_columns, is_ollama_available
+    _AI_AVAILABLE = True
+except ImportError:
+    _AI_AVAILABLE = False
+    def ai_map_columns(*a, **kw): return {}
+    def is_ollama_available(): return False
 
 
 def normalise(text: str) -> str:
@@ -65,6 +75,24 @@ def build_column_mapping(raw_columns: list[str], threshold: float = 0.65) -> dic
         if col not in mapping and field not in claimed_fields:
             mapping[col] = field
             claimed_fields.add(field)
+
+    # AI fallback: if required fields still unmapped, ask Ollama
+    missing = [f for f in REQUIRED_FIELDS if f not in claimed_fields]
+    if missing and _AI_AVAILABLE and is_ollama_available():
+        try:
+            ai_result = ai_map_columns(raw_columns, already_mapped=mapping)
+            # ai_result maps field_name → column_index
+            for field_name, col_idx in ai_result.items():
+                if field_name in claimed_fields:
+                    continue
+                if isinstance(col_idx, (int, float)) and 0 <= int(col_idx) < len(raw_columns):
+                    col_name = raw_columns[int(col_idx)]
+                    if col_name not in mapping:
+                        mapping[col_name] = field_name
+                        claimed_fields.add(field_name)
+                        print(f"[field_mapper] AI mapped: '{col_name}' → '{field_name}'")
+        except Exception as e:
+            print(f"[field_mapper] AI fallback failed: {e}")
 
     return mapping
 

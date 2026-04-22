@@ -88,14 +88,22 @@ def _extract_json(text):
     return None
 
 
+_ollama_cache = {"available": None, "checked_at": 0}
+
 def is_ollama_available():
-    """Quick health check — returns True if Ollama is reachable."""
+    """Quick health check with 30s cache — returns True if Ollama is reachable."""
+    import time
+    now = time.time()
+    if _ollama_cache["available"] is not None and (now - _ollama_cache["checked_at"]) < 30:
+        return _ollama_cache["available"]
     try:
         req = urllib.request.Request(f"{OLLAMA_URL}/api/tags")
         with urllib.request.urlopen(req, timeout=3) as resp:
-            return resp.status == 200
+            _ollama_cache["available"] = resp.status == 200
     except Exception:
-        return False
+        _ollama_cache["available"] = False
+    _ollama_cache["checked_at"] = now
+    return _ollama_cache["available"]
 
 
 # ── Level 1: Column mapping (given a known header row) ───────────────────

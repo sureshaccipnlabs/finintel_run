@@ -143,8 +143,11 @@ def _map_columns(header, fields=None):
             else:
                 idx_to_field[idx] = f
 
-    # AI fallback for any missing critical fields
-    if _AI_AVAILABLE and is_ollama_available():
+    # AI fallback only when essential fields (within requested set) are missing
+    essential = {"name", "actual_hours"}
+    requested_essential = essential.intersection(set(fields))
+    missing_essential = [f for f in requested_essential if mapped.get(f) is None]
+    if missing_essential and _AI_AVAILABLE and is_ollama_available():
         critical = [f for f in fields if mapped.get(f) is None]
         if critical:
             key = tuple(str(v) for v in header)
@@ -371,14 +374,37 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
 
 
 # ── STRATEGY 1: Pattern-based parsing ────────────────────────────────────
+_SKIP_SHEET_NAMES = {"instructions", "template", "readme", "config", "settings",
+                     "notes", "data", "lookup", "dropdown", "lists", "master",
+                     "reference", "help", "about", "index", "cover", "changelog",
+                     "team", "teams", "contacts", "directory", "org", "org chart",
+                     "summary", "dashboard", "sheet1", "sheet2", "sheet3"}
+
+
+def _looks_like_timesheet_sheet(rows, sheet_name):
+    """Quick heuristic: does this sheet look like it could contain timesheet data?
+    Always trusts actual content (headers) over sheet name."""
+    # Check first 30 rows for any header-like content — most reliable signal
+    scan = min(30, len(rows))
+    for i in range(scan):
+        if _is_data_header(rows[i]):
+            return True  # has timesheet headers, regardless of sheet name
+    # No headers found — use name blacklist to avoid wasting AI on obvious non-data sheets
+    if sheet_name.lower().strip() in _SKIP_SHEET_NAMES:
+        return False
+    # Unknown sheet with no recognizable headers — let AI try
+    return True
+
+
 def _parse_with_patterns(rows):
     """
     Try to parse using pattern matching.
     Handles: fortnights + summary overlay, OR summary-only sheets.
     Returns merged employee dict or {} on failure.
     """
+    max_header_scan = min(len(rows), 50)
     all_headers = [
-        (i, rows[i]) for i in range(len(rows)) if _is_data_header(rows[i])
+        (i, rows[i]) for i in range(max_header_scan) if _is_data_header(rows[i])
     ]
     if not all_headers:
         return {}
@@ -590,11 +616,16 @@ def parse_timesheet(filepath, target_month=None):
                         yr = "20" + yr
                     month_label = f"{mt.group(1).capitalize()} {yr}"
 
+            # Phase 2: skip sheets that don't look like timesheets
+            if phase == 2 and not _looks_like_timesheet_sheet(rows, sheet_name):
+                continue
+
             # ── STRATEGY 1: Pattern-based parsing ─────────────────────
             merged = _parse_with_patterns(rows)
 
-            # ── STRATEGY 2: AI fallback if patterns found nothing ─────
-            if not merged:
+            # ── STRATEGY 2: AI fallback ONLY if no headers were found ─
+            # If patterns found headers but no employees, AI won't help either
+            if not merged and not any(_is_data_header(rows[i]) for i in range(min(30, len(rows)))):
                 merged = _parse_with_ai(rows, sheet_name)
 
             if not merged:
