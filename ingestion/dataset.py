@@ -284,11 +284,15 @@ def build_project_summaries(records: List[dict]) -> List[dict]:
                 "revenue": 0.0,
                 "cost": 0.0,
                 "monthly": {},
+                "employees": set(),
             }
 
         proj = projects[project_name]
         proj["revenue"] += revenue
         proj["cost"] += cost
+        employee_name = r.get("employee")
+        if employee_name:
+            proj["employees"].add(employee_name)
 
         if month not in proj["monthly"]:
             proj["monthly"][month] = {"revenue": 0.0, "cost": 0.0}
@@ -308,13 +312,21 @@ def build_project_summaries(records: List[dict]) -> List[dict]:
         profit_series = [round(rev - cst, 2) for rev, cst in zip(revenue_series, cost_series)]
         margin_series = [_calc_margin(rev, cst) for rev, cst in zip(revenue_series, cost_series)]
 
+        if gross_margin_pct > 40:
+            status = "Healthy"
+        elif gross_margin_pct >= 30:
+            status = "Optimal"
+        else:
+            status = "At Risk"
+
         output.append({
             "project_name": project_name,
             "total_revenue": total_revenue,
             "total_cost": total_cost,
             "total_profit": total_profit,
             "gross_margin_pct": gross_margin_pct,
-            "status": "Healthy" if gross_margin_pct >= 20 else "Risk",
+            "employees": len(data["employees"]),
+            "status": status,
             "trends": {
                 "revenue_trend": _trend_from_values(revenue_series),
                 "cost_trend": _trend_from_values(cost_series),
@@ -438,6 +450,8 @@ def _clean_record_for_api(r: dict) -> dict:
         "actual_hours": r.get("actual_hours") or 0,
         "billable_hours": r.get("billable_hours") or 0,
         "working_days": r.get("working_days") or 0,
+        "leave_days": r.get("leave_days") or r.get("vacation_days") or 0,
+        "holiday_days": r.get("holiday_days") or 0,
         "vacation_days": r.get("vacation_days") or 0,
         "billing_rate": r.get("billing_rate"),
         "cost_rate": r.get("cost_rate"),

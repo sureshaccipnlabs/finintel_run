@@ -108,6 +108,89 @@ def _safe_float(row, idx):
         return 0
 
 
+_LEAVE_MARKERS = {"off", "l", "leave", ""}
+_HOLIDAY_MARKERS = {"ph", "holiday", "public holiday"}
+_WEEKDAY_MARKERS = {
+    "mon", "monday", "tue", "tues", "tuesday", "wed", "wednesday",
+    "thu", "thur", "thurs", "thursday", "fri", "friday", "sat", "saturday",
+    "sun", "sunday"
+}
+
+
+def _is_daily_date_col(v):
+    if is_date(v):
+        return True
+    if isinstance(v, (int, float)):
+        iv = int(v)
+        return float(iv) == float(v) and 1 <= iv <= 31
+
+    s = clean(v).strip().lower()
+    if not s:
+        return False
+    if s in _WEEKDAY_MARKERS:
+        return True
+    if re.match(r"^\d{1,2}$", s):
+        return 1 <= int(s) <= 31
+    if re.match(r"^\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?$", s):
+        return True
+    if re.match(r"^\d{4}[/-]\d{1,2}[/-]\d{1,2}$", s):
+        return True
+    return False
+
+
+def _get_daily_date_columns(header):
+    cols = [i for i, v in enumerate(header or []) if _is_daily_date_col(v)]
+    return cols if len(cols) >= 5 else []
+
+
+def _compute_daily_metrics(row, day_cols):
+    working_days = 0
+    leave_days = 0
+    holiday_days = 0
+    actual_hours = 0.0
+
+    for idx in day_cols:
+        if idx >= len(row):
+            continue
+
+        val = row[idx]
+        if val is None:
+            leave_days += 1
+            continue
+
+        if isinstance(val, (int, float)):
+            hrs = float(val)
+            if hrs > 0:
+                actual_hours += hrs
+                working_days += 1
+            continue
+
+        s = clean(val).strip()
+        low = s.lower()
+
+        if low in _LEAVE_MARKERS:
+            leave_days += 1
+            continue
+        if low in _HOLIDAY_MARKERS:
+            holiday_days += 1
+            continue
+
+        try:
+            hrs = float(low)
+            if hrs > 0:
+                actual_hours += hrs
+                working_days += 1
+        except (ValueError, TypeError):
+            continue
+
+    return {
+        "actual_hours": round(actual_hours, 2),
+        "working_days": working_days,
+        "leave_days": leave_days,
+        "holiday_days": holiday_days,
+    }
+
+
 def _safe_int(row, idx):
     if idx is None or idx >= len(row) or row[idx] is None:
         return 0
@@ -333,6 +416,8 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
     if data_end is None:
         data_end = min(data_start + 50, len(rows) - 1)
 
+    day_cols = _get_daily_date_columns(header)
+
     employees = {}
     found_any = False
     for r in rows[data_start : data_end + 1]:
@@ -351,6 +436,28 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
                 break
             continue
 
+        daily = _compute_daily_metrics(r, day_cols) if day_cols else {
+            "actual_hours": 0.0,
+            "working_days": 0,
+            "leave_days": 0,
+            "holiday_days": 0,
+        }
+
+        row_actual = _safe_float(r, actual_idx) or _safe_float(r, sub_actual_idx)
+        actual_hours = daily["actual_hours"] if day_cols else row_actual
+        if not actual_hours and row_actual:
+            actual_hours = row_actual
+
+        row_working_days = _safe_int(r, wd_idx)
+        working_days = daily["working_days"] if day_cols else row_working_days
+        if not working_days and row_working_days:
+            working_days = row_working_days
+
+        row_leave_days = _safe_int(r, leaves_idx)
+        leave_days = daily["leave_days"] if day_cols else row_leave_days
+        if not leave_days and row_leave_days:
+            leave_days = row_leave_days
+
         # Project
         project = default_project or ""
         if project_idx is not None and project_idx < len(r) and r[project_idx]:
@@ -362,11 +469,13 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
             "project":       project,
             "billing_rate":  _safe_float(r, rate_idx),
             "cost_rate":     _safe_float(r, cost_idx),
-            "actual_hours":  _safe_float(r, actual_idx) or _safe_float(r, sub_actual_idx),
+            "actual_hours":  actual_hours,
             "billable_hours":_safe_float(r, billable_idx) or _safe_float(r, sub_billable_idx),
             "expected_hours":_safe_float(r, max_idx),
-            "vacation_days": _safe_int(r, leaves_idx),
-            "working_days":  _safe_int(r, wd_idx),
+            "vacation_days": leave_days,
+            "leave_days":    leave_days,
+            "holiday_days":  daily["holiday_days"],
+            "working_days":  working_days,
         }
         found_any = True
 
@@ -420,9 +529,9 @@ def _parse_with_patterns(rows):
         fort_data = _extract_employees(rows, h_idx, col_map)
         for name, data in fort_data.items():
             if name not in merged:
-                merged[name] = {k: 0 for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "working_days"]}
+                merged[name] = {k: 0 for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "leave_days", "holiday_days", "working_days"]}
                 merged[name]["project"] = data["project"]
-            for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "working_days"]:
+            for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "leave_days", "holiday_days", "working_days"]:
                 merged[name][k] += data.get(k, 0)
 
     # Overlay summary (rates + authoritative totals)
@@ -448,6 +557,8 @@ def _parse_with_patterns(rows):
                         merged[name]["expected_hours"] = sm["expected_hours"]
                     if sm.get("vacation_days"):
                         merged[name]["vacation_days"] = sm["vacation_days"]
+                    if sm.get("leave_days"):
+                        merged[name]["leave_days"] = sm["leave_days"]
                 else:
                     merged[name].setdefault("billing_rate", 0)
                     merged[name].setdefault("cost_rate", 0)
@@ -504,7 +615,9 @@ def _build_employee_record(name, data, month_label):
     billable_hours = data.get("billable_hours", 0) or actual_hours
     expected_hours = data.get("expected_hours", 0)
     working_days   = data.get("working_days", 0)
-    vacation_days  = data.get("vacation_days", 0)
+    leave_days     = data.get("leave_days", data.get("vacation_days", 0))
+    holiday_days   = data.get("holiday_days", 0)
+    vacation_days  = leave_days
 
     if working_days == 0 and expected_hours > 0:
         working_days = int(expected_hours / HOURS_PER_DAY)
@@ -543,6 +656,8 @@ def _build_employee_record(name, data, month_label):
         "project": data.get("project", ""),
         "month": month_label,
         "working_days": working_days,
+        "leave_days": leave_days,
+        "holiday_days": holiday_days,
         "vacation_days": vacation_days,
         "effective_working_days": effective_working_days,
         "actual_hours": actual_hours,
@@ -690,6 +805,8 @@ def parse_timesheet(filepath, target_month=None):
                     "total_actual_hours": round(sum(e["actual_hours"] for e in employees), 2),
                     "total_billable_hours": round(sum(e["billable_hours"] for e in employees), 2),
                     "total_working_days": sum(e["working_days"] for e in employees),
+                    "total_leave_days": sum(e.get("leave_days", e.get("vacation_days", 0)) for e in employees),
+                    "total_holidays": sum(e.get("holiday_days", 0) for e in employees),
                 },
                 "projects": projects,
                 "employees": employees,

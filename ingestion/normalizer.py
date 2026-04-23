@@ -55,6 +55,8 @@ def normalize_record(rec: dict) -> dict:
         "billable_hours": rec.get("billable_hours") or 0,
         "expected_hours": rec.get("expected_hours") or 0,
         "working_days": rec.get("working_days") or 0,
+        "leave_days": rec.get("leave_days") or rec.get("vacation_days") or 0,
+        "holiday_days": rec.get("holiday_days") or 0,
         "vacation_days": rec.get("vacation_days") or 0,
         "effective_working_days": rec.get("effective_working_days") or 0,
         "leave_hours": rec.get("leave_hours") or 0,
