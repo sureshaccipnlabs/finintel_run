@@ -70,6 +70,14 @@ def _sheet_month_key(sheet_name: str, sheet_data: dict) -> Optional[str]:
     return None
 
 
+def _sheet_quality_score(sheet_data: dict):
+    emps = sheet_data.get("employees", [])
+    total = len(emps)
+    with_both_rates = sum(1 for e in emps if e.get("billing_rate") and e.get("cost_rate"))
+    total_revenue = sheet_data.get("summary", {}).get("total_revenue", 0) or 0
+    return (with_both_rates, total, total_revenue)
+
+
 def _rebuild_overall_summary_from_sheets(sheets: dict) -> dict:
     total_revenue = round(sum(s.get("summary", {}).get("total_revenue", 0) for s in sheets.values()), 2)
     total_cost = round(sum(s.get("summary", {}).get("total_cost", 0) for s in sheets.values()), 2)
@@ -101,11 +109,21 @@ def ingest_file(filepath: str, time_range: Optional[str] = None, original_filena
 
             if target_months:
                 target_set = set(target_months)
-                filtered_sheets = {
-                    sheet_name: sheet_data
-                    for sheet_name, sheet_data in ts_result.get("sheets", {}).items()
-                    if _sheet_month_key(sheet_name, sheet_data) in target_set
-                }
+                # Keep only the best sheet per target month key.
+                best_by_month = {}
+                for sheet_name, sheet_data in ts_result.get("sheets", {}).items():
+                    key = _sheet_month_key(sheet_name, sheet_data)
+                    if key not in target_set:
+                        continue
+                    current = best_by_month.get(key)
+                    if not current:
+                        best_by_month[key] = (sheet_name, sheet_data)
+                        continue
+                    _, current_data = current
+                    if _sheet_quality_score(sheet_data) > _sheet_quality_score(current_data):
+                        best_by_month[key] = (sheet_name, sheet_data)
+
+                filtered_sheets = {name: data for name, data in best_by_month.values()}
                 if filtered_sheets:
                     ts_result["sheets"] = filtered_sheets
                     ts_result["overall_summary"] = _rebuild_overall_summary_from_sheets(filtered_sheets)

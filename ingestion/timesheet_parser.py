@@ -34,7 +34,8 @@ FIELD_PATTERNS = {
                       "charge rate", "sell rate", "client rate",
                       "rate", "billing"],
     "cost_rate":     ["cost_rate", "cost rate", "ctc rate", "internal rate",
-                      "pay rate", "cosst"],
+                      "pay rate", "cost", "internal cost", "resource cost",
+                      "cost per hour", "cost/hr", "cosst"],
     "actual_hours":  ["actual hours", "total actual", "hours worked", "work hours",
                       "logged hours", "total hours", "worked hours",
                       "actual"],
@@ -595,6 +596,35 @@ def _parse_with_patterns(rows):
     return merged
 
 
+def _build_mapping_debug(rows):
+    """Return lightweight mapping diagnostics for the first detected header row."""
+    max_header_scan = min(len(rows), 50)
+    for i in range(max_header_scan):
+        header = rows[i]
+        if not _is_data_header(header):
+            continue
+
+        col_map = _map_columns(header)
+        fields = {}
+        for field, idx in col_map.items():
+            if idx is None:
+                continue
+            label = clean(header[idx]) if idx < len(header) else ""
+            fields[field] = {"index": idx, "header": label}
+
+        return {
+            "header_row": i + 1,
+            "section_type": _classify_section(header),
+            "fields": fields,
+        }
+
+    return {
+        "header_row": None,
+        "section_type": "unknown",
+        "fields": {},
+    }
+
+
 # ── STRATEGY 2: AI full-sheet analysis ───────────────────────────────────
 def _parse_with_ai(rows, sheet_name):
     """
@@ -755,6 +785,9 @@ def _match_target_month(sheet_name, target_month):
 # ── Main entry point ──────────────────────────────────────────────────────
 def parse_timesheet(filepath, target_month=None):
     wb = load_workbook(filepath, data_only=True)
+    visible_sheetnames = [
+        sn for sn in wb.sheetnames if wb[sn].sheet_state == "visible"
+    ]
 
     result = {
         "file": os.path.basename(filepath),
@@ -770,7 +803,7 @@ def parse_timesheet(filepath, target_month=None):
     if target_month:
         target_norm = _norm_month_text(target_month)
         exact_month_sheets = {
-            sn for sn in wb.sheetnames if _norm_month_text(sn) == target_norm
+            sn for sn in visible_sheetnames if _norm_month_text(sn) == target_norm
         }
 
     # Two-phase sheet selection:
@@ -781,7 +814,7 @@ def parse_timesheet(filepath, target_month=None):
         if phase == 2 and result["sheets"]:
             break  # Phase 1 found data, no need for Phase 2
 
-        for sheet_name in wb.sheetnames:
+        for sheet_name in visible_sheetnames:
             if sheet_name in result["sheets"]:
                 continue  # already processed
 
@@ -825,6 +858,8 @@ def parse_timesheet(filepath, target_month=None):
 
             if not merged:
                 continue
+
+            mapping_debug = _build_mapping_debug(rows)
 
             # Quality check: discard if no employee has meaningful data
             has_data = any(
@@ -876,6 +911,7 @@ def parse_timesheet(filepath, target_month=None):
 
             result["sheets"][sheet_name] = {
                 "template": "generic",
+                "mapping_debug": mapping_debug,
                 "summary": {
                     "total_employees": len(employees),
                     "total_revenue": total_revenue,

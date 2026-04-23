@@ -4,6 +4,7 @@ record_parser.py — Parses a single mapped row into canonical format.
 
 from typing import Dict, Any, List
 from datetime import datetime
+from .normalizer import normalize_project_name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -26,7 +27,7 @@ def normalize_employee(name: str) -> str:
 def normalize_project(name: str) -> str:
     if not name:
         return None
-    return str(name).strip()
+    return normalize_project_name(name)
 
 
 def normalize_month(m):
