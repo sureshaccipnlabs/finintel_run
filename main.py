@@ -36,6 +36,9 @@ async def ingest(files: List[UploadFile] = File(...)):
     ALLOWED_EXTENSIONS = {".xlsx", ".xls", ".csv", ".tsv", ".txt", ".pdf"}
     MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
+    # Do not maintain upload history for now; each ingest replaces dataset state.
+    clear_dataset()
+
     # Phase 1: Validate all files and write to temp (fast, sequential)
     staged = []
     for file in files:
