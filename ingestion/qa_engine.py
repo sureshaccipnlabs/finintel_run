@@ -5,6 +5,8 @@ Builds a compact text summary of GLOBAL_DATASET and sends it as context
 to Ollama so the LLM can answer any natural-language question about the data.
 """
 
+import re
+
 from .dataset import (
     GLOBAL_DATASET, build_projects, build_monthly, build_overall_summary,
     build_top_performers, build_risks, get_months_available, filter_by_range,
@@ -94,7 +96,7 @@ def _build_dataset_context(records=None):
 
 _QA_PROMPT = """\
 You are FinIntel AI, a financial data analyst assistant. You answer questions \
-about timesheet and financial data that has been uploaded.
+about uploaded timesheet and financial data.
 
 Here is the current dataset:
 
@@ -105,12 +107,59 @@ Here is the current dataset:
 User question: {question}
 
 Instructions:
-- Answer based ONLY on the data above. Do not make up numbers.
-- Be concise and specific. Use actual numbers from the data.
-- If the data doesn't contain enough information to answer, say so.
+- Answer using ONLY the dataset above.
+- Do NOT infer, generalize, summarize, or combine records unless the user explicitly asks for a summary or aggregation.
+- Do NOT use phrases like "multiple months", "appears", "indicates", "suggests", or any similar interpretive wording unless that exact conclusion is directly supported by the data and requested by the user.
+- Do not repeat the user’s question.
+- Do not restate or paraphrase the question.
+- Start directly with the answer.
+- For superlative questions like highest, lowest, max, minimum, return only the record(s) tied for the extreme value.
+- If the question asks who, which employee, which month, or similar, answer with the exact matching rows from the dataset.
+- If an employee appears in more than one month, list each employee-month separately unless the user explicitly asks for grouped results.
+- If the question asks "how many", "count", "number of", or "total number of", return a count first, not a row dump.
+- For count questions about employees, count unique employee names unless the user explicitly asks for employee-month records, rows, entries, or occurrences.
+- For count questions about projects, count unique project names unless the user explicitly asks for rows, entries, or occurrences.
+- If the question is ambiguous, prefer the business entity count rather than the row count.
+- Do not mix unique counts with row counts in the same answer unless the user asks for both.
+- If helpful, after the count you may list the unique names included in that count on the same line or in a short plain-text continuation.
+- If there are no matching rows, say that no matching records were found in the provided data.
+- If the data does not contain enough information to answer, say so plainly.
+- Be concise and precise. Use exact employee names, project names, months, numbers, currency, and percentages from the data.
 - Format currency as $X,XXX.XX and percentages as X.X%.
-- When comparing, show both values side by side.
+- When comparing values, show both values side by side.
+- Do not explain what the numbers mean unless the user explicitly asks for analysis.
+- Prefer bullet points for lists.
+- Do not start the answer with phrases like "Based on the dataset", "Based on the provided data", "From the data", or similar lead-ins.
+- Do not output escaped newline characters like \n or \t.
+- Do not use markdown emphasis such as **bold**, *italic*, headings, or code fences.
+- Return plain text only.
+
+Output rules:
+- For aggregated questions, show the calculation result only if it can be read or computed directly from the provided data.
+- For count questions, prefer formats like:
+  <N> employees are underutilized.
+  <N> unique employees are underutilized: <Name1>, <Name2>, <Name3>.
 """
+
+
+def _clean_answer(text: str) -> str:
+    answer = (text or "")
+    for _ in range(3):
+        answer = answer.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", " ")
+    answer = answer.replace("\r\n", "\n").replace("\r", "\n")
+    answer = re.sub(r"\*\*(.*?)\*\*", r"\1", answer)
+    answer = re.sub(r"\*(.*?)\*", r"\1", answer)
+    answer = re.sub(r"^\s*(based on the (provided )?(dataset|data)[,:]?|from the (provided )?(dataset|data)[,:]?)\s*", "", answer, flags=re.IGNORECASE)
+    # Remove echoed question lines like 'User question: ...' or a repeated question at the start
+    answer = re.sub(r"(?im)^\s*(user question|question)\s*:\s*.*?$", "", answer)
+    answer = re.sub(r"(?im)^\s*(which|who|what|how many|how much|count|show|list)\b.*?[?:]?\s*$", "", answer)
+    answer = answer
+    answer = answer
+    answer = re.sub(r"\n{3,}", "\n\n", answer)
+    answer = re.sub(r"[ \t]+\n", "\n", answer)
+    answer = answer
+    answer = re.sub(r"\s{2,}", " ", answer)
+    return answer.strip()
 
 
 # ── Main Q&A function ───────────────────────────────────────────────────────
@@ -153,7 +202,7 @@ def ask(question: str, time_range: str = None) -> dict:
 
     # Return answer with metadata
     return {
-        "answer": answer.strip(),
+        "answer": _clean_answer(answer),
         "sources": {
             "total_records": len(records),
             "months": get_months_available(records),
