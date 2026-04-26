@@ -211,6 +211,7 @@ def get_projects(time_range: Optional[str] = Query(None, alias="range")):
     filtered = filter_by_range(GLOBAL_DATASET, time_range)
     return {
         "time_range": time_range or "ALL",
+        "months_considered": get_months_available(filtered),
         "projects": build_project_summaries(filtered),
     }
 

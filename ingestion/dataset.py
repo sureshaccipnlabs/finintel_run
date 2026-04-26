@@ -154,26 +154,27 @@ def filter_by_range(records: List[dict], time_range: Optional[str] = None) -> Li
     if not time_range or time_range.upper() == "ALL":
         return records
 
-    days_map = {"1M": 30, "3M": 90, "6M": 180, "12M": 365}
     key = time_range.upper().strip()
-    if key.isdigit():
-        key = key + "M"
-    cutoff_days = days_map.get(key)
-    if not cutoff_days:
+    if key.endswith("M"):
+        key = key[:-1]
+
+    if not key.isdigit():
         return records
 
-    today = dt.date.today()
-    cutoff = today - dt.timedelta(days=cutoff_days)
+    months_requested = int(key)
+    if months_requested <= 0:
+        return records
 
-    result = []
-    for r in records:
-        d = _parse_month_date(r.get("month", ""))
-        if d and d >= cutoff:
-            result.append(r)
-        elif not d:
-            result.append(r)
+    month_dates = sorted({_parse_month_date(r.get("month", "")) for r in records if _parse_month_date(r.get("month", ""))})
+    if not month_dates:
+        return records
 
-    return result
+    allowed_months = set(month_dates[-months_requested:])
+
+    return [
+        r for r in records
+        if _parse_month_date(r.get("month", "")) in allowed_months
+    ]
 
 
 def get_months_available(records: List[dict] = None) -> List[str]:

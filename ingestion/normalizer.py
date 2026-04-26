@@ -46,10 +46,17 @@ def normalize_employee_name(name: str) -> str:
     return " ".join(str(name).strip().title().split())
 
 
+def normalize_project_name(name: str) -> str:
+    """Normalize project name for consistent grouping."""
+    if not name:
+        return ""
+    return " ".join(str(name).strip().title().split())
+
+
 def normalize_record(rec: dict) -> dict:
     return {
         "employee": normalize_employee_name(rec.get("employee")),
-        "project": (rec.get("project") or "").strip(),
+        "project": normalize_project_name(rec.get("project")),
         "month": normalize_month_label(rec.get("month")),
         "actual_hours": rec.get("actual_hours") or 0,
         "billable_hours": rec.get("billable_hours") or 0,

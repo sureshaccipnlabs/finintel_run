@@ -9,6 +9,7 @@ Supported formats:
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,77 @@ from .field_mapper import build_column_mapping, mapping_report, apply_mapping
 from .record_parser import parse_record
 from .dataset import append_records
 from .text_parser import parse_freeform_text, is_freeform_text, looks_like_timesheet_text
+
+
+def _extract_filename_target_months(filename: str):
+    """Return target month tokens from filenames like 'MAY-JAN-2026'.
+    Example output: ["MAY'26", "JAN'26"]. Returns [] if not a multi-month hint.
+    """
+    base = Path(filename).stem
+    month_hits = re.findall(
+        r"(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)",
+        base,
+        flags=re.IGNORECASE,
+    )
+    if len(month_hits) < 2:
+        return []
+
+    year_hits = re.findall(r"(\d{4}|\d{2})", base)
+    if not year_hits:
+        return []
+    year_2 = year_hits[-1][-2:]
+
+    out = []
+    for m in month_hits:
+        token = f"{m.upper()[:3]}'{year_2}"
+        if token not in out:
+            out.append(token)
+    return out
+
+
+def _month_key_from_text(text) -> Optional[str]:
+    if not text:
+        return None
+    m = re.search(
+        r"(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)\D*(\d{2,4})",
+        str(text),
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return f"{m.group(1).upper()[:3]}'{m.group(2)[-2:]}"
+
+
+def _sheet_month_key(sheet_name: str, sheet_data: dict) -> Optional[str]:
+    by_name = _month_key_from_text(sheet_name)
+    if by_name:
+        return by_name
+    for emp in sheet_data.get("employees", []):
+        by_emp = _month_key_from_text(emp.get("month"))
+        if by_emp:
+            return by_emp
+    return None
+
+
+def _sheet_quality_score(sheet_data: dict):
+    emps = sheet_data.get("employees", [])
+    total = len(emps)
+    with_both_rates = sum(1 for e in emps if e.get("billing_rate") and e.get("cost_rate"))
+    total_revenue = sheet_data.get("summary", {}).get("total_revenue", 0) or 0
+    return (with_both_rates, total, total_revenue)
+
+
+def _rebuild_overall_summary_from_sheets(sheets: dict) -> dict:
+    total_revenue = round(sum(s.get("summary", {}).get("total_revenue", 0) for s in sheets.values()), 2)
+    total_cost = round(sum(s.get("summary", {}).get("total_cost", 0) for s in sheets.values()), 2)
+    total_profit = round(sum(s.get("summary", {}).get("total_profit", 0) for s in sheets.values()), 2)
+    avg_margin = round((total_profit / total_revenue) * 100, 2) if total_revenue > 0 else 0
+    return {
+        "total_revenue": total_revenue,
+        "total_cost": total_cost,
+        "total_profit": total_profit,
+        "avg_margin_pct": avg_margin,
+    }
 
 def ingest_file(filepath: str, time_range: Optional[str] = None, original_filename: Optional[str] = None) -> dict:
     errors = []
@@ -28,22 +100,33 @@ def ingest_file(filepath: str, time_range: Optional[str] = None, original_filena
     # ── STEP 1: Excel Timesheet (.xlsx, .xls) ───────────────────────────
     if filepath.lower().endswith((".xlsx", ".xls")):
         try:
-            import re as _re
             from .timesheet_parser import parse_timesheet
 
-            # Extract target month from filename (e.g. "MARCH-2026" or "March_2026")
-            basename = Path(original_filename or filepath).stem
-            month_match = _re.search(
-                r'(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)'
-                r'[\s_-]*(\d{2,4})',
-                basename, _re.IGNORECASE
-            )
-            target_month = None
-            if month_match:
-                month_token = month_match.group(1).upper()[:3]
-                target_month = f"{month_token}'{month_match.group(2)[-2:]}"
+            # For multi-month filenames like MAY-JAN-2026, process only those months.
+            # Otherwise, process all timesheet sheets in the workbook.
+            target_months = _extract_filename_target_months(original_filename or filepath)
+            ts_result = parse_timesheet(filepath)
 
-            ts_result = parse_timesheet(filepath, target_month=target_month)
+            if target_months:
+                target_set = set(target_months)
+                # Keep only the best sheet per target month key.
+                best_by_month = {}
+                for sheet_name, sheet_data in ts_result.get("sheets", {}).items():
+                    key = _sheet_month_key(sheet_name, sheet_data)
+                    if key not in target_set:
+                        continue
+                    current = best_by_month.get(key)
+                    if not current:
+                        best_by_month[key] = (sheet_name, sheet_data)
+                        continue
+                    _, current_data = current
+                    if _sheet_quality_score(sheet_data) > _sheet_quality_score(current_data):
+                        best_by_month[key] = (sheet_name, sheet_data)
+
+                filtered_sheets = {name: data for name, data in best_by_month.values()}
+                if filtered_sheets:
+                    ts_result["sheets"] = filtered_sheets
+                    ts_result["overall_summary"] = _rebuild_overall_summary_from_sheets(filtered_sheets)
 
             all_employees = []
             for sheet in ts_result.get("sheets", {}).values():

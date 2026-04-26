@@ -182,9 +182,9 @@ def _normalize_extracted(r: dict) -> dict:
         except (ValueError, TypeError):
             return 0
 
-    from .normalizer import normalize_month_label
+    from .normalizer import normalize_month_label, normalize_project_name
     employee = str(r.get("employee", "")).strip().title()
-    project = str(r.get("project", "Unknown")).strip()
+    project = normalize_project_name(r.get("project", "Unknown")) or "Unknown"
     month = normalize_month_label(r.get("month")) or "Unknown"
     actual_hours = _float(r.get("actual_hours"))
     billing_rate = _float(r.get("billing_rate"))
