@@ -1592,7 +1592,7 @@ def get_risks_and_recommendations(
         "data_quality":        data_quality,
         "sources":             explainability_sources,
         "employee_scorecards": scorecards,
-        "ai_insights":         ai_insights,
+        "ai_insights":         [s for s in ai_insights.split("\n") if s.strip()],
         "summary":             overall,
         "projects_at_risk":    projects_at_risk,
         "meta": {
@@ -1626,7 +1626,7 @@ def _empty_response() -> dict:
                                  "missing_fields": {}, "notes": "No records available for risk analysis."},
         "sources":             [],
         "employee_scorecards": [],
-        "ai_insights":         "",
+        "ai_insights":         [],
         "summary":             {},
         "meta":                {"time_range": "ALL", "total_employees": 0, "total_risks": 0,
                                 "action_needed": 0, "records_analysed": 0},
