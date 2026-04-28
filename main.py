@@ -2,11 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
-from ingestion.ingest import (
-    ingest_file,
-    extract_cost_rates_from_excel,
-    apply_cost_rates_to_global_dataset,
-)
+from ingestion.ingest import ingest_file
 from ingestion.dataset import (
     GLOBAL_DATASET, transform_to_api_format, filter_by_range,
     build_projects, build_monthly, build_overall_summary,
@@ -22,12 +18,6 @@ import tempfile
 import os
 
 _ingest_pool = ThreadPoolExecutor(max_workers=4)
-
-
-def _looks_like_cost_reference(filename: str) -> bool:
-    name = (filename or "").lower()
-    tokens = ("cost", "ctc", "rate card", "ratecard", "salary", "resource cost")
-    return any(t in name for t in tokens)
 
 app = FastAPI(title="FinIntel AI", description="AI-powered Financial Document Intelligence System")
 
@@ -75,54 +65,16 @@ async def ingest(files: List[UploadFile] = File(...)):
     # Phase 2: Process all files in parallel (heavy, concurrent)
     def _process_one(item):
         result = ingest_file(item["tmp_path"], original_filename=item["filename"])
-
-        cost_map = None
-        ext = os.path.splitext(item["filename"])[1].lower()
-        if ext in (".xlsx", ".xls") and _looks_like_cost_reference(item["filename"]):
-            try:
-                cost_map = extract_cost_rates_from_excel(item["tmp_path"])
-            except Exception as e:
-                cost_map = {"error": str(e), "employee_rates": {}, "employee_project_rates": {}}
-
         try:
             os.unlink(item["tmp_path"])
         except OSError:
             pass
         result.pop("overall_summary", None)
-        return {"filename": item["filename"], "result": result, "cost_map": cost_map}
+        return {"filename": item["filename"], "result": result}
 
     loop = asyncio.get_event_loop()
     tasks = [loop.run_in_executor(_ingest_pool, _process_one, item) for item in staged]
     results = await asyncio.gather(*tasks)
-
-    merged_employee_rates = {}
-    merged_employee_project_rates = {}
-    cost_sources = []
-    for row in results:
-        cm = row.get("cost_map")
-        if not cm or cm.get("error"):
-            continue
-        merged_employee_rates.update(cm.get("employee_rates") or {})
-        merged_employee_project_rates.update(cm.get("employee_project_rates") or {})
-        cost_sources.append({
-            "filename": row.get("filename"),
-            "rows_scanned": cm.get("rows_scanned", 0),
-            "mapped_rows": cm.get("mapped_rows", 0),
-        })
-
-    cost_merge_summary = None
-    if merged_employee_rates or merged_employee_project_rates:
-        merge_stats = apply_cost_rates_to_global_dataset(
-            merged_employee_rates,
-            merged_employee_project_rates,
-        )
-        cost_merge_summary = {
-            "cost_files_used": len(cost_sources),
-            "employee_rate_mappings": len(merged_employee_rates),
-            "employee_project_rate_mappings": len(merged_employee_project_rates),
-            "merge_stats": merge_stats,
-            "sources": cost_sources,
-        }
 
     return {
         "status": "success",
@@ -131,7 +83,6 @@ async def ingest(files: List[UploadFile] = File(...)):
         "months_available": get_months_available(),
         "data_warnings": _build_data_warnings(GLOBAL_DATASET),
         "results": results,
-        "cost_rate_merge": cost_merge_summary,
         "overall_summary": build_overall_summary(GLOBAL_DATASET),
     }
 

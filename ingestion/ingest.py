@@ -13,12 +13,10 @@ import re
 from pathlib import Path
 from typing import Optional
 
-import pandas as pd
-
 from .file_reader import read_file
 from .field_mapper import build_column_mapping, mapping_report, apply_mapping
 from .record_parser import parse_record
-from .dataset import append_records, GLOBAL_DATASET
+from .dataset import append_records
 from .text_parser import parse_freeform_text, is_freeform_text, looks_like_timesheet_text
 
 
@@ -90,140 +88,6 @@ def _rebuild_overall_summary_from_sheets(sheets: dict) -> dict:
         "total_cost": total_cost,
         "total_profit": total_profit,
         "avg_margin_pct": avg_margin,
-    }
-
-
-def _norm_emp(v: str) -> str:
-    return " ".join(str(v or "").strip().title().split())
-
-
-def _norm_proj(v: str) -> str:
-    return " ".join(str(v or "").strip().lower().split())
-
-
-def _to_rate(v) -> Optional[float]:
-    if v is None:
-        return None
-    text = str(v).strip().replace(",", "")
-    text = text.replace("$", "")
-    if text == "":
-        return None
-    try:
-        return float(text)
-    except (TypeError, ValueError):
-        return None
-
-
-def extract_cost_rates_from_excel(filepath: str) -> dict:
-    """Extract employee cost-rate mappings from a standalone cost workbook."""
-    xl = pd.ExcelFile(filepath)
-    employee_rates: dict[str, float] = {}
-    employee_project_rates: dict[tuple[str, str], float] = {}
-    rows_scanned = 0
-    mapped_rows = 0
-
-    employee_keys = ("employee", "emp", "name", "resource", "consultant", "staff")
-    cost_keys = ("cost rate", "cost_rate", "ctc", "pay rate", "internal rate", "cost/hr", "resource cost")
-    project_keys = ("project", "client", "account", "engagement")
-
-    for sheet in xl.sheet_names:
-        try:
-            df = pd.read_excel(filepath, sheet_name=sheet, dtype=str)
-        except Exception:
-            continue
-        if df is None or df.empty:
-            continue
-
-        raw_cols = [str(c).strip() for c in df.columns]
-        cols_norm = {c: str(c).strip().lower() for c in raw_cols}
-
-        emp_col = next((c for c in raw_cols if any(k in cols_norm[c] for k in employee_keys)), None)
-        cost_col = next((c for c in raw_cols if any(k in cols_norm[c] for k in cost_keys)), None)
-        proj_col = next((c for c in raw_cols if any(k in cols_norm[c] for k in project_keys)), None)
-
-        if not emp_col or not cost_col:
-            continue
-
-        for _, row in df.iterrows():
-            rows_scanned += 1
-            emp = _norm_emp(row.get(emp_col))
-            rate = _to_rate(row.get(cost_col))
-            if not emp or rate is None or rate <= 0:
-                continue
-            employee_rates[emp] = rate
-            mapped_rows += 1
-
-            if proj_col:
-                proj = _norm_proj(row.get(proj_col))
-                if proj:
-                    employee_project_rates[(emp, proj)] = rate
-
-    return {
-        "employee_rates": employee_rates,
-        "employee_project_rates": employee_project_rates,
-        "rows_scanned": rows_scanned,
-        "mapped_rows": mapped_rows,
-        "sheet_count": len(xl.sheet_names),
-    }
-
-
-def apply_cost_rates_to_global_dataset(employee_rates: dict, employee_project_rates: dict) -> dict:
-    """Fill missing cost_rate in GLOBAL_DATASET using employee/project mappings."""
-    updated = 0
-    updated_employee_only = 0
-    untouched = 0
-
-    for rec in GLOBAL_DATASET:
-        current_rate = rec.get("cost_rate")
-        if current_rate not in (None, "", 0, 0.0):
-            untouched += 1
-            continue
-
-        emp = _norm_emp(rec.get("employee"))
-        proj = _norm_proj(rec.get("project"))
-        if not emp:
-            continue
-
-        new_rate = None
-        if proj:
-            new_rate = employee_project_rates.get((emp, proj))
-        if new_rate is None:
-            new_rate = employee_rates.get(emp)
-            if new_rate is not None:
-                updated_employee_only += 1
-
-        if new_rate is None:
-            continue
-
-        rec["cost_rate"] = float(new_rate)
-
-        actual_hours = float(rec.get("actual_hours") or 0)
-        leave_hours = float(rec.get("leave_hours") or 0)
-        hours_for_cost = actual_hours + leave_hours if leave_hours > 0 else actual_hours
-        rec["cost"] = round(hours_for_cost * float(new_rate), 2)
-
-        billing_rate = rec.get("billing_rate")
-        if billing_rate not in (None, "", 0, 0.0):
-            billable_hours = float(rec.get("billable_hours") or actual_hours)
-            rec["revenue"] = round(billable_hours * float(billing_rate), 2)
-
-        revenue = rec.get("revenue")
-        cost = rec.get("cost")
-        if revenue is not None and cost is not None:
-            rec["profit"] = round(float(revenue) - float(cost), 2)
-            rec["margin_pct"] = round((rec["profit"] / float(revenue)) * 100, 2) if float(revenue) > 0 else 0
-
-        flags = rec.get("validation_flags") or []
-        if "MISSING_COST_RATE" in flags:
-            flags = [f for f in flags if f != "MISSING_COST_RATE"]
-            rec["validation_flags"] = flags
-
-        updated += 1
-
-    return {
-        "updated_records": updated,
-        "updated_employee_only": updated_employee_only,
-        "untouched_records": untouched,
     }
 
 def ingest_file(filepath: str, time_range: Optional[str] = None, original_filename: Optional[str] = None) -> dict:
