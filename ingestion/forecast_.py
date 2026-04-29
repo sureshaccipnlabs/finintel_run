@@ -145,6 +145,52 @@ def _extract_freeform_targets(question: str) -> List[str]:
                 out.append(cleaned)
     return out
 
+def _llm_parse_question(question: str, known_projects: List[str], known_employees: List[str]) -> Optional[dict]:
+    """
+    Use LLM to parse a forecast question into structured parameters.
+    Returns dict with: is_forecast, metrics, scope, targets, horizon_type, horizon_value, explicit_periods
+    """
+    if not is_ollama_available():
+        return None
+    prompt = f"""You are a financial data assistant. Analyze this question and extract structured parameters for forecasting.
+
+Question: "{question}"
+
+Known projects in dataset: {', '.join(known_projects[:20]) if known_projects else 'None'}
+Known employees in dataset: {', '.join(known_employees[:20]) if known_employees else 'None'}
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "is_forecast": true or false,
+  "metrics": ["revenue", "profit", "leaves", "hours", "utilization", "cost", "headcount", "vacation", "holidays", "working_days"],
+  "scope": "overall" or "project" or "employee",
+  "targets": ["Project or Employee Name", ...],
+  "horizon_type": "months" or "quarters" or "explicit_months" or "explicit_quarter",
+  "horizon_value": 3,
+  "explicit_periods": ["July 2026", "Q3 2026", ...]
+}}
+
+Rules:
+1. is_forecast=true if the question asks about future predictions, forecasts, estimates, projections, or expected values.
+2. metrics: list only the metrics mentioned or implied. Use lowercase keys.
+3. scope: "project" if asking about specific project(s), "employee" if about specific employee(s), else "overall".
+4. targets: list the project or employee names mentioned. Match to known names if possible.
+5. horizon_type: "months" for "next N months", "quarters" for "next N quarters", "explicit_months" for specific months like "July 2026", "explicit_quarter" for "Q3 2026".
+6. horizon_value: the number of months or quarters requested (e.g., 3 for "next 3 months").
+7. explicit_periods: list specific periods mentioned (e.g., ["July 2026", "August 2026"] or ["Q3 2026"]).
+8. If no metrics specified, return empty list for metrics.
+9. If not a forecast question, set is_forecast=false and leave other fields empty/default.
+"""
+    try:
+        raw = _ollama_generate(prompt, timeout=30)
+        parsed = _extract_json(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception as exc:
+        print(f"[forecast_] LLM question parsing failed: {exc}")
+    return None
+
+
 def _llm_advise_settings(question: str, months: List[str], series: Dict[str, List[float]]) -> Optional[dict]:
     if not is_ollama_available():
         return None
@@ -773,7 +819,7 @@ def _format_month_line(idx: int, label: str, metrics: List[str], fmap: Dict[str,
     if "total_hours" in metrics and fmap.get("total_hours"):
         v = _apply_adjustment(fmap['total_hours'][step_idx], 'total_hours', label, adj_map)
         parts.append(f"Hours: {_fmt_int(_clamp_nonneg(v))}")
-    lead = f"- MonthNo: {idx} | Month: {label}"
+    lead = f"- Month: {label}"
     if group_type and group_name:
         lead += f" | {group_type.capitalize()}: {group_name}"
     return lead + " | " + " | ".join(parts)
@@ -818,10 +864,58 @@ def _format_quarter_line(idx: int, qlabel: str, metrics: List[str], qagg: Dict[s
         if hours_band_pct is not None:
             htxt += f" (±{hours_band_pct:.1f}%)"
         parts.append(htxt)
-    lead = f"- QuarterNo: {idx} | Quarter: {qlabel}"
+    lead = f"- Quarter: {qlabel}"
     if group_type and group_name:
         lead += f" | {group_type.capitalize()}: {group_name}"
     return lead + " | " + " | ".join(parts)
+
+
+def _map_llm_metrics(llm_metrics: List[str]) -> List[str]:
+    """Map LLM metric names to internal metric keys."""
+    mapping = {
+        "revenue": "revenue", "profit": "profit", "cost": "cost",
+        "leaves": "leave_days", "leave": "leave_days", "leave_days": "leave_days",
+        "vacation": "vacation_days", "vacations": "vacation_days", "vacation_days": "vacation_days",
+        "holidays": "holiday_days", "holiday": "holiday_days", "holiday_days": "holiday_days",
+        "hours": "total_hours", "total_hours": "total_hours", "work_hours": "total_hours",
+        "utilization": "utilization", "utilisation": "utilization",
+        "headcount": "headcount", "head_count": "headcount",
+        "working_days": "working_days", "workdays": "working_days",
+    }
+    out = []
+    for m in llm_metrics:
+        key = mapping.get(m.lower().strip())
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def _parse_llm_explicit_periods(periods: List[str], base: dt.date) -> Tuple[List[dt.date], Optional[Tuple]]:
+    """Parse explicit periods from LLM output into month dates and/or quarter tuple."""
+    explicit_months: List[dt.date] = []
+    explicit_quarter = None
+    for p in periods:
+        p = (p or "").strip()
+        if not p:
+            continue
+        # Try quarter format: Q1 2026, Q2 2026, etc.
+        qm = re.match(r"(?i)q([1-4])\s*(\d{4})", p)
+        if qm:
+            qn = int(qm.group(1))
+            yr = int(qm.group(2))
+            start_month = dt.date(yr, (qn - 1) * 3 + 1, 1)
+            explicit_quarter = (qn, yr, start_month, f"Q{qn} {yr}")
+            continue
+        # Try month format: July 2026, Jul 2026, etc.
+        for fmt in ("%B %Y", "%b %Y", "%B-%Y", "%b-%Y"):
+            try:
+                d = dt.datetime.strptime(p, fmt).date().replace(day=1)
+                if d not in explicit_months:
+                    explicit_months.append(d)
+                break
+            except ValueError:
+                continue
+    return explicit_months, explicit_quarter
 
 
 def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[str]:
@@ -835,83 +929,160 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
     last_label = months[-1]
     base = _parse_month_date(last_label) or dt.date.today().replace(day=1)
 
-    months_n = _select_months_count(q)
-    quarters_n = _select_quarters_count(q)
-    explicit_quarter = _find_target_quarter(q)
-    explicit_months = _find_target_months(q, base)
+    # Collect known entities for LLM context
+    known_projects = _distinct_values(recs, "project")
+    known_emps = _distinct_values(recs, "employee")
 
-    intent = bool(months_n or quarters_n or explicit_quarter or explicit_months) \
-        or any(w in q for w in ["forecast", "predict", "projection", "estimate"]) \
-        or any(w in q for w in ["expected", "projected", "future", "futuristic"]) \
-        or any(p in q for p in ["next month", "next quarter", "next months", "upcoming months", "coming months"]) \
-        or bool(re.search(r"(?i)next\s+\d+\s*(months?|qtrs?|quarters?)\b", q))
-    if not intent:
-        return None
+    # --- LLM-based question parsing (primary) ---
+    llm_parsed = _llm_parse_question(question, known_projects, known_emps)
+    use_llm = llm_parsed and llm_parsed.get("is_forecast") is True
 
-    metrics = _select_metrics(question)
-    if not metrics:
-        metrics = ["revenue", "profit", "headcount", "utilization"]
+    if use_llm:
+        # Extract parameters from LLM response
+        llm_metrics = _map_llm_metrics(llm_parsed.get("metrics") or [])
+        llm_scope = (llm_parsed.get("scope") or "overall").lower()
+        llm_targets = llm_parsed.get("targets") or []
+        llm_horizon_type = (llm_parsed.get("horizon_type") or "").lower()
+        llm_horizon_value = llm_parsed.get("horizon_value")
+        llm_explicit_periods = llm_parsed.get("explicit_periods") or []
 
-    scope, targets = _detect_scope(q, recs)
-    # Extra: if a concrete 'project X' was asked, try to map to known projects; if no match, stop early
-    req_projects = _extract_requested_projects(question)
-    if req_projects:
-        known_projects = _distinct_values(recs, "project")
-        kp_norm = { _norm_key(p): p for p in known_projects }
-        matched: List[str] = []
-        for rp in req_projects:
-            nn = _norm_key(rp)
-            # exact norm match
-            if nn in kp_norm:
-                matched.append(kp_norm[nn])
-            else:
-                # fuzzy contains
-                for kn, orig in kp_norm.items():
-                    if nn and (nn in kn or kn in nn):
-                        matched.append(orig)
-        matched = sorted(set(matched))
-        if not matched:
-            return f"Project not found\n- No matching project for '{', '.join(req_projects)}'"
-        scope = "project"
-        targets = matched
+        # Parse explicit periods
+        explicit_months, explicit_quarter = _parse_llm_explicit_periods(llm_explicit_periods, base)
 
-    # Extra: explicit employee guard
-    req_employees = _extract_requested_employees(question)
-    if req_employees:
-        known_emps = _distinct_values(recs, "employee")
-        ke_norm = { _norm_key(e): e for e in known_emps }
-        matched_e: List[str] = []
-        for re_emp in req_employees:
-            nn = _norm_key(re_emp)
-            if nn in ke_norm:
-                matched_e.append(ke_norm[nn])
-            else:
-                for kn, orig in ke_norm.items():
-                    if nn and (nn in kn or kn in nn):
-                        matched_e.append(orig)
-        matched_e = sorted(set(matched_e))
-        if not matched_e:
-            return f"Employee not found\n- No matching employee for '{', '.join(req_employees)}'"
-        scope = "employee"
-        targets = matched_e
+        # Determine months_n / quarters_n from LLM
+        months_n = None
+        quarters_n = None
+        if llm_horizon_type == "months" and llm_horizon_value:
+            try:
+                months_n = int(llm_horizon_value)
+            except Exception:
+                months_n = 1
+        elif llm_horizon_type == "quarters" and llm_horizon_value:
+            try:
+                quarters_n = int(llm_horizon_value)
+            except Exception:
+                quarters_n = 1
+        elif llm_horizon_type == "explicit_months":
+            pass  # explicit_months already set
+        elif llm_horizon_type == "explicit_quarter":
+            pass  # explicit_quarter already set
 
-    # Extra: freeform 'for <name>' guard — if exactly one target mentioned and it doesn't match any known entity, stop early
-    free_targets = _extract_freeform_targets(question)
-    if len(free_targets) == 1 and not (req_projects or req_employees):
-        token = free_targets[0]
-        known_projects = _distinct_values(recs, "project")
-        known_emps = _distinct_values(recs, "employee")
-        kp_norm = { _norm_key(p): p for p in known_projects }
-        ke_norm = { _norm_key(e): e for e in known_emps }
-        nn = _norm_key(token)
-        exists = nn in kp_norm or nn in ke_norm
-        if not exists:
-            # also try contains
-            exists = any(nn in k for k in kp_norm.keys()) or any(nn in k for k in ke_norm.keys())
-        if not exists:
-            return f"Target not found\n- '{token}' does not match any project or employee in the dataset."
+        # Default horizon if none specified
+        if not months_n and not quarters_n and not explicit_months and not explicit_quarter:
+            months_n = 1  # default to next month
 
-    # LLM guidance (overall snapshot)
+        # Metrics
+        metrics = llm_metrics if llm_metrics else ["revenue", "profit"]
+
+        # Scope and targets
+        scope = llm_scope if llm_scope in ("overall", "project", "employee") else "overall"
+        targets: List[str] = []
+
+        # Validate and match targets
+        if scope == "project" and llm_targets:
+            kp_norm = {_norm_key(p): p for p in known_projects}
+            matched: List[str] = []
+            for t in llm_targets:
+                nn = _norm_key(t)
+                if nn in kp_norm:
+                    matched.append(kp_norm[nn])
+                else:
+                    for kn, orig in kp_norm.items():
+                        if nn and (nn in kn or kn in nn):
+                            matched.append(orig)
+            matched = sorted(set(matched))
+            if not matched:
+                return f"Project not found\n- No matching project for '{', '.join(llm_targets)}'"
+            targets = matched
+        elif scope == "employee" and llm_targets:
+            ke_norm = {_norm_key(e): e for e in known_emps}
+            matched_e: List[str] = []
+            for t in llm_targets:
+                nn = _norm_key(t)
+                if nn in ke_norm:
+                    matched_e.append(ke_norm[nn])
+                else:
+                    for kn, orig in ke_norm.items():
+                        if nn and (nn in kn or kn in nn):
+                            matched_e.append(orig)
+            matched_e = sorted(set(matched_e))
+            if not matched_e:
+                return f"Employee not found\n- No matching employee for '{', '.join(llm_targets)}'"
+            targets = matched_e
+
+    else:
+        # --- Regex-based fallback (when LLM unavailable or says not a forecast) ---
+        months_n = _select_months_count(q)
+        quarters_n = _select_quarters_count(q)
+        explicit_quarter = _find_target_quarter(q)
+        explicit_months = _find_target_months(q, base)
+
+        intent = bool(months_n or quarters_n or explicit_quarter or explicit_months) \
+            or any(w in q for w in ["forecast", "predict", "projection", "estimate"]) \
+            or any(w in q for w in ["expected", "projected", "future", "futuristic"]) \
+            or any(p in q for p in ["next month", "next quarter", "next months", "upcoming months", "coming months"]) \
+            or bool(re.search(r"(?i)next\s+\d+\s*(months?|qtrs?|quarters?)\b", q))
+        if not intent:
+            return None
+
+        metrics = _select_metrics(question)
+        if not metrics:
+            metrics = ["revenue", "profit", "headcount", "utilization"]
+
+        scope, targets = _detect_scope(q, recs)
+
+        # Extra: if a concrete 'project X' was asked, try to map to known projects; if no match, stop early
+        req_projects = _extract_requested_projects(question)
+        if req_projects:
+            kp_norm = {_norm_key(p): p for p in known_projects}
+            matched: List[str] = []
+            for rp in req_projects:
+                nn = _norm_key(rp)
+                if nn in kp_norm:
+                    matched.append(kp_norm[nn])
+                else:
+                    for kn, orig in kp_norm.items():
+                        if nn and (nn in kn or kn in nn):
+                            matched.append(orig)
+            matched = sorted(set(matched))
+            if not matched:
+                return f"Project not found\n- No matching project for '{', '.join(req_projects)}'"
+            scope = "project"
+            targets = matched
+
+        # Extra: explicit employee guard
+        req_employees = _extract_requested_employees(question)
+        if req_employees:
+            ke_norm = {_norm_key(e): e for e in known_emps}
+            matched_e: List[str] = []
+            for re_emp in req_employees:
+                nn = _norm_key(re_emp)
+                if nn in ke_norm:
+                    matched_e.append(ke_norm[nn])
+                else:
+                    for kn, orig in ke_norm.items():
+                        if nn and (nn in kn or kn in nn):
+                            matched_e.append(orig)
+            matched_e = sorted(set(matched_e))
+            if not matched_e:
+                return f"Employee not found\n- No matching employee for '{', '.join(req_employees)}'"
+            scope = "employee"
+            targets = matched_e
+
+        # Extra: freeform 'for <name>' guard
+        free_targets = _extract_freeform_targets(question)
+        if len(free_targets) == 1 and not (req_projects or req_employees):
+            token = free_targets[0]
+            kp_norm = {_norm_key(p): p for p in known_projects}
+            ke_norm = {_norm_key(e): e for e in known_emps}
+            nn = _norm_key(token)
+            exists = nn in kp_norm or nn in ke_norm
+            if not exists:
+                exists = any(nn in k for k in kp_norm.keys()) or any(nn in k for k in ke_norm.keys())
+            if not exists:
+                return f"Target not found\n- '{token}' does not match any project or employee in the dataset."
+
+    # LLM guidance for forecasting method (overall snapshot)
     overall_series = _build_overall_series(recs)
     cfg = _llm_advise_settings(question, months, overall_series)
     adj_map = _build_adjustment_map(cfg)

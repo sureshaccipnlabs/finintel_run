@@ -394,7 +394,7 @@ def ask(question: str, time_range: str = None) -> dict:
         rows = _extract_rows(fc_answer)
         if rows:
             preferred_cols = [
-                "month_no", "month", "quarter_no", "quarter",
+                "month", "quarter",
                 "project", "employee",
                 "revenue", "cost", "profit", "headcount", "utilization_pct",
                 "leave_days", "vacation_days", "holiday_days", "working_days", "hours",
