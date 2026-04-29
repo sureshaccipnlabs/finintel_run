@@ -119,3 +119,13 @@ The ingestion flow supports:
 - If you get dependency import errors, run `uv sync` again.
 - If Q&A responses fail, make sure Ollama is running.
 
+### AI behavior (current)
+
+Notes:
+
+- `GET /risks-recommendations` uses Ollama for `ai_insights`.
+- If Ollama is unavailable, insights return empty text and rule-based risks/recommendations still return.
+- Q&A uses Ollama (`POST /ask`).
+- `GET /risks-recommendations` now also returns compact grouped fields: `overview`, `risk_groups`, `recommendation_groups`, `top_risks`, and `top_recommendations`.
+- Use query param `max_items` (default `8`, range `3-20`) to control compact list sizes.
+

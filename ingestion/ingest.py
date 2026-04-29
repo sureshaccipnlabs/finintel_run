@@ -10,13 +10,17 @@ Supported formats:
 
 import json
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
+
+import pandas as pd
 
 from .file_reader import read_file
 from .field_mapper import build_column_mapping, mapping_report, apply_mapping
 from .record_parser import parse_record
-from .dataset import append_records
+from .dataset import append_records, GLOBAL_DATASET
 from .text_parser import parse_freeform_text, is_freeform_text, looks_like_timesheet_text
 
 
@@ -59,6 +63,21 @@ def _month_key_from_text(text) -> Optional[str]:
     return f"{m.group(1).upper()[:3]}'{m.group(2)[-2:]}"
 
 
+def _month_parts_from_text(text) -> tuple[Optional[str], Optional[str]]:
+    if not text:
+        return None, None
+    m = re.search(
+        r"(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)\D*(\d{2,4})?",
+        str(text),
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None, None
+    month = m.group(1).upper()[:3]
+    year = m.group(2)[-2:] if m.group(2) else None
+    return month, year
+
+
 def _sheet_month_key(sheet_name: str, sheet_data: dict) -> Optional[str]:
     by_name = _month_key_from_text(sheet_name)
     if by_name:
@@ -88,6 +107,401 @@ def _rebuild_overall_summary_from_sheets(sheets: dict) -> dict:
         "total_cost": total_cost,
         "total_profit": total_profit,
         "avg_margin_pct": avg_margin,
+    }
+
+
+def _norm_emp(v: str) -> str:
+    return " ".join(str(v or "").strip().title().split())
+
+
+def _norm_proj(v: str) -> str:
+    return " ".join(str(v or "").strip().lower().split())
+
+
+def _to_rate(v) -> Optional[float]:
+    if v is None:
+        return None
+    text = str(v).strip().replace(",", "")
+    text = text.replace("$", "")
+    if text == "":
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_cost_rates_from_dataframe(df: pd.DataFrame) -> tuple[dict, dict, int, int]:
+    employee_rates: dict[str, float] = {}
+    employee_project_rates: dict[tuple[str, str], float] = {}
+    rows_scanned = 0
+    mapped_rows = 0
+
+    employee_keys = ("employee", "emp", "name", "resource", "consultant", "staff")
+    cost_keys = ("cost rate", "cost_rate", "ctc", "pay rate", "internal rate", "cost/hr", "resource cost", "cost")
+    project_keys = ("project", "client", "account", "engagement")
+
+    raw_cols = [str(c).strip() for c in df.columns]
+    cols_norm = {c: str(c).strip().lower() for c in raw_cols}
+
+    emp_col = next((c for c in raw_cols if any(k in cols_norm[c] for k in employee_keys)), None)
+    cost_col = next((c for c in raw_cols if any(k in cols_norm[c] for k in cost_keys)), None)
+    proj_col = next((c for c in raw_cols if any(k in cols_norm[c] for k in project_keys)), None)
+
+    if not emp_col or not cost_col:
+        return employee_rates, employee_project_rates, rows_scanned, mapped_rows
+
+    for _, row in df.iterrows():
+        rows_scanned += 1
+        emp = _norm_emp(row.get(emp_col))
+        rate = _to_rate(row.get(cost_col))
+        if not emp or rate is None or rate <= 0:
+            continue
+        employee_rates[emp] = rate
+        mapped_rows += 1
+
+        if proj_col:
+            proj = _norm_proj(row.get(proj_col))
+            if proj:
+                employee_project_rates[(emp, proj)] = rate
+
+    return employee_rates, employee_project_rates, rows_scanned, mapped_rows
+
+
+def _is_ods_file(filepath: str) -> bool:
+    try:
+        with zipfile.ZipFile(filepath, "r") as zf:
+            if "mimetype" not in zf.namelist():
+                return False
+            mt = zf.read("mimetype").decode("utf-8", errors="ignore").strip()
+            return mt == "application/vnd.oasis.opendocument.spreadsheet"
+    except Exception:
+        return False
+
+
+def _extract_cost_rates_from_ods(filepath: str) -> dict:
+    table_ns = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    text_ns = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+
+    with zipfile.ZipFile(filepath, "r") as zf:
+        content_xml = zf.read("content.xml")
+    root = ET.fromstring(content_xml)
+
+    employee_rates: dict[str, float] = {}
+    employee_project_rates: dict[tuple[str, str], float] = {}
+    rows_scanned = 0
+    mapped_rows = 0
+    sheet_count = 0
+
+    employee_keys = ("employee", "emp", "name", "resource", "consultant", "staff")
+    cost_keys = ("cost rate", "cost_rate", "ctc", "pay rate", "internal rate", "cost/hr", "resource cost", "cost")
+    project_keys = ("project", "client", "account", "engagement")
+
+    for table in root.findall(f".//{{{table_ns}}}table"):
+        sheet_count += 1
+        rows = []
+        for row_el in table.findall(f"{{{table_ns}}}table-row"):
+            row_vals = []
+            for cell in list(row_el):
+                tag = cell.tag
+                if not tag.endswith("table-cell"):
+                    continue
+                repeat = int(cell.attrib.get(f"{{{table_ns}}}number-columns-repeated", "1"))
+                txt = " ".join(
+                    (p.text or "").strip()
+                    for p in cell.findall(f"{{{text_ns}}}p")
+                    if (p.text or "").strip()
+                ).strip()
+                if txt == "":
+                    txt = cell.attrib.get(f"{{urn:oasis:names:tc:opendocument:xmlns:office:1.0}}value", "")
+                for _ in range(max(repeat, 1)):
+                    row_vals.append(txt)
+            if any(str(v).strip() for v in row_vals):
+                rows.append(row_vals)
+
+        if not rows:
+            continue
+
+        header_idx = None
+        for i, r in enumerate(rows[:12]):
+            low = [str(c).strip().lower() for c in r]
+            has_emp = any(any(k in c for k in employee_keys) for c in low)
+            has_cost = any(any(k in c for k in cost_keys) for c in low)
+            if has_emp and has_cost:
+                header_idx = i
+                break
+        if header_idx is None:
+            continue
+
+        headers = [str(c).strip() or f"col_{j}" for j, c in enumerate(rows[header_idx])]
+        data_rows = rows[header_idx + 1:]
+        if not data_rows:
+            continue
+
+        max_len = max(len(headers), max(len(r) for r in data_rows))
+        headers = (headers + [f"col_{i}" for i in range(len(headers), max_len)])[:max_len]
+        normalized_rows = []
+        for r in data_rows:
+            vals = list(r) + [""] * (max_len - len(r))
+            normalized_rows.append({headers[i]: vals[i] for i in range(max_len)})
+
+        df = pd.DataFrame(normalized_rows)
+        er, epr, rs, mr = _extract_cost_rates_from_dataframe(df)
+        employee_rates.update(er)
+        employee_project_rates.update(epr)
+        rows_scanned += rs
+        mapped_rows += mr
+
+    return {
+        "employee_rates": employee_rates,
+        "employee_project_rates": employee_project_rates,
+        "rows_scanned": rows_scanned,
+        "mapped_rows": mapped_rows,
+        "sheet_count": sheet_count,
+    }
+
+
+def _xml_local_name(tag: str) -> str:
+    if "}" in tag:
+        return tag.rsplit("}", 1)[1]
+    return tag
+
+
+def _xlsx_col_to_index(cell_ref: str) -> int:
+    letters = ""
+    for ch in str(cell_ref or ""):
+        if ch.isalpha():
+            letters += ch.upper()
+        else:
+            break
+    if not letters:
+        return 0
+    idx = 0
+    for ch in letters:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return max(0, idx - 1)
+
+
+def _extract_cost_rates_from_xlsx_zip(filepath: str) -> dict:
+    employee_rates: dict[str, float] = {}
+    employee_project_rates: dict[tuple[str, str], float] = {}
+    rows_scanned = 0
+    mapped_rows = 0
+
+    with zipfile.ZipFile(filepath, "r") as zf:
+        names = zf.namelist()
+        sheet_files = sorted(n for n in names if n.startswith("xl/worksheets/") and n.endswith(".xml"))
+        if not sheet_files:
+            return {
+                "employee_rates": employee_rates,
+                "employee_project_rates": employee_project_rates,
+                "rows_scanned": rows_scanned,
+                "mapped_rows": mapped_rows,
+                "sheet_count": 0,
+            }
+
+        shared_strings = []
+        if "xl/sharedStrings.xml" in names:
+            ss_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in ss_root.iter():
+                if _xml_local_name(si.tag) != "si":
+                    continue
+                chunks = []
+                for node in si.iter():
+                    if _xml_local_name(node.tag) == "t" and node.text:
+                        chunks.append(node.text)
+                shared_strings.append("".join(chunks).strip())
+
+        for sheet_file in sheet_files:
+            root = ET.fromstring(zf.read(sheet_file))
+            rows = []
+            for row_el in root.iter():
+                if _xml_local_name(row_el.tag) != "row":
+                    continue
+                row_vals = []
+                for c in list(row_el):
+                    if _xml_local_name(c.tag) != "c":
+                        continue
+                    ref = c.attrib.get("r", "")
+                    col_idx = _xlsx_col_to_index(ref)
+                    while len(row_vals) <= col_idx:
+                        row_vals.append("")
+
+                    cell_type = c.attrib.get("t", "")
+                    val = ""
+                    if cell_type == "inlineStr":
+                        parts = []
+                        for n in c.iter():
+                            if _xml_local_name(n.tag) == "t" and n.text:
+                                parts.append(n.text)
+                        val = "".join(parts).strip()
+                    else:
+                        v_el = next((n for n in list(c) if _xml_local_name(n.tag) == "v"), None)
+                        raw = (v_el.text or "").strip() if v_el is not None else ""
+                        if cell_type == "s" and raw.isdigit():
+                            idx = int(raw)
+                            if 0 <= idx < len(shared_strings):
+                                val = shared_strings[idx]
+                            else:
+                                val = raw
+                        else:
+                            val = raw
+
+                    row_vals[col_idx] = val
+
+                if any(str(v).strip() for v in row_vals):
+                    rows.append(row_vals)
+
+            if not rows:
+                continue
+
+            header_idx = None
+            employee_keys = ("employee", "emp", "name", "resource", "consultant", "staff")
+            cost_keys = ("cost rate", "cost_rate", "ctc", "pay rate", "internal rate", "cost/hr", "resource cost", "cost")
+            for i, r in enumerate(rows[:12]):
+                low = [str(c).strip().lower() for c in r]
+                has_emp = any(any(k in c for k in employee_keys) for c in low)
+                has_cost = any(any(k in c for k in cost_keys) for c in low)
+                if has_emp and has_cost:
+                    header_idx = i
+                    break
+
+            if header_idx is None:
+                continue
+
+            headers = [str(c).strip() or f"col_{j}" for j, c in enumerate(rows[header_idx])]
+            data_rows = rows[header_idx + 1:]
+            if not data_rows:
+                continue
+
+            max_len = max(len(headers), max(len(r) for r in data_rows))
+            headers = (headers + [f"col_{i}" for i in range(len(headers), max_len)])[:max_len]
+            normalized_rows = []
+            for r in data_rows:
+                vals = list(r) + [""] * (max_len - len(r))
+                normalized_rows.append({headers[i]: vals[i] for i in range(max_len)})
+
+            df = pd.DataFrame(normalized_rows)
+            er, epr, rs, mr = _extract_cost_rates_from_dataframe(df)
+            employee_rates.update(er)
+            employee_project_rates.update(epr)
+            rows_scanned += rs
+            mapped_rows += mr
+
+    return {
+        "employee_rates": employee_rates,
+        "employee_project_rates": employee_project_rates,
+        "rows_scanned": rows_scanned,
+        "mapped_rows": mapped_rows,
+        "sheet_count": len(sheet_files),
+    }
+
+
+def extract_cost_rates_from_excel(filepath: str) -> dict:
+    """Extract employee cost-rate mappings from standalone cost workbook."""
+    try:
+        xl = pd.ExcelFile(filepath)
+        employee_rates: dict[str, float] = {}
+        employee_project_rates: dict[tuple[str, str], float] = {}
+        rows_scanned = 0
+        mapped_rows = 0
+
+        for sheet in xl.sheet_names:
+            try:
+                df = pd.read_excel(filepath, sheet_name=sheet, dtype=str)
+            except Exception:
+                continue
+            if df is None or df.empty:
+                continue
+            er, epr, rs, mr = _extract_cost_rates_from_dataframe(df)
+            employee_rates.update(er)
+            employee_project_rates.update(epr)
+            rows_scanned += rs
+            mapped_rows += mr
+
+        result = {
+            "employee_rates": employee_rates,
+            "employee_project_rates": employee_project_rates,
+            "rows_scanned": rows_scanned,
+            "mapped_rows": mapped_rows,
+            "sheet_count": len(xl.sheet_names),
+        }
+        if result["mapped_rows"] == 0:
+            return _extract_cost_rates_from_xlsx_zip(filepath)
+        return result
+    except Exception:
+        if _is_ods_file(filepath):
+            return _extract_cost_rates_from_ods(filepath)
+        return _extract_cost_rates_from_xlsx_zip(filepath)
+
+
+def apply_cost_rates_to_global_dataset(
+    employee_rates: dict,
+    employee_project_rates: dict,
+    allowed_months: Optional[set[str]] = None,
+    allowed_years: Optional[set[str]] = None,
+) -> dict:
+    """Fill missing cost_rate in GLOBAL_DATASET and recalculate financial fields."""
+    updated = 0
+    updated_employee_only = 0
+    untouched = 0
+    employees_with_project_rates = {emp for emp, _ in employee_project_rates.keys()}
+
+    for rec in GLOBAL_DATASET:
+        current_rate = rec.get("cost_rate")
+        if current_rate not in (None, "", 0, 0.0):
+            untouched += 1
+            continue
+
+        if allowed_months:
+            rec_month, rec_year = _month_parts_from_text(rec.get("month"))
+            if not rec_month or rec_month not in allowed_months:
+                continue
+            if allowed_years and (not rec_year or rec_year not in allowed_years):
+                continue
+
+        emp = _norm_emp(rec.get("employee"))
+        proj = _norm_proj(rec.get("project"))
+        if not emp:
+            continue
+
+        new_rate = employee_project_rates.get((emp, proj)) if proj else None
+        if new_rate is None:
+            if emp not in employees_with_project_rates:
+                new_rate = employee_rates.get(emp)
+                if new_rate is not None:
+                    updated_employee_only += 1
+        if new_rate is None:
+            continue
+
+        rec["cost_rate"] = float(new_rate)
+
+        actual_hours = float(rec.get("actual_hours") or 0)
+        leave_hours = float(rec.get("leave_hours") or 0)
+        hours_for_cost = actual_hours + leave_hours if leave_hours > 0 else actual_hours
+        rec["cost"] = round(hours_for_cost * float(new_rate), 2)
+
+        billing_rate = rec.get("billing_rate")
+        if billing_rate not in (None, "", 0, 0.0):
+            billable_hours = float(rec.get("billable_hours") or actual_hours)
+            rec["revenue"] = round(billable_hours * float(billing_rate), 2)
+
+        revenue = rec.get("revenue")
+        cost = rec.get("cost")
+        if revenue is not None and cost is not None:
+            rec["profit"] = round(float(revenue) - float(cost), 2)
+            rec["margin_pct"] = round((rec["profit"] / float(revenue)) * 100, 2) if float(revenue) > 0 else 0
+
+        flags = rec.get("validation_flags") or []
+        if "MISSING_COST_RATE" in flags:
+            rec["validation_flags"] = [f for f in flags if f != "MISSING_COST_RATE"]
+
+        updated += 1
+
+    return {
+        "updated_records": updated,
+        "updated_employee_only": updated_employee_only,
+        "untouched_records": untouched,
     }
 
 def ingest_file(filepath: str, time_range: Optional[str] = None, original_filename: Optional[str] = None) -> dict:
