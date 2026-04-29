@@ -1,17 +1,16 @@
 """
-ai_mapper.py — LLM-powered sheet analyser (Ollama local).
+ai_mapper.py — LLM-powered sheet analyser (Ollama/OpenAI).
 
 Two levels of AI assistance:
   1. ai_map_columns  — given a header row, map columns to semantic fields.
   2. ai_analyze_sheet — given the first N rows, detect full sheet structure
      (header row, column mapping, project name, data range).
 
-Requirements:
-    1. Install Ollama: https://ollama.com
-    2. Pull a model:   ollama pull llama3
-    3. Start server:   ollama serve  (usually auto-starts)
+Providers:
+    - Ollama (local): set AI_PROVIDER=ollama (or auto)
+    - OpenAI (API): set AI_PROVIDER=openai (or auto) and OPENAI_API_KEY
 
-Degrades gracefully — if Ollama is unreachable, returns empty results.
+Degrades gracefully — if configured provider is unreachable, returns empty results.
 """
 
 import json
@@ -22,6 +21,13 @@ import urllib.error
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
+
+OPENAI_URL = os.environ.get("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
+AI_PROVIDER_ORDER = os.environ.get("AI_PROVIDER_ORDER", "ollama,openai")
 
 TARGET_FIELDS = [
     "name", "project", "billing_rate", "cost_rate",
@@ -47,6 +53,70 @@ def _ollama_generate(prompt, timeout=60):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = json.loads(resp.read().decode())
         return body.get("response", "")
+
+
+def _openai_generate(prompt, timeout=60):
+    """Send a prompt to OpenAI Chat Completions and return response text."""
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    payload = json.dumps({
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+    }).encode()
+
+    req = urllib.request.Request(
+        OPENAI_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = json.loads(resp.read().decode())
+        choices = body.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        return message.get("content", "")
+
+
+def _normalized_provider_order() -> list[str]:
+    if AI_PROVIDER in ("ollama", "openai"):
+        return [AI_PROVIDER]
+
+    if AI_PROVIDER != "auto":
+        return ["ollama", "openai"]
+
+    order = []
+    for token in (AI_PROVIDER_ORDER or "").split(","):
+        p = token.strip().lower()
+        if p in ("ollama", "openai") and p not in order:
+            order.append(p)
+    if not order:
+        order = ["ollama", "openai"]
+    return order
+
+
+def _llm_generate(prompt, timeout=60):
+    """Generate text using preferred provider selection logic."""
+    errors = []
+    for provider in _normalized_provider_order():
+        try:
+            if provider == "ollama":
+                return _ollama_generate(prompt, timeout=timeout)
+            if provider == "openai":
+                return _openai_generate(prompt, timeout=timeout)
+        except Exception as exc:
+            errors.append(f"{provider}: {exc}")
+            if AI_PROVIDER in ("ollama", "openai"):
+                break
+            continue
+
+    raise RuntimeError("All configured LLM providers failed: " + " | ".join(errors))
 
 
 def _clean_json_text(raw):
@@ -106,6 +176,94 @@ def is_ollama_available():
     return _ollama_cache["available"]
 
 
+def is_openai_available():
+    """OpenAI considered available when API key is configured."""
+    return bool(OPENAI_API_KEY)
+
+
+def is_llm_available():
+    """Availability check based on configured provider preference."""
+    for provider in _normalized_provider_order():
+        if provider == "ollama" and is_ollama_available():
+            return True
+        if provider == "openai" and is_openai_available():
+            return True
+    return False
+
+
+def get_active_provider() -> str | None:
+    """Return the first currently available provider in preference order."""
+    for provider in _normalized_provider_order():
+        if provider == "ollama" and is_ollama_available():
+            return "ollama"
+        if provider == "openai" and is_openai_available():
+            return "openai"
+    return None
+
+
+def get_ai_provider_status() -> dict:
+    """Return runtime provider configuration and availability status."""
+    return {
+        "configured_provider": AI_PROVIDER,
+        "provider_order": _normalized_provider_order(),
+        "active_provider": get_active_provider(),
+        "active_available": is_llm_available(),
+        "providers": {
+            "ollama": {
+                "available": is_ollama_available(),
+                "url": OLLAMA_URL,
+                "model": OLLAMA_MODEL,
+            },
+            "openai": {
+                "available": is_openai_available(),
+                "url": OPENAI_URL,
+                "model": OPENAI_MODEL,
+                "api_key_configured": bool(OPENAI_API_KEY),
+            },
+        },
+    }
+
+
+def configure_ai_provider(
+    provider: str | None = None,
+    provider_order: str | None = None,
+    openai_api_key: str | None = None,
+    openai_model: str | None = None,
+    openai_url: str | None = None,
+    ollama_model: str | None = None,
+    ollama_url: str | None = None,
+) -> dict:
+    """Update provider runtime configuration and return latest status."""
+    global AI_PROVIDER, AI_PROVIDER_ORDER
+    global OPENAI_API_KEY, OPENAI_MODEL, OPENAI_URL
+    global OLLAMA_MODEL, OLLAMA_URL
+
+    if provider is not None:
+        p = provider.strip().lower()
+        if p not in ("ollama", "openai", "auto"):
+            raise ValueError("provider must be one of: ollama, openai, auto")
+        AI_PROVIDER = p
+
+    if provider_order is not None:
+        AI_PROVIDER_ORDER = provider_order.strip()
+
+    if openai_api_key is not None:
+        OPENAI_API_KEY = openai_api_key.strip()
+    if openai_model is not None:
+        OPENAI_MODEL = openai_model.strip() or OPENAI_MODEL
+    if openai_url is not None:
+        OPENAI_URL = openai_url.strip() or OPENAI_URL
+
+    if ollama_model is not None:
+        OLLAMA_MODEL = ollama_model.strip() or OLLAMA_MODEL
+    if ollama_url is not None:
+        OLLAMA_URL = ollama_url.strip() or OLLAMA_URL
+        _ollama_cache["available"] = None
+        _ollama_cache["checked_at"] = 0
+
+    return get_ai_provider_status()
+
+
 # ── Level 1: Column mapping (given a known header row) ───────────────────
 
 _COL_PROMPT = """\
@@ -142,7 +300,7 @@ def ai_map_columns(header_row, already_mapped=None):
         parts.append(f"  {i}: {str(v).strip() if v else '(empty)'}")
     prompt = _COL_PROMPT.format(header_list="\n".join(parts))
     try:
-        raw = _ollama_generate(prompt)
+        raw = _llm_generate(prompt)
     except Exception as exc:
         print(f"[ai_mapper] column mapping failed ({exc})")
         return {}
@@ -217,7 +375,7 @@ def ai_analyze_sheet(rows, sheet_name="Sheet1", max_rows=35):
     prompt = _SHEET_PROMPT.format(sheet_name=sheet_name, rows_text=rows_text)
 
     try:
-        raw = _ollama_generate(prompt, timeout=90)
+        raw = _llm_generate(prompt, timeout=90)
     except Exception as exc:
         print(f"[ai_mapper] sheet analysis failed ({exc})")
         return None

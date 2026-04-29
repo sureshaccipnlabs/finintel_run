@@ -6,13 +6,13 @@ import re
 from .normalizer import normalize_record
 
 try:
-    from .ai_mapper import ai_map_columns, ai_analyze_sheet, is_ollama_available
+    from .ai_mapper import ai_map_columns, ai_analyze_sheet, is_llm_available
     _AI_AVAILABLE = True
 except ImportError:
     _AI_AVAILABLE = False
     def ai_map_columns(*a, **kw): return {}
     def ai_analyze_sheet(*a, **kw): return None
-    def is_ollama_available(): return False
+    def is_llm_available(): return False
 
 HOURS_PER_DAY = 8.0
 
@@ -242,7 +242,7 @@ def _map_columns(header, fields=None):
     essential = {"name", "actual_hours"}
     requested_essential = essential.intersection(set(fields))
     missing_essential = [f for f in requested_essential if mapped.get(f) is None]
-    if missing_essential and _AI_AVAILABLE and is_ollama_available():
+    if missing_essential and _AI_AVAILABLE and is_llm_available():
         critical = [f for f in fields if mapped.get(f) is None]
         if critical:
             key = tuple(str(v) for v in header)
@@ -631,7 +631,7 @@ def _parse_with_ai(rows, sheet_name):
     Ask the LLM to analyze the entire sheet structure and extract employees.
     Returns merged employee dict or {} on failure.
     """
-    if not _AI_AVAILABLE or not is_ollama_available():
+    if not _AI_AVAILABLE or not is_llm_available():
         return {}
 
     analysis = ai_analyze_sheet(rows, sheet_name=sheet_name)

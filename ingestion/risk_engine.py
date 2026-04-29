@@ -59,7 +59,7 @@ from .dataset import (
     filter_by_range,
     get_months_available,
 )
-from .ai_mapper import _ollama_generate, is_ollama_available
+from .ai_mapper import _llm_generate, is_llm_available
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1363,7 +1363,7 @@ No bullet numbering. Separate insights with a blank line.
 
 
 def _get_ai_insights(records: list[dict], risks: list[dict], scorecards: list[dict]) -> str:
-    """Use Ollama for strategic insights. Returns empty string on failure."""
+    """Use configured LLM provider for strategic insights. Returns empty string on failure."""
     overall   = build_overall_summary(records)
     months    = get_months_available(records)
     projects  = build_projects(records)
@@ -1397,11 +1397,11 @@ def _get_ai_insights(records: list[dict], risks: list[dict], scorecards: list[di
         scorecard_text="\n".join(sc_lines) or "None",
     )
 
-    if is_ollama_available():
+    if is_llm_available():
         try:
-            return _ollama_generate(prompt, timeout=90).strip()
+            return _llm_generate(prompt, timeout=90).strip()
         except Exception as e:
-            print(f"[risk_engine] Ollama insight failed: {e}")
+            print(f"[risk_engine] LLM insight failed: {e}")
 
     return ""
 

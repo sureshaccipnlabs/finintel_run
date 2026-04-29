@@ -11,7 +11,7 @@ from .dataset import (
     GLOBAL_DATASET, build_projects, build_monthly, build_overall_summary,
     build_top_performers, build_risks, get_months_available, filter_by_range,
 )
-from .ai_mapper import _ollama_generate, is_ollama_available
+from .ai_mapper import _llm_generate, is_llm_available
 
 
 # ── Context builder ──────────────────────────────────────────────────────────
@@ -142,6 +142,42 @@ Output rules:
 """
 
 
+_FORECAST_PROMPT = """\
+You are FinIntel AI, a financial forecasting assistant.
+
+Here is the current dataset:
+
+{context}
+
+---
+
+User question: {question}
+
+Forecasting mode instructions:
+- The user is explicitly asking for future projection. Provide a forecast answer.
+- Use ONLY the data provided above and the assumptions below.
+- Assumption 1: Future monthly actual hours remain equal to current observed level per employee.
+- Assumption 2: Billing rate and cost rate remain unchanged from current observed level per employee.
+- Assumption 3: If multiple records exist for an employee, use a simple average of observed values.
+- Compute monthly forecast per employee using:
+  revenue = actual_hours * billing_rate
+  cost = actual_hours * cost_rate
+  profit = revenue - cost
+- Forecast for next 3 months with these assumptions and provide concise results.
+- Clearly include one short disclaimer: assumptions-based forecast from historical data only.
+- Return plain text only (no markdown emphasis, no code blocks).
+"""
+
+
+def _is_forecast_question(question: str) -> bool:
+    q = (question or "").lower()
+    keywords = (
+        "forecast", "predict", "projection", "projected", "next month", "next 3",
+        "next three", "upcoming", "future", "how will", "will be performance",
+    )
+    return any(k in q for k in keywords)
+
+
 def _clean_answer(text: str) -> str:
     answer = (text or "")
     for _ in range(3):
@@ -181,19 +217,20 @@ def ask(question: str, time_range: str = None) -> dict:
     if time_range:
         records = filter_by_range(records, time_range)
 
-    # Check Ollama availability
-    if not is_ollama_available():
+    # Check LLM availability based on configured provider preference
+    if not is_llm_available():
         return {
-            "answer": "LLM service (Ollama) is not running. Please start it with: ollama serve",
+            "answer": "No configured LLM provider is available. Set AI_PROVIDER and related env vars (Ollama/OpenAI).",
             "sources": [],
         }
 
     # Build context and prompt
     context = _build_dataset_context(records)
-    prompt = _QA_PROMPT.format(context=context, question=question)
+    prompt_template = _FORECAST_PROMPT if _is_forecast_question(question) else _QA_PROMPT
+    prompt = prompt_template.format(context=context, question=question)
 
     try:
-        answer = _ollama_generate(prompt, timeout=120)
+        answer = _llm_generate(prompt, timeout=120)
     except Exception as e:
         return {
             "answer": f"LLM query failed: {str(e)}",

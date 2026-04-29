@@ -9,12 +9,12 @@ import json
 import re
 
 try:
-    from .ai_mapper import _ollama_generate, is_ollama_available, _extract_json
+    from .ai_mapper import _llm_generate, is_llm_available, _extract_json
     _AI_OK = True
 except ImportError:
     _AI_OK = False
-    def _ollama_generate(*a, **kw): return ""
-    def is_ollama_available(): return False
+    def _llm_generate(*a, **kw): return ""
+    def is_llm_available(): return False
     def _extract_json(t): return None
 
 
@@ -103,8 +103,8 @@ def parse_freeform_text(text: str) -> list[dict]:
         print("[text_parser] Text does not look like timesheet/financial data — skipping LLM")
         return []
 
-    if not _AI_OK or not is_ollama_available():
-        print("[text_parser] Ollama unavailable — cannot parse freeform text")
+    if not _AI_OK or not is_llm_available():
+        print("[text_parser] No configured LLM provider available — cannot parse freeform text")
         return []
 
     # Truncate very large text to fit context window
@@ -115,7 +115,7 @@ def parse_freeform_text(text: str) -> list[dict]:
     prompt = _EXTRACT_PROMPT.format(text=text)
 
     try:
-        raw_response = _ollama_generate(prompt, timeout=120)
+        raw_response = _llm_generate(prompt, timeout=120)
     except Exception as e:
         print(f"[text_parser] LLM extraction failed: {e}")
         return []
