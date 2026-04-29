@@ -477,9 +477,7 @@ def apply_cost_rates_to_global_dataset(
         rec["cost_rate"] = float(new_rate)
 
         actual_hours = float(rec.get("actual_hours") or 0)
-        leave_hours = float(rec.get("leave_hours") or 0)
-        hours_for_cost = actual_hours + leave_hours if leave_hours > 0 else actual_hours
-        rec["cost"] = round(hours_for_cost * float(new_rate), 2)
+        rec["cost"] = round(actual_hours * float(new_rate), 2)
 
         billing_rate = rec.get("billing_rate")
         if billing_rate not in (None, "", 0, 0.0):
