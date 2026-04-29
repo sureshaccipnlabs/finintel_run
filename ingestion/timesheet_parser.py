@@ -678,7 +678,7 @@ def _build_employee_record(name, data, month_label):
     if working_days == 0 and expected_hours > 0:
         working_days = int(expected_hours / HOURS_PER_DAY)
 
-    effective_working_days = working_days - vacation_days
+    effective_working_days = max(working_days - vacation_days - holiday_days, 0)
     leave_hours = vacation_days * HOURS_PER_DAY
 
     billing_rate = data.get("billing_rate", 0)
