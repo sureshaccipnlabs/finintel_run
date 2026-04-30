@@ -17,7 +17,23 @@ from .dataset import (
     _calc_margin
 )
 from .ai_mapper import _llm_generate, is_llm_available
-from .forecast_ import try_answer_forecast, is_likely_forecast
+
+# Use legacy forecast_ module (set USE_NEW_FORECAST=False to use old implementation)
+USE_NEW_FORECAST = False  # Set to True to use new OOP module
+
+if USE_NEW_FORECAST:
+    try:
+        from .forecast import try_answer_forecast, is_likely_forecast
+        _USING_NEW_FORECAST = True
+        print("[qa_engine] Using NEW OOP forecast module")
+    except ImportError as e:
+        from .forecast_ import try_answer_forecast, is_likely_forecast
+        _USING_NEW_FORECAST = False
+        print(f"[qa_engine] Using LEGACY forecast_ module (import error: {e})")
+else:
+    from .forecast_ import try_answer_forecast, is_likely_forecast
+    _USING_NEW_FORECAST = False
+    print("[qa_engine] Using LEGACY forecast_ module (configured)")
 
 
 # ── QA-specific JSON extraction ───────────────────────────────────────────────
@@ -1259,11 +1275,12 @@ def ask(question: str, time_range: str = None) -> dict:
         print(f"[qa_engine] Total time: {time.time() - _start_time:.2f}s (cached)")
         return cached_response
 
-    # Forecast intent: use AI forecaster (forecast_.py) only
+    # Forecast intent: use AI forecaster
     # Note: try_answer_forecast now uses fast keyword check internally
     _fc_start = time.time()
+    _forecast_module = "forecast (OOP)" if _USING_NEW_FORECAST else "forecast_ (legacy)"
     fc_answer = try_answer_forecast(question, records)
-    print(f"[qa_engine] Forecast check took {time.time() - _fc_start:.2f}s (likely_forecast={is_likely_forecast(question)})")
+    print(f"[qa_engine] Forecast check took {time.time() - _fc_start:.2f}s (module={_forecast_module}, likely_forecast={is_likely_forecast(question)})")
     if fc_answer is not None:
         rows = _extract_rows(fc_answer)
         if rows:

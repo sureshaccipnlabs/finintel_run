@@ -27,9 +27,15 @@ _FORECAST_KEYWORDS = [
     # Prediction verbs
     "forecast", "predict", "projection", "estimate", "projected",
     "anticipate", "foresee", "extrapolate", "project forward",
-    # Time-based
+    # Time-based (singular)
     "next month", "next quarter", "next year", "upcoming",
     "next week", "coming month", "coming quarter", "following month",
+    "upcoming quarter", "upcoming quarters", "coming quarters",
+    # Time-based (informal)
+    "next few months", "couple of months", "few months ahead",
+    "quarters ahead", "months ahead",
+    # Current period (often implies forecast for rest of period)
+    "this quarter", "this qtr", "rest of quarter", "rest of year",
     # Future tense
     "will be", "would be", "expected to", "expecting", "expect",
     # Planning & scenarios
@@ -39,21 +45,123 @@ _FORECAST_KEYWORDS = [
     "grow to", "reach by", "trend forward",
 ]
 
-# Future month/quarter patterns (e.g., "July 2026", "Q3 2026")
-_FUTURE_PERIOD_PATTERN = re.compile(
-    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*202[5-9]\b"
-    r"|\bq[1-4]\s*202[5-9]\b"
-    r"|\b202[5-9]\s*q[1-4]\b",
+# Pattern to extract month/year from question for dynamic comparison
+_DATE_EXTRACT_PATTERN = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{4})\b"
+    r"|\bq([1-4])\s+(\d{4})\b"
+    r"|\b(\d{4})\s+q([1-4])\b",
     re.IGNORECASE
 )
 
+# Month name to number mapping
+_MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def _is_future_date(question: str) -> bool:
+    """Check if question contains a future date (after current month)."""
+    today = dt.date.today()
+    current_year = today.year
+    current_month = today.month
+    
+    q = question.lower()
+    
+    # Check for "next month/quarter/year" keywords (singular)
+    if re.search(r"\b(next\s+(?:month|quarter|year)|upcoming|future)\b", q, re.IGNORECASE):
+        return True
+    
+    # Check for "next N months/quarters" patterns
+    if re.search(r"\bnext\s+\d+\s+(?:months?|quarters?)\b", q, re.IGNORECASE):
+        return True
+    
+    # Check for "N months/quarters ahead" patterns
+    if re.search(r"\b(?:one|two|three|four|five|six|\d+)\s+(?:months?|quarters?)\s+ahead\b", q, re.IGNORECASE):
+        return True
+    
+    # Check for fiscal year patterns (FY26, FY2026, FY 26)
+    fy_match = re.search(r"\bfy\s*(\d{2,4})\b", q, re.IGNORECASE)
+    if fy_match:
+        fy_year = int(fy_match.group(1))
+        if fy_year < 100:
+            fy_year += 2000  # FY26 -> 2026
+        if fy_year > current_year:
+            return True
+    
+    # Extract explicit dates and compare
+    for match in _DATE_EXTRACT_PATTERN.finditer(q):
+        groups = match.groups()
+        
+        if groups[0] and groups[1]:  # "Jan 2024"
+            month_str = groups[0].lower()[:3]
+            year = int(groups[1])
+            month = _MONTH_MAP.get(month_str, 0)
+            if year > current_year or (year == current_year and month > current_month):
+                return True
+        elif groups[2] and groups[3]:  # "Q1 2024"
+            quarter = int(groups[2])
+            year = int(groups[3])
+            quarter_start_month = (quarter - 1) * 3 + 1
+            if year > current_year or (year == current_year and quarter_start_month > current_month):
+                return True
+        elif groups[4] and groups[5]:  # "2024 Q1"
+            year = int(groups[4])
+            quarter = int(groups[5])
+            quarter_start_month = (quarter - 1) * 3 + 1
+            if year > current_year or (year == current_year and quarter_start_month > current_month):
+                return True
+    
+    return False
+
+
+def _is_past_date(question: str) -> bool:
+    """Check if question contains a past date (before or equal to current month)."""
+    today = dt.date.today()
+    current_year = today.year
+    current_month = today.month
+    
+    q = question.lower()
+    
+    for match in _DATE_EXTRACT_PATTERN.finditer(q):
+        groups = match.groups()
+        
+        if groups[0] and groups[1]:  # "Jan 2024"
+            month_str = groups[0].lower()[:3]
+            year = int(groups[1])
+            month = _MONTH_MAP.get(month_str, 0)
+            if year < current_year or (year == current_year and month <= current_month):
+                return True
+        elif groups[2] and groups[3]:  # "Q1 2024"
+            quarter = int(groups[2])
+            year = int(groups[3])
+            quarter_end_month = quarter * 3
+            if year < current_year or (year == current_year and quarter_end_month <= current_month):
+                return True
+        elif groups[4] and groups[5]:  # "2024 Q1"
+            year = int(groups[4])
+            quarter = int(groups[5])
+            quarter_end_month = quarter * 3
+            if year < current_year or (year == current_year and quarter_end_month <= current_month):
+                return True
+    
+    return False
+
 # Keywords that indicate NOT a forecast (historical/current data queries)
 _NON_FORECAST_KEYWORDS = [
-    "show me", "list", "what is", "what are", "how much", "how many",
+    "show me", "show", "list", "what is", "what are", "how much", "how many",
     "give me", "current", "total", "who is", "who are", "which",
     "top", "bottom", "best", "worst", "compare", "comparison",
     "details", "summary", "report", "breakdown",
     "last month", "previous", "so far", "to date", "ytd",
+    # Ranking queries
+    "highest", "lowest", "most", "least", "maximum", "minimum", "rank",
+    # Historical date ranges
+    "from", "between", "during",
+    "jan to", "feb to", "mar to", "apr to", "may to", "jun to",
+    "jul to", "aug to", "sep to", "oct to", "nov to", "dec to",
 ]
 
 
@@ -68,18 +176,26 @@ def is_likely_forecast(question: str) -> bool:
 
     q = question.lower().strip()
 
-    # Strong forecast indicators should win even if the sentence also contains
-    # generic phrasing like "what is" or "show me".
-    has_strong_forecast_cue = any(kw in q for kw in _FORECAST_KEYWORDS) or bool(_FUTURE_PERIOD_PATTERN.search(q))
-    if has_strong_forecast_cue:
-        _debug("is_likely_forecast: Found strong forecast cue, returning True")
-        return True
+    # 1. Check for PAST dates FIRST (dynamically compared to today) - NOT forecasts
+    if _is_past_date(question):
+        _debug("is_likely_forecast: Found past date, returning False")
+        return False
 
-    # Check for explicit non-forecast keywords first (quick exit)
+    # 2. Check for non-forecast keywords
     for kw in _NON_FORECAST_KEYWORDS:
         if kw in q:
             _debug(f"is_likely_forecast: Found non-forecast keyword '{kw}', returning False")
             return False
+
+    # 3. Check for strong forecast indicators
+    if any(kw in q for kw in _FORECAST_KEYWORDS):
+        _debug("is_likely_forecast: Found forecast keyword, returning True")
+        return True
+
+    # 4. Check for future dates (dynamically compared to today)
+    if _is_future_date(question):
+        _debug("is_likely_forecast: Found future date, returning True")
+        return True
 
     _debug(f"is_likely_forecast: No forecast indicators found, returning False")
     return False
@@ -387,6 +503,22 @@ def _llm_advise_settings(question: str, months: List[str], series: Dict[str, Lis
 
 
 def _guided_method_for(metric: str, cfg: Optional[dict]) -> Tuple[str, dict, float]:
+    """
+    Extract LLM-guided forecasting parameters for a specific metric.
+    
+    Retrieves method, parameters, and damping factor from LLM configuration.
+    Used when LLM provides specific guidance on how to forecast each metric.
+    
+    Args:
+        metric: The metric name (e.g., "revenue", "cost", "profit").
+        cfg: LLM configuration dict with keys: method, params, damping.
+    
+    Returns:
+        Tuple of (method, params, damping):
+        - method: "lin", "sma", "holt", or "auto"
+        - params: Dict with method-specific parameters
+        - damping: Float 0-1, reduces month-over-month volatility
+    """
     if not cfg:
         return ("auto", {}, 0.0)
     method = (cfg.get("method", {}) or {}).get(metric)
@@ -400,6 +532,26 @@ def _guided_method_for(metric: str, cfg: Optional[dict]) -> Tuple[str, dict, flo
 
 
 def _forecast_values_with_guidance(values: List[float], steps: int, metric: str, cfg: Optional[dict]) -> List[float]:
+    """
+    Forecast with LLM-Guided Method Selection and Damping.
+    
+    Uses LLM-provided configuration to select forecasting method and apply
+    damping to reduce forecast volatility.
+    
+    Damping Effect:
+        - 0.0 = No damping (use raw forecast)
+        - 0.3 = 30% reduction in month-over-month changes
+        - 1.0 = Flat forecast (no change from first value)
+    
+    Args:
+        values: Historical time series data.
+        steps: Number of future periods to forecast.
+        metric: Metric name for looking up LLM guidance.
+        cfg: LLM configuration with method/params/damping.
+    
+    Returns:
+        List of forecasted values, optionally damped.
+    """
     method, params, damping = _guided_method_for(metric, cfg)
     if method == "holt":
         arr = _holt_linear_forecast(values, steps, float(params.get("alpha", 0.5)), float(params.get("beta", 0.3)))
@@ -420,6 +572,24 @@ def _forecast_values_with_guidance(values: List[float], steps: int, metric: str,
 
 
 def _build_adjustment_map(cfg: Optional[dict]) -> Dict[str, Dict[str, dict]]:
+    """
+    Build adjustment map from LLM configuration.
+    
+    Parses LLM-provided adjustments for specific periods and metrics.
+    Adjustments can be percentage-based or absolute values.
+    
+    Example adjustments:
+        - {"label": "Q3 2026", "metric": "revenue", "type": "percent", "value": 10}
+          → Increase Q3 2026 revenue forecast by 10%
+        - {"label": "July 2026", "metric": "cost", "type": "absolute", "value": 5000}
+          → Add $5000 to July 2026 cost forecast
+    
+    Args:
+        cfg: LLM configuration with "adjustments" list.
+    
+    Returns:
+        Nested dict: {period_label: {metric: {type, value}}}
+    """
     amap: Dict[str, Dict[str, dict]] = {}
     if not cfg:
         return amap
@@ -669,6 +839,26 @@ def _extract_requested_projects(question: str) -> List[str]:
 
 
 def _lin_forecast(values: List[float], steps: int) -> List[float]:
+    """
+    Linear Regression Forecast.
+    
+    Fits a straight line (y = a + b*x) to historical data using least squares method,
+    then extrapolates to predict future values.
+    
+    Best for: Data with consistent upward or downward trends.
+    
+    Formula:
+        - Slope (b) = Σ(xi - x̄)(yi - ȳ) / Σ(xi - x̄)²
+        - Intercept (a) = ȳ - b*x̄
+        - Forecast = a + b * (n + step)
+    
+    Args:
+        values: Historical time series data (e.g., monthly revenue).
+        steps: Number of future periods to forecast.
+    
+    Returns:
+        List of forecasted values for each future step.
+    """
     clean_idx = [i for i, v in enumerate(values) if isinstance(v, (int, float)) and not math.isnan(v)]
     if not clean_idx:
         return []
@@ -690,6 +880,25 @@ def _lin_forecast(values: List[float], steps: int) -> List[float]:
 
 
 def _sma_forecast(values: List[float], steps: int, k: int = 3) -> List[float]:
+    """
+    Simple Moving Average (SMA) Forecast.
+    
+    Calculates the average of the last k periods and uses it as the forecast
+    for all future periods. Assumes the future will be similar to recent past.
+    
+    Best for: Stable data without strong trends, or when smoothing out noise.
+    
+    Formula:
+        Forecast = (sum of last k values) / k
+    
+    Args:
+        values: Historical time series data.
+        steps: Number of future periods to forecast.
+        k: Window size for moving average (default: 3 periods).
+    
+    Returns:
+        List of forecasted values (all identical, equal to the moving average).
+    """
     clean = [v for v in values if isinstance(v, (int, float)) and not math.isnan(v)]
     if not clean:
         return []
@@ -701,6 +910,28 @@ def _sma_forecast(values: List[float], steps: int, k: int = 3) -> List[float]:
 
 
 def _holt_linear_forecast(values: List[float], steps: int, alpha: float = 0.5, beta: float = 0.3) -> List[float]:
+    """
+    Holt's Linear Exponential Smoothing Forecast (Double Exponential Smoothing).
+    
+    Extends simple exponential smoothing to capture data with trends by maintaining
+    two components: level (L) and trend (B). More recent observations have higher weight.
+    
+    Best for: Data with trends that may change over time.
+    
+    Formulas:
+        - Level:    Lt = α*Yt + (1-α)*(Lt-1 + Bt-1)
+        - Trend:    Bt = β*(Lt - Lt-1) + (1-β)*Bt-1
+        - Forecast: Ft+h = Lt + h*Bt
+    
+    Args:
+        values: Historical time series data.
+        steps: Number of future periods to forecast.
+        alpha: Smoothing factor for level (0-1). Higher = more weight on recent data.
+        beta: Smoothing factor for trend (0-1). Higher = faster trend adaptation.
+    
+    Returns:
+        List of forecasted values incorporating both level and trend.
+    """
     clean = [v for v in values if isinstance(v, (int, float)) and not math.isnan(v)]
     if not clean:
         return []
@@ -717,6 +948,22 @@ def _holt_linear_forecast(values: List[float], steps: int, alpha: float = 0.5, b
 
 
 def _rmse(actual: List[float], pred: List[float]) -> float:
+    """
+    Root Mean Square Error (RMSE).
+    
+    Measures the average magnitude of prediction errors. Lower RMSE indicates
+    better model fit. Used to compare and select the best forecasting model.
+    
+    Formula:
+        RMSE = √(Σ(actual - predicted)² / n)
+    
+    Args:
+        actual: Actual observed values.
+        pred: Predicted values from a model.
+    
+    Returns:
+        RMSE value (lower is better). Returns infinity if no valid pairs.
+    """
     pairs = [(a, p) for a, p in zip(actual, pred) if not (math.isnan(a) or math.isnan(p))]
     if not pairs:
         return float("inf")
@@ -725,6 +972,27 @@ def _rmse(actual: List[float], pred: List[float]) -> float:
 
 
 def _choose_model(values: List[float]) -> Tuple[str, dict]:
+    """
+    Automatic Model Selection.
+    
+    Compares three forecasting methods (Linear, SMA, Holt) using RMSE on
+    historical data and selects the best performing model.
+    
+    Selection Process:
+        1. Fit each model to historical data
+        2. Calculate RMSE for each model's in-sample predictions
+        3. Select model with lowest RMSE
+        4. For Holt, performs grid search over alpha/beta parameters
+    
+    Args:
+        values: Historical time series data.
+    
+    Returns:
+        Tuple of (method_name, params_dict):
+        - ("lin", {}) for Linear Regression
+        - ("sma", {"k": 3}) for Simple Moving Average
+        - ("holt", {"alpha": x, "beta": y}) for Holt's method
+    """
     clean = [v for v in values if isinstance(v, (int, float)) and not math.isnan(v)]
     n = len(clean)
     if n <= 2:
@@ -774,6 +1042,28 @@ def _choose_model(values: List[float]) -> Tuple[str, dict]:
 
 
 def _forecast_values(values: List[float], steps: int) -> List[float]:
+    """
+    Main Forecasting Function with Automatic Model Selection.
+    
+    Automatically selects the best forecasting model based on historical data
+    characteristics and generates predictions for future periods.
+    
+    Workflow:
+        1. Analyze historical data using _choose_model()
+        2. Select best method (Linear/SMA/Holt) based on RMSE
+        3. Generate forecasts using the selected method
+    
+    Args:
+        values: Historical time series data (e.g., [30000, 32000, 34000]).
+        steps: Number of future periods to forecast.
+    
+    Returns:
+        List of forecasted values for each future step.
+    
+    Example:
+        >>> _forecast_values([30000, 32000, 34000], 3)
+        [36000.0, 38000.0, 40000.0]  # Linear trend detected
+    """
     method, params = _choose_model(values)
     if method == "holt":
         return _holt_linear_forecast(values, steps, params.get("alpha", 0.5), params.get("beta", 0.3))
@@ -1096,6 +1386,7 @@ def _parse_llm_explicit_periods(periods: List[str], base: dt.date) -> Tuple[List
 
 
 def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[str]:
+    print(f"[forecast_] try_answer_forecast called with: '{question}'")
     _debug(f"try_answer_forecast called with question: '{question}'")
     q = (question or "").lower()
     recs = records if records is not None else GLOBAL_DATASET
@@ -1104,7 +1395,9 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         return None
 
     # ── OPTIMIZATION: Fast keyword check before expensive LLM call ──
-    if not is_likely_forecast(question):
+    likely = is_likely_forecast(question)
+    print(f"[forecast_] is_likely_forecast = {likely}")
+    if not likely:
         _debug("Keyword check says not a forecast, skipping LLM call")
         return None
 
