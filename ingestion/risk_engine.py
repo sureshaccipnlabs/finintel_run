@@ -395,6 +395,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                 "gap_pct":         round(gap, 2),
                 "billing_rate":    billing_rate,
                 "cost_rate":       cost_rate,
+                "total_cost":      round(total_cost, 2),
                 "profit_recovery": round(total_rev * (gap / 100), 2),
             },
             "linked_employees": [name],
@@ -427,6 +428,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                 "metrics": {
                     "billing_rate": billing_rate,
                     "cost_rate":    cost_rate,
+                    "total_cost":   round(total_cost, 2),
                     "rate_ratio":   round(rate_ratio, 3),
                     "buffer_pct":   round(buffer_pct, 2),
                 },
@@ -1131,6 +1133,7 @@ def _build_employee_scorecards(timelines: dict[str, list[dict]]) -> list[dict]:
             "latest_month":    latest.get("month") or "",
             "performance":     perf,
             "total_revenue":   round(sum(_num(r.get("revenue")) for r in records), 2),
+            "total_cost":      round(sum(_num(r.get("cost")) for r in records), 2),
             "total_profit":    round(sum(_num(r.get("revenue")) - _num(r.get("cost")) for r in records), 2),
             "avg_utilisation": round(perf["inputs"]["utilisation_pct"], 1),
         })
