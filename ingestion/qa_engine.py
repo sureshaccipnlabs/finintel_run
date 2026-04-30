@@ -16,7 +16,7 @@ from .dataset import (
     build_employee_summaries, set_on_dataset_change_callback
 )
 from .ai_mapper import _ollama_generate, is_ollama_available
-from .forecast_ import try_answer_forecast
+from .forecast_ import try_answer_forecast, is_likely_forecast
 
 
 # ── QA-specific JSON extraction ───────────────────────────────────────────────
@@ -1030,6 +1030,8 @@ def ask(question: str, time_range: str = None) -> dict:
 
     Returns: {"summary": str, "visual_type": str, "columns": list, "data": list, "sources": dict}
     """
+    _start_time = time.time()
+    
     records = GLOBAL_DATASET
     if not records:
         return {
@@ -1045,7 +1047,10 @@ def ask(question: str, time_range: str = None) -> dict:
         records = filter_by_range(records, time_range)
 
     # Forecast intent: use AI forecaster (forecast_.py) only
+    # Note: try_answer_forecast now uses fast keyword check internally
+    _fc_start = time.time()
     fc_answer = try_answer_forecast(question, records)
+    print(f"[qa_engine] Forecast check took {time.time() - _fc_start:.2f}s (likely_forecast={is_likely_forecast(question)})")
     if fc_answer is not None:
         rows = _extract_rows(fc_answer)
         if rows:
@@ -1106,11 +1111,16 @@ def ask(question: str, time_range: str = None) -> dict:
         }
 
     # Build targeted context based on question (smart context selection)
+    _ctx_start = time.time()
     context = _get_cached_context(records, question=question)
+    print(f"[qa_engine] Context build took {time.time() - _ctx_start:.2f}s")
+    
     prompt = _QA_PROMPT.format(context=context, question=question)
 
     try:
+        _llm_start = time.time()
         raw_response = _ollama_generate(prompt, timeout=120)
+        print(f"[qa_engine] LLM call took {time.time() - _llm_start:.2f}s")
     except Exception as e:
         return {
             "summary": f"LLM query failed: {str(e)}",
@@ -1120,6 +1130,7 @@ def ask(question: str, time_range: str = None) -> dict:
             "sources": {},
         }
 
+    print(f"[qa_engine] Total time: {time.time() - _start_time:.2f}s")
     # Parse the JSON from the LLM
     parsed_json = _extract_qa_json(raw_response)
     
