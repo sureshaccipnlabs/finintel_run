@@ -9,7 +9,6 @@ import json
 import re
 import hashlib
 import time
-from datetime import datetime
 
 from .dataset import (
     GLOBAL_DATASET, build_projects, build_monthly, build_overall_summary,
@@ -899,150 +898,6 @@ def _llm_table_name(summary: str, columns, data) -> str:
     
     return "Data"
 
-
-_MONTH_MAP = {
-    "jan": 1, "january": 1,
-    "feb": 2, "february": 2,
-    "mar": 3, "march": 3,
-    "apr": 4, "april": 4,
-    "may": 5,
-    "jun": 6, "june": 6,
-    "jul": 7, "july": 7,
-    "aug": 8, "august": 8,
-    "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10,
-    "nov": 11, "november": 11,
-    "dec": 12, "december": 12,
-}
-
-
-def _is_last_month_margin_question(question: str) -> bool:
-    q = (question or "").lower()
-    return ("last month" in q) and ("margin" in q)
-
-
-def _previous_calendar_month() -> tuple[int, int]:
-    now = datetime.now()
-    if now.month == 1:
-        return now.year - 1, 12
-    return now.year, now.month - 1
-
-
-def _parse_month_label(value: str):
-    txt = (value or "").strip().lower()
-    if not txt:
-        return None
-
-    # Matches labels like "March 2026", "Mar 2026", "march-26"
-    m = re.search(r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\W*(\d{2,4})", txt)
-    if not m:
-        return None
-
-    mon = _MONTH_MAP.get(m.group(1)[:3])
-    if not mon:
-        return None
-
-    year_raw = m.group(2)
-    year = int(year_raw)
-    if year < 100:
-        year += 2000
-
-    return year, mon
-
-
-def _month_label(year: int, month: int) -> str:
-    return datetime(year, month, 1).strftime("%B %Y")
-
-
-def _answer_last_month_margin(question: str, records: list[dict], time_range: str = None):
-    if not _is_last_month_margin_question(question):
-        return None
-
-    target_year, target_month = _previous_calendar_month()
-    label = _month_label(target_year, target_month)
-
-    month_records = []
-    for r in records:
-        parsed = _parse_month_label(r.get("month"))
-        if parsed == (target_year, target_month):
-            month_records.append(r)
-
-    if not month_records:
-        return {
-            "summary": f"No data available for {label}, so margin cannot be calculated.",
-            "visual_type": "text",
-            "columns": [],
-            "data": [],
-            "sources": {
-                "total_records": len(records),
-                "months": get_months_available(records),
-                "time_range": time_range or "ALL",
-                "forecast": False,
-            },
-        }
-
-    q = (question or "").lower()
-    if "project" in q:
-        by_project = {}
-        for r in month_records:
-            p = r.get("project") or "Unknown"
-            if p not in by_project:
-                by_project[p] = {"revenue": 0.0, "cost": 0.0}
-            by_project[p]["revenue"] += float(r.get("revenue") or 0)
-            by_project[p]["cost"] += float(r.get("cost") or 0)
-
-        rows = []
-        for project, vals in by_project.items():
-            rev = round(vals["revenue"], 2)
-            cost = round(vals["cost"], 2)
-            profit = round(rev - cost, 2)
-            margin = round((profit / rev) * 100, 2) if rev > 0 else 0
-            rows.append({
-                "project": project,
-                "revenue": rev,
-                "cost": cost,
-                "profit": profit,
-                "gross_margin_pct": margin,
-            })
-        rows.sort(key=lambda x: x["gross_margin_pct"], reverse=True)
-
-        cols = ["project", "revenue", "cost", "profit", "gross_margin_pct"]
-        return {
-            "summary": f"Project gross margin for {label}",
-            "visual_type": "table",
-            "columns": _format_columns(cols),
-            "data": _format_data_keys(rows, cols),
-            "sources": {
-                "total_records": len(records),
-                "months": get_months_available(records),
-                "time_range": time_range or "ALL",
-                "forecast": False,
-            },
-        }
-
-    total_revenue = round(sum(float(r.get("revenue") or 0) for r in month_records), 2)
-    total_cost = round(sum(float(r.get("cost") or 0) for r in month_records), 2)
-    total_profit = round(total_revenue - total_cost, 2)
-    gross_margin = round((total_profit / total_revenue) * 100, 2) if total_revenue > 0 else 0
-
-    return {
-        "summary": f"Gross margin for {label}",
-        "visual_type": "metric",
-        "columns": [],
-        "data": [
-            {"label": "Gross Margin", "value": f"{gross_margin:.1f}%"},
-            {"label": "Revenue", "value": f"${total_revenue:,.2f}"},
-            {"label": "Cost", "value": f"${total_cost:,.2f}"},
-            {"label": "Profit", "value": f"${total_profit:,.2f}"},
-        ],
-        "sources": {
-            "total_records": len(records),
-            "months": get_months_available(records),
-            "time_range": time_range or "ALL",
-            "forecast": False,
-        },
-    }
-
 # ── Main Q&A function ───────────────────────────────────────────────────────
 
 def ask(question: str, time_range: str = None) -> dict:
@@ -1064,11 +919,6 @@ def ask(question: str, time_range: str = None) -> dict:
     # Apply time range filter if specified
     if time_range:
         records = filter_by_range(records, time_range)
-
-    # Deterministic margin response for "last month" questions
-    deterministic_margin = _answer_last_month_margin(question, records, time_range=time_range)
-    if deterministic_margin is not None:
-        return deterministic_margin
 
     # Forecast intent: use AI forecaster (forecast_.py) only
     fc_answer = try_answer_forecast(question, records)
