@@ -158,12 +158,22 @@ def _detect_question_scope(question: str) -> dict:
         "specific_month": None,
     }
     
-    # Project-related
-    if any(w in q for w in ["project", "projects", "client", "clients"]):
+    # Project-related keywords (expanded)
+    project_keywords = [
+        "project", "projects", "client", "clients", "projecty", "projectx",
+        "which project", "project health", "project performance"
+    ]
+    if any(w in q for w in project_keywords):
         scope["needs_projects"] = True
     
-    # Monthly/trend-related
-    if any(w in q for w in ["month", "monthly", "trend", "over time", "by month", "each month"]):
+    # Monthly/trend-related (expanded)
+    monthly_keywords = [
+        "month", "monthly", "trend", "over time", "by month", "each month",
+        "quarter", "q1", "q2", "q3", "q4", "growth", "change", "from", "to",
+        "ytd", "year to date", "last quarter", "this quarter", "previous month",
+        "last month", "this month", "fiscal", "fy", "weekly", "week"
+    ]
+    if any(w in q for w in monthly_keywords):
         scope["needs_monthly"] = True
     
     # Specific month mentioned
@@ -171,40 +181,106 @@ def _detect_question_scope(question: str) -> dict:
     month_match = re.search(month_pattern, q)
     if month_match:
         scope["needs_monthly"] = True
-        scope["needs_employee_details"] = True  # May need specific record
+        scope["needs_employee_details"] = True
         scope["specific_month"] = month_match.group(1)
     
-    # Employee-related
-    if any(w in q for w in ["employee", "employees", "person", "people", "who", "top", "bottom", "best", "worst", "performer"]):
+    # Employee-related keywords (expanded for natural language)
+    employee_keywords = [
+        "employee", "employees", "person", "people", "who", "top", "bottom", 
+        "best", "worst", "performer", "performers", "resource", "resources",
+        "team", "staff", "idle", "sitting", "working", "contributor", "contributors",
+        "underutilized", "overloaded", "free", "busy", "risky", "productive"
+    ]
+    if any(w in q for w in employee_keywords):
         scope["needs_employee_summary"] = True
     
-    # Specific metrics that need details
-    if any(w in q for w in ["hours", "actual hours", "billable", "vacation", "leave", "working days", "utilization", "utilisation"]):
+    # Specific employee name mentioned (capitalized word that's not a common word)
+    common_words = {
+        "give", "me", "show", "list", "what", "how", "the", "for", "and", "with", "summary", 
+        "detail", "details", "total", "revenue", "profit", "cost", "margin", "hours", 
+        "attendance", "utilization", "which", "who", "where", "when", "why", "does", "did",
+        "employees", "employee", "project", "projects", "highest", "lowest", "top", "bottom",
+        "best", "worst", "most", "least", "generated", "has", "have", "had", "are", "is", "was",
+        "show", "compare", "trend", "performance", "health", "summary", "insights", "issues",
+        "risks", "anomalies", "identify", "detect", "predict", "suggest", "analyze"
+    }
+    name_match = re.findall(r"\b([A-Z][a-z]+)\b", question)
+    for name in name_match:
+        if name.lower() not in common_words and name.lower() not in month_pattern:
+            scope["needs_employee_summary"] = True
+            scope["needs_employee_details"] = True
+            scope["specific_employee"] = name
+            break
+    
+    # Specific metrics that need employee details (expanded)
+    metric_keywords = [
+        "hours", "actual hours", "billable", "billable hours", "vacation", "leave", 
+        "working days", "utilization", "utilisation", "util", "billing rate", 
+        "cost rate", "zero hours", "no hours", "logged", "per hour", "per day",
+        "per employee", "per project", "ratio", "average", "avg", "mean",
+        "below", "above", "less than", "more than", "greater than", "threshold"
+    ]
+    if any(w in q for w in metric_keywords):
         scope["needs_employee_summary"] = True
-        # If asking about specific person's hours, need details
         if any(w in q for w in ["his", "her", "their", "'s"]) or re.search(r"\b[A-Z][a-z]+\b", question):
             scope["needs_employee_details"] = True
     
-    # Risk-related
-    if any(w in q for w in ["risk", "risks", "issue", "problem", "concern", "flag", "warning", "low utilization", "underperform"]):
+    # Risk-related keywords (expanded for natural language)
+    risk_keywords = [
+        "risk", "risks", "risky", "issue", "issues", "problem", "problems", 
+        "concern", "flag", "flags", "warning", "warnings", "low utilization",
+        "underperform", "underutilized", "idle", "zero", "not generating",
+        "not working", "not billing", "not billable", "not profitable",
+        "anomaly", "anomalies", "inconsistent", "validation", "declining",
+        "losing", "leakage", "attention", "health"
+    ]
+    if any(w in q for w in risk_keywords):
         scope["needs_risks"] = True
         scope["needs_employee_summary"] = True
     
     # Comparison queries need multiple sections
-    if any(w in q for w in ["compare", "comparison", "vs", "versus", "difference", "between"]):
+    comparison_keywords = ["compare", "comparison", "vs", "versus", "difference", "between"]
+    if any(w in q for w in comparison_keywords):
         scope["needs_projects"] = True
         scope["needs_employee_summary"] = True
         scope["needs_monthly"] = True
+    
+    # Insight/summary queries (executive level)
+    insight_keywords = [
+        "insight", "insights", "summary", "overview", "highlight", "observations",
+        "key", "important", "performance summary", "health summary", "improve"
+    ]
+    if any(w in q for w in insight_keywords):
+        scope["needs_projects"] = True
+        scope["needs_employee_summary"] = True
+        scope["needs_risks"] = True
     
     # Aggregation queries (totals, counts) - overall is enough
     if re.search(r"\b(total|sum|count|how many|how much|overall|all)\b", q) and not scope["needs_employee_details"]:
         pass  # Overall summary is sufficient
     
-    # If question is very specific or ambiguous, include more context
-    if len(q.split()) <= 3 or any(w in q for w in ["show", "list", "all", "everything", "detail"]):
+    # For short questions (<=3 words), infer from keywords
+    if len(q.split()) <= 3:
+        if any(w in q for w in ["revenue", "profit", "cost", "margin", "total", "overall", "rev", "pft"]):
+            pass  # Overall summary already included
+        elif any(w in q for w in ["employee", "employees", "who", "person", "emp", "top", "bottom"]):
+            scope["needs_employee_summary"] = True
+        elif any(w in q for w in ["project", "projects"]):
+            scope["needs_projects"] = True
+        elif any(w in q for w in ["month", "monthly", "trend"]):
+            scope["needs_monthly"] = True
+        elif any(w in q for w in ["risk", "risks", "issues", "problems"]):
+            scope["needs_risks"] = True
+            scope["needs_employee_summary"] = True
+        else:
+            scope["needs_employee_summary"] = True
+    
+    # Explicit "show all" type requests
+    if any(w in q for w in ["everything", "all data", "full summary", "complete"]):
         scope["needs_projects"] = True
         scope["needs_monthly"] = True
         scope["needs_employee_summary"] = True
+        scope["needs_risks"] = True
     
     return scope
 
@@ -229,6 +305,9 @@ def _build_dataset_context(records=None, question: str = None):
     lines.append(f"Total Revenue: ${overall['total_revenue']:,.2f}, Cost: ${overall['total_cost']:,.2f}, Profit: ${overall['total_profit']:,.2f}")
     lines.append(f"Hours: {overall.get('total_hours', 0)}, Margin: {overall['avg_margin_pct']}%, Employees: {overall['total_employees']}")
     lines.append(f"Months: {', '.join(months)}")
+    if months:
+        lines.append(f"LAST MONTH (most recent data available): {months[-1]}")
+        lines.append(f"NOTE: If user asks about 'last month', return data for {months[-1]} and clarify this is the most recent data available.")
     lines.append("")
 
     # Projects - include if needed
@@ -242,13 +321,18 @@ def _build_dataset_context(records=None, question: str = None):
             )
         lines.append("")
 
-    # Monthly - include if needed
+    # Monthly - include if needed (sorted chronologically)
     if include_all or scope.get("needs_monthly"):
         monthly = build_monthly(recs)
         lines.append("=== MONTHLY ===")
-        for m, data in monthly.items():
+        # Sort months chronologically using the same order as get_months_available
+        sorted_months = [m for m in months if m in monthly]
+        for m in sorted_months:
+            data = monthly[m]
+            is_last = (m == months[-1]) if months else False
+            marker = " [LAST MONTH]" if is_last else ""
             lines.append(
-                f"- {m}: Revenue=${data['total_revenue']:,.2f}, Profit=${data['total_profit']:,.2f}, "
+                f"- {m}{marker}: Revenue=${data['total_revenue']:,.2f}, Profit=${data['total_profit']:,.2f}, "
                 f"Margin={data['avg_margin_pct']}%, Employees={data['employees']}"
             )
         lines.append("")
@@ -256,13 +340,20 @@ def _build_dataset_context(records=None, question: str = None):
     # Employee Summaries - include if needed
     if include_all or scope.get("needs_employee_summary"):
         employee_summaries = build_employee_summaries(recs)
+        # Filter to specific employee if mentioned
+        if scope and scope.get("specific_employee"):
+            emp_name = scope["specific_employee"].lower()
+            employee_summaries = [e for e in employee_summaries if emp_name in e["employee_name"].lower()]
         lines.append("=== EMPLOYEES ===")
         for emp in employee_summaries:
             lines.append(
                 f"- {emp['employee_name']}: Revenue=${emp['total_revenue']:,.2f}, "
-                f"Profit=${emp['total_profit']:,.2f}, Hours={emp['total_hours']}, "
-                f"Utilisation={emp['utilization_pct'] or 0}%"
+                f"Profit=${emp['total_profit']:,.2f}, Margin={emp.get('margin_pct', 0)}%, "
+                f"Hours={emp['total_hours']}, Utilisation={emp['utilization_pct'] or 0}%, "
+                f"Attendance={emp.get('attendance_pct', 100)}%, VacationDays={emp.get('vacation_days', 0)}"
             )
+        if not employee_summaries:
+            lines.append("- No matching employee found")
         lines.append("")
 
     # Employee Details - include if needed (limit to relevant records)
@@ -270,16 +361,21 @@ def _build_dataset_context(records=None, question: str = None):
         lines.append("=== EMPLOYEE DETAILS ===")
         # Filter records if specific month/employee mentioned
         filtered_recs = recs
+        if scope and scope.get("specific_employee"):
+            emp_name = scope["specific_employee"].lower()
+            filtered_recs = [r for r in recs if emp_name in (r.get("employee") or "").lower()]
         if scope and scope.get("specific_month"):
             month_key = scope["specific_month"].lower()
-            filtered_recs = [r for r in recs if month_key in (r.get("month") or "").lower()]
+            filtered_recs = [r for r in filtered_recs if month_key in (r.get("month") or "").lower()]
         
         # Limit to 30 records max to keep context manageable
         for r in filtered_recs[:30]:
+            rev = r.get('revenue') or 0
+            pft = r.get('profit') or 0
             lines.append(
                 f"- {r.get('employee', '?')} | {r.get('project', '?')} | {r.get('month', '?')} | "
                 f"Hours={r.get('actual_hours', 0)}, Vacation={r.get('vacation_days', 0)}, "
-                f"Revenue={r.get('revenue', 0)}, Profit={r.get('profit', 0)}, "
+                f"Revenue=${rev:,.2f}, Profit=${pft:,.2f}, "
                 f"Utilisation={r.get('utilisation_pct', 0)}%"
             )
         if len(filtered_recs) > 30:
@@ -329,14 +425,45 @@ Q: "How many employees?"
 Q: "Monthly revenue trend"
 {{"summary": "Monthly revenue trend.", "visual_type": "table", "columns": ["month", "revenue"], "data": [{{"month": "January 2026", "revenue": 30000}}, {{"month": "February 2026", "revenue": 32000}}]}}
 
+Q: "Employees with highest attendance"
+{{"summary": "Employees sorted by highest attendance.", "visual_type": "table", "columns": ["employee", "attendance"], "data": [{{"employee": "Jane", "attendance": 100}}, {{"employee": "John", "attendance": 95}}, {{"employee": "Bob", "attendance": 90}}]}}
+
+Q: "Which employees are not generating revenue"
+{{"summary": "Employees with zero or negative revenue.", "visual_type": "table", "columns": ["employee", "revenue"], "data": [{{"employee": "Bob", "revenue": 0}}, {{"employee": "Jane", "revenue": -500}}]}}
+
+Q: "Employees with margin below 30%"
+{{"summary": "Employees with margin below 30%.", "visual_type": "table", "columns": ["employee", "margin"], "data": [{{"employee": "Bob", "margin": 15}}, {{"employee": "Jane", "margin": 22}}]}}
+
+Q: "Show employees with revenue above $10,000"
+{{"summary": "Employees with revenue above $10,000.", "visual_type": "table", "columns": ["employee", "revenue"], "data": [{{"employee": "John", "revenue": 25000}}, {{"employee": "Jane", "revenue": 18000}}]}}
+
+Q: "Revenue per employee"
+{{"summary": "Average revenue per employee.", "visual_type": "metric", "columns": [], "data": [{{"label": "Revenue per Employee", "value": 12500}}]}}
+
+Q: "Compare Project Alpha vs Project Beta"
+{{"summary": "Comparison of Project Alpha and Project Beta.", "visual_type": "table", "columns": ["metric", "Project Alpha", "Project Beta"], "data": [{{"metric": "Revenue", "Project Alpha": 50000, "Project Beta": 45000}}, {{"metric": "Profit", "Project Alpha": 12000, "Project Beta": 10000}}, {{"metric": "Margin", "Project Alpha": 24, "Project Beta": 22}}]}}
+
+Q: "Top 3 employees in Project Alpha"
+{{"summary": "Top 3 employees in Project Alpha by profit.", "visual_type": "table", "columns": ["employee", "project", "profit"], "data": [{{"employee": "John", "project": "Alpha", "profit": 8000}}, {{"employee": "Jane", "project": "Alpha", "profit": 6000}}, {{"employee": "Bob", "project": "Alpha", "profit": 4000}}]}}
+
 RULES:
 1. "metric" for totals, counts, averages, summaries - use label/value pairs
 2. "table" for lists, rankings, breakdowns with multiple columns
 3. "text" only if no data found
-4. Use lowercase keys: employee, project, month, revenue, cost, profit, utilization, hours
+4. Use lowercase keys: employee, project, month, revenue, cost, profit, utilization, hours, attendance
 5. Numbers must be raw numbers (not strings with $ or %)
 6. summary must be a specific answer, not "Overall summary"
 7. Return ONLY the JSON object, nothing else
+8. "last month" or "recent month" = the month marked as "LAST MONTH (most recent)" in the data
+9. For "highest", "top", "best" questions: sort data DESCENDING by the relevant metric
+10. For "lowest", "bottom", "worst" questions: sort data ASCENDING by the relevant metric
+11. "not generating", "zero", "no revenue/profit" = filter for values that are 0 or negative
+12. "below X%", "less than X", "under X" = ONLY include values < X; "above X%", "more than X", "over X" = ONLY include values > X. NEVER include values that don't meet the threshold!
+13. "per employee", "per project", "per hour" = calculate average or divide total by count
+14. "compare A vs B" = show side-by-side comparison table with metrics as rows
+15. "YTD", "year to date" = sum from January to the last available month
+16. "Q1" = Jan-Mar, "Q2" = Apr-Jun, "Q3" = Jul-Sep, "Q4" = Oct-Dec
+17. For "top N in Project X" = filter by project first, then rank
 """
 
 

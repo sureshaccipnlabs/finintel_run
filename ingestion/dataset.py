@@ -392,12 +392,19 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
         profit = revenue - cost
         approved_hours = _to_num(r.get("expected_hours") if r.get("expected_hours") is not None else r.get("max_hours"))
 
+        vacation_days = _to_num(r.get("vacation_days"))
+        leave_days = _to_num(r.get("leave_days"))
+        working_days = _to_num(r.get("working_days"))
+
         if employee_name not in employees:
             employees[employee_name] = {
                 "hours": 0.0,
                 "revenue": 0.0,
                 "profit": 0.0,
                 "approved_hours": 0.0,
+                "vacation_days": 0.0,
+                "leave_days": 0.0,
+                "working_days": 0.0,
                 "projects": {},
             }
 
@@ -406,6 +413,9 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
         emp["revenue"] += revenue
         emp["profit"] += profit
         emp["approved_hours"] += approved_hours
+        emp["vacation_days"] += vacation_days
+        emp["leave_days"] += leave_days
+        emp["working_days"] += working_days
 
         if project_name not in emp["projects"]:
             emp["projects"][project_name] = {
@@ -429,6 +439,14 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
     for employee_name, data in employees.items():
         approved_total = data["approved_hours"]
         utilization = round((data["hours"] / approved_total) * 100, 2) if approved_total > 0 else None
+        margin_pct = round((data["profit"] / data["revenue"]) * 100, 2) if data["revenue"] > 0 else 0.0
+        
+        # Attendance calculation: match risk_engine formula
+        # Uses only vacation_days (same as risk_engine.py line 237-243)
+        vacation = data["vacation_days"]
+        working = data["working_days"]
+        leave_pct = round((vacation / working) * 100, 2) if working > 0 else 0.0
+        attendance_pct = round(100.0 - leave_pct, 2)
 
         projects = []
         for project_name, p in data["projects"].items():
@@ -452,7 +470,12 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
             "total_hours": round(data["hours"], 2),
             "total_revenue": round(data["revenue"], 2),
             "total_profit": round(data["profit"], 2),
+            "margin_pct": margin_pct,
             "utilization_pct": utilization,
+            "attendance_pct": attendance_pct,
+            "vacation_days": round(data["vacation_days"], 1),
+            "leave_days": round(data["leave_days"], 1),
+            "working_days": round(data["working_days"], 1),
             "projects": projects,
             "contribution_status": contribution_status,
         })
