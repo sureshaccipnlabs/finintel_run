@@ -79,6 +79,8 @@ Useful endpoints include:
 - `GET /metrics`
 - `GET /projects`
 - `GET /employees`
+- `GET /ai-provider`
+- `POST /ai-provider`
 
 ### Run the sample CLI flow
 
@@ -119,13 +121,95 @@ The ingestion flow supports:
 - If you get dependency import errors, run `uv sync` again.
 - If Q&A responses fail, make sure Ollama is running.
 
+### AI provider selection (Ollama + OpenAI)
+
+You can now choose which LLM backend the app should use.
+
+Supported providers:
+
+- `ollama` (local)
+- `openai` (API)
+- `auto` (fallback order)
+
+Environment variables:
+
+- `AI_PROVIDER`: `ollama` | `openai` | `auto` (default: `auto`)
+- `AI_PROVIDER_ORDER`: comma-separated fallback order for auto mode (default: `ollama,openai`)
+- `OLLAMA_URL` (default: `http://localhost:11434`)
+- `OLLAMA_MODEL` (default: `llama3`)
+- `OPENAI_API_KEY` (required for OpenAI)
+- `OPENAI_MODEL` (default: `gpt-4o-mini`)
+- `OPENAI_URL` (default: `https://api.openai.com/v1/chat/completions`)
+
+Quick commands to run (copy-paste):
+
+OpenAI only:
+
+```bash
+export AI_PROVIDER=openai
+export OPENAI_API_KEY="your_openai_api_key"
+export OPENAI_MODEL="gpt-4o-mini"
+uv run uvicorn main:app --reload
+```
+
+Ollama only:
+
+```bash
+export AI_PROVIDER=ollama
+export OLLAMA_URL="http://localhost:11434"
+export OLLAMA_MODEL="llama3"
+uv run uvicorn main:app --reload
+```
+
+Examples:
+
+Use Ollama only:
+
+```bash
+export AI_PROVIDER=ollama
+export OLLAMA_MODEL=llama3
+```
+
+Use OpenAI only:
+
+```bash
+export AI_PROVIDER=openai
+export OPENAI_API_KEY=your_key_here
+export OPENAI_MODEL=gpt-4o-mini
+```
+
+Auto mode (try OpenAI first, then Ollama):
+
+```bash
+export AI_PROVIDER=auto
+export AI_PROVIDER_ORDER=openai,ollama
+```
+
+You can also switch provider at runtime (without restart):
+
+```bash
+curl -X POST "http://127.0.0.1:8000/ai-provider" \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"openai"}'
+```
+
+Switch to Ollama runtime:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/ai-provider" \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"ollama"}'
+```
+
+`POST /ai-provider` now only switches provider. Model, URL, and API key are taken from server-side configuration (`OPENAI_*`, `OLLAMA_*`, `AI_PROVIDER_ORDER`).
+
 ### AI behavior (current)
 
 Notes:
 
-- `GET /risks-recommendations` uses Ollama for `ai_insights`.
-- If Ollama is unavailable, insights return empty text and rule-based risks/recommendations still return.
-- Q&A uses Ollama (`POST /ask`).
+- `GET /risks-recommendations` and `POST /ask` use the provider configured via `AI_PROVIDER`.
+- If no configured provider is available, insights return empty text and rule-based risks/recommendations still return.
+- `POST /ask` now detects forecast-style questions (`forecast`, `predict`, `next 3 months`, etc.) and applies a forecast prompt with explicit assumptions for more consistent Ollama/OpenAI output.
 - `GET /risks-recommendations` now also returns compact grouped fields: `overview`, `risk_groups`, `recommendation_groups`, `top_risks`, and `top_recommendations`.
 - Use query param `max_items` (default `8`, range `3-20`) to control compact list sizes.
 

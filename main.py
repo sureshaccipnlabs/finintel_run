@@ -16,6 +16,7 @@ from ingestion.dataset import (
 )
 from ingestion.qa_engine import ask as qa_ask
 from ingestion.risk_engine import get_risks_and_recommendations
+from ingestion import ai_mapper
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import tempfile
@@ -383,6 +384,11 @@ class AskRequest(BaseModel):
     time_range: Optional[str] = None
 
 
+class AIProviderConfigRequest(BaseModel):
+    provider: Optional[str] = None
+    provider_order: Optional[str] = None
+
+
 @app.post("/ask")
 def ask_question(req: AskRequest):
     return qa_ask(req.query, time_range=req.time_range)
@@ -393,6 +399,24 @@ def ask_question(req: AskRequest):
 def list_files():
     files = get_files_processed()
     return {"files": files, "count": len(files)}
+
+
+# ── GET /ai-provider — Active AI provider config and health ────────────────
+@app.get("/ai-provider")
+def get_ai_provider_status():
+    return ai_mapper.get_ai_provider_status()
+
+
+# ── POST /ai-provider — Update provider config at runtime ────────────────
+@app.post("/ai-provider")
+def set_ai_provider_status(req: AIProviderConfigRequest):
+    try:
+        return ai_mapper.configure_ai_provider(
+            provider=req.provider,
+            provider_order=req.provider_order,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 # ── DELETE /dataset — Reset all ────────────────────────────────────────

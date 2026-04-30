@@ -12,12 +12,12 @@ from typing import Optional
 from .field_config import FIELD_ALIASES, OPTIONAL_FIELDS, REQUIRED_FIELDS
 
 try:
-    from .ai_mapper import ai_map_columns, is_ollama_available
+    from .ai_mapper import ai_map_columns, is_llm_available
     _AI_AVAILABLE = True
 except ImportError:
     _AI_AVAILABLE = False
     def ai_map_columns(*a, **kw): return {}
-    def is_ollama_available(): return False
+    def is_llm_available(): return False
 
 
 def normalise(text: str) -> str:
@@ -78,7 +78,7 @@ def build_column_mapping(raw_columns: list[str], threshold: float = 0.65) -> dic
 
     # AI fallback: if required fields still unmapped, ask Ollama
     missing = [f for f in REQUIRED_FIELDS if f not in claimed_fields]
-    if missing and _AI_AVAILABLE and is_ollama_available():
+    if missing and _AI_AVAILABLE and is_llm_available():
         try:
             ai_result = ai_map_columns(raw_columns, already_mapped=mapping)
             # ai_result maps field_name → column_index
