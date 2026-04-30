@@ -400,6 +400,7 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
             employees[employee_name] = {
                 "hours": 0.0,
                 "revenue": 0.0,
+                "cost": 0.0,
                 "profit": 0.0,
                 "approved_hours": 0.0,
                 "vacation_days": 0.0,
@@ -411,6 +412,7 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
         emp = employees[employee_name]
         emp["hours"] += hours
         emp["revenue"] += revenue
+        emp["cost"] += cost
         emp["profit"] += profit
         emp["approved_hours"] += approved_hours
         emp["vacation_days"] += vacation_days
@@ -439,7 +441,7 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
     for employee_name, data in employees.items():
         approved_total = data["approved_hours"]
         utilization = round((data["hours"] / approved_total) * 100, 2) if approved_total > 0 else None
-        margin_pct = round((data["profit"] / data["revenue"]) * 100, 2) if data["revenue"] > 0 else 0.0
+        gross_margin_pct = _calc_margin(data["revenue"], data["cost"])
         
         # Attendance calculation: match risk_engine formula
         # Uses only vacation_days (same as risk_engine.py line 237-243)
@@ -469,8 +471,9 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
             "employee_name": employee_name,
             "total_hours": round(data["hours"], 2),
             "total_revenue": round(data["revenue"], 2),
+            "total_cost": round(data["cost"], 2),
             "total_profit": round(data["profit"], 2),
-            "margin_pct": margin_pct,
+            "gross_margin_pct": gross_margin_pct,
             "utilization_pct": utilization,
             "attendance_pct": attendance_pct,
             "vacation_days": round(data["vacation_days"], 1),
