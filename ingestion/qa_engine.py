@@ -1480,4 +1480,3 @@ def ask(question: str, time_range: str = None) -> dict:
     _cache_response(question, data_hash, result)
     
     return result
-
