@@ -16,7 +16,7 @@ from .dataset import (
     build_employee_summaries, set_on_dataset_change_callback, _trend_from_values,
     _calc_margin
 )
-from .ai_mapper import _ollama_generate, is_ollama_available
+from .ai_mapper import _llm_generate, is_llm_available
 from .forecast_ import try_answer_forecast, is_likely_forecast
 
 
@@ -1320,10 +1320,10 @@ def ask(question: str, time_range: str = None) -> dict:
                 },
             }
 
-    # Check Ollama availability
-    if not is_ollama_available():
+    # Check configured provider availability
+    if not is_llm_available():
         return {
-            "summary": "LLM service (Ollama) is not running. Please start it with: ollama serve",
+            "summary": "No configured LLM provider is available. Set AI_PROVIDER and related env vars (Ollama/OpenAI).",
             "visual_type": "text",
             "columns": [],
             "data": [],
@@ -1339,7 +1339,7 @@ def ask(question: str, time_range: str = None) -> dict:
 
     try:
         _llm_start = time.time()
-        raw_response = _ollama_generate(prompt, timeout=120)
+        raw_response = _llm_generate(prompt, timeout=120)
         print(f"[qa_engine] LLM call took {time.time() - _llm_start:.2f}s")
     except Exception as e:
         return {

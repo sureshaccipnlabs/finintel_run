@@ -68,22 +68,18 @@ def is_likely_forecast(question: str) -> bool:
 
     q = question.lower().strip()
 
+    # Strong forecast indicators should win even if the sentence also contains
+    # generic phrasing like "what is" or "show me".
+    has_strong_forecast_cue = any(kw in q for kw in _FORECAST_KEYWORDS) or bool(_FUTURE_PERIOD_PATTERN.search(q))
+    if has_strong_forecast_cue:
+        _debug("is_likely_forecast: Found strong forecast cue, returning True")
+        return True
+
     # Check for explicit non-forecast keywords first (quick exit)
     for kw in _NON_FORECAST_KEYWORDS:
         if kw in q:
             _debug(f"is_likely_forecast: Found non-forecast keyword '{kw}', returning False")
             return False
-
-    # Check for forecast keywords
-    for kw in _FORECAST_KEYWORDS:
-        if kw in q:
-            _debug(f"is_likely_forecast: Found forecast keyword '{kw}', returning True")
-            return True
-
-    # Check for future period patterns
-    if _FUTURE_PERIOD_PATTERN.search(q):
-        _debug(f"is_likely_forecast: Found future period pattern, returning True")
-        return True
 
     _debug(f"is_likely_forecast: No forecast indicators found, returning False")
     return False
