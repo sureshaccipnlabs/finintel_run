@@ -233,7 +233,7 @@ def employee_performance_score(emp_records: list[dict]) -> dict:
     total_rev    = sum(_num(r.get("revenue"))        for r in emp_records)
     total_cost   = sum(_num(r.get("cost"))           for r in emp_records)
     total_hours  = sum(_num(r.get("actual_hours"))   for r in emp_records)
-    appr_hours   = sum(_num(r.get("approved_hours") or r.get("max_hours")) for r in emp_records)
+    appr_hours   = sum(_num(r.get("approved_hours") or r.get("max_hours") or r.get("expected_hours")) for r in emp_records)
     leave_days   = sum(_num(r.get("vacation_days"))  for r in emp_records)
     work_days    = sum(_num(r.get("working_days") or DEFAULT_WORK_DAYS) for r in emp_records)
 
@@ -305,7 +305,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
     total_cost  = sum(_num(r.get("cost"))         for r in monthly_records)
     total_hours = sum(_num(r.get("actual_hours")) for r in monthly_records)
     total_leave = sum(_num(r.get("vacation_days"))for r in monthly_records)
-    appr_hours  = sum(_num(r.get("approved_hours") or r.get("max_hours")) for r in monthly_records)
+    appr_hours  = sum(_num(r.get("approved_hours") or r.get("max_hours") or r.get("expected_hours")) for r in monthly_records)
     total_profit= total_rev - total_cost
     avg_margin  = (total_profit / total_rev * 100) if total_rev > 0 else 0.0
     avg_util    = (total_hours / appr_hours * 100) if appr_hours > 0 else (
@@ -667,8 +667,8 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
     # ── 11. BILLING_CEILING_HIT ───────────────────────────────────────────
     if n >= 3:
         ceiling_flags = [
-            abs(_num(r.get("billable_hours")) - _num(r.get("approved_hours") or r.get("max_hours"))) < 2
-            and _num(r.get("approved_hours") or r.get("max_hours")) > 0
+            abs(_num(r.get("billable_hours")) - _num(r.get("approved_hours") or r.get("max_hours") or r.get("expected_hours"))) < 2
+            and _num(r.get("approved_hours") or r.get("max_hours") or r.get("expected_hours")) > 0
             for r in monthly_records
         ]
         consecutive_ceiling = _consecutive_condition(ceiling_flags)
@@ -692,7 +692,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                 "deadline": "Next headcount review",
                 "metrics": {
                     "consecutive_ceiling_months": consecutive_ceiling,
-                    "approved_hours_per_month": _num(latest.get("approved_hours") or latest.get("max_hours")),
+                    "approved_hours_per_month": _num(latest.get("approved_hours") or latest.get("max_hours") or latest.get("expected_hours")),
                 },
                 "linked_employees": [name],
                 "revenue_contribution_pct": revenue_pct,

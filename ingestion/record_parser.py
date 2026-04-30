@@ -83,7 +83,7 @@ def parse_record(row: Dict[str, Any]) -> Dict[str, Any]:
 
     # Cost
     if cost_rate and cost_rate != 0:
-        cost = round((actual_hours + leave_hours) * cost_rate, 2)
+        cost = round(actual_hours * cost_rate, 2)
     else:
         cost = None
         flags.append("MISSING_COST_RATE")
