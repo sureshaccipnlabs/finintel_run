@@ -315,8 +315,12 @@ def _build_dataset_context(records=None, question: str = None):
         projects = build_projects(recs)
         lines.append("=== PROJECTS ===")
         for name, data in sorted(projects.items(), key=lambda x: x[1]["revenue"], reverse=True):
+            proj_revenue = float(data.get("revenue") or 0)
+            proj_cost = float(data.get("cost") or 0)
+            proj_margin = round(((proj_revenue - proj_cost) / proj_revenue) * 100, 2) if proj_revenue > 0 else 0
             lines.append(
-                f"- {name}: Revenue=${data['revenue']:,.2f}, Profit=${data['profit']:,.2f}, "
+                f"- {name}: Revenue=${data['revenue']:,.2f}, Cost=${data.get('cost', 0):,.2f}, "
+                f"Profit=${data['profit']:,.2f}, GrossMargin={proj_margin}%, "
                 f"Utilisation={data.get('avg_utilisation', 0)}%, Employees={data['employees']}"
             )
         lines.append("")
@@ -348,7 +352,7 @@ def _build_dataset_context(records=None, question: str = None):
         for emp in employee_summaries:
             lines.append(
                 f"- {emp['employee_name']}: Revenue=${emp['total_revenue']:,.2f}, "
-                f"Profit=${emp['total_profit']:,.2f}, Margin={emp.get('margin_pct', 0)}%, "
+                f"Profit=${emp['total_profit']:,.2f}, Margin={emp.get('gross_margin_pct') or emp.get('margin_pct') or 0}%, "
                 f"Hours={emp['total_hours']}, Utilisation={emp['utilization_pct'] or 0}%, "
                 f"Attendance={emp.get('attendance_pct', 100)}%, VacationDays={emp.get('vacation_days', 0)}"
             )
@@ -576,7 +580,7 @@ def _extract_rows(text: str):
                     fv = _to_float_num(v)
                     if fv is not None:
                         row["working_days"] = fv
-                elif k.startswith("margin"):
+                elif k.startswith("margin") or "margin" in k.replace(" ", ""):
                     fv = _to_float_num(v)
                     if fv is not None:
                         row["margin_pct"] = fv
@@ -625,6 +629,10 @@ def _format_column_name(col: str) -> str:
         "working_days": "Working Days",
         "margin_pct": "Margin",
         "margin": "Margin",
+        "gross_margin_pct": "Gross Margin",
+        "avg_margin_pct": "Avg Margin",
+        "gross_margin": "Gross Margin",
+        "avg_margin": "Avg Margin",
         "billing_rate": "Bill Rate",
         "cost_rate": "Cost Rate",
         "actual_hours": "Actual Hours",
@@ -668,9 +676,18 @@ def _format_value(key: str, value) -> str:
             return str(value)
     
     # Percentage fields
-    if key_lower in ("utilization", "utilization_pct", "utilisation", "utilisation_pct", "margin", "margin_pct"):
+    if key_lower in (
+        "utilization", "utilization_pct", "utilisation", "utilisation_pct",
+        "margin", "margin_pct", "gross_margin", "gross_margin_pct", "avg_margin", "avg_margin_pct",
+    ) or ("margin" in key_lower) or key_lower.endswith("_pct"):
         try:
-            num = float(value) if not isinstance(value, (int, float)) else value
+            if isinstance(value, (int, float)):
+                num = float(value)
+            else:
+                parsed = _to_float_num(str(value))
+                if parsed is None:
+                    return str(value)
+                num = parsed
             return f"{num:.1f}%"
         except (ValueError, TypeError):
             return str(value)
@@ -918,6 +935,8 @@ def _llm_table_name(summary: str, columns, data) -> str:
         ("holidays", "Holidays"), ("holiday", "Holidays"), ("holiday_days", "Holidays"),
         ("working_days", "Working Days"), ("workdays", "Working Days"),
         ("margin", "Margin"), ("margin_pct", "Margin"),
+        ("gross_margin", "Gross Margin"), ("gross_margin_pct", "Gross Margin"),
+        ("avg_margin", "Avg Margin"), ("avg_margin_pct", "Avg Margin"),
         ("headcount", "Headcount"),
     ]
     metrics = []
