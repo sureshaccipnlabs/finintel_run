@@ -11,6 +11,22 @@ from typing import Optional, List
 _LOCK = threading.Lock()
 GLOBAL_DATASET: List[dict] = []
 
+# Callback for cache invalidation (set by qa_engine to avoid circular import)
+_ON_DATASET_CHANGE_CALLBACK = None
+
+def set_on_dataset_change_callback(callback):
+    """Register a callback to be called when dataset changes."""
+    global _ON_DATASET_CHANGE_CALLBACK
+    _ON_DATASET_CHANGE_CALLBACK = callback
+
+def _notify_dataset_change():
+    """Notify listeners that dataset has changed."""
+    if _ON_DATASET_CHANGE_CALLBACK:
+        try:
+            _ON_DATASET_CHANGE_CALLBACK()
+        except Exception:
+            pass
+
 MONTH_ORDER = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
@@ -68,6 +84,7 @@ def clear():
         GLOBAL_DATASET.clear()
         _FILES_PROCESSED.clear()
         _DEDUP_KEYS.clear()
+    _notify_dataset_change()
 
 
 def append_records(records: List[dict], filename: str = ""):
@@ -104,10 +121,12 @@ def append_records(records: List[dict], filename: str = ""):
 
         if skipped:
             print(f"[dataset] Skipped {skipped} records with missing employee name")
+    _notify_dataset_change()
 
 
 def remove_by_file(filename: str) -> int:
     """Remove all records from a specific source file. Returns count removed."""
+    removed = 0
     with _LOCK:
         before = len(GLOBAL_DATASET)
         remaining = [r for r in GLOBAL_DATASET if r.get("_source_file") != filename]
@@ -123,7 +142,8 @@ def remove_by_file(filename: str) -> int:
             _DEDUP_KEYS.add((_normalize_key(emp), _normalize_key(mon), _normalize_key(proj)))
         if filename in _FILES_PROCESSED:
             _FILES_PROCESSED.remove(filename)
-        return removed
+    _notify_dataset_change()
+    return removed
 
 
 def get_files_processed() -> List[str]:
@@ -202,17 +222,24 @@ def build_projects(records: List[dict]) -> dict:
         if proj not in projects:
             projects[proj] = {
                 "revenue": 0, "cost": 0, "profit": 0,
+                "hours": 0.0, "approved_hours": 0.0,
                 "employees": set(),
             }
         projects[proj]["revenue"] += r.get("revenue") or 0
         projects[proj]["cost"] += r.get("cost") or 0
         projects[proj]["profit"] += r.get("profit") or 0
+        projects[proj]["hours"] += _to_num(r.get("actual_hours"))
+        projects[proj]["approved_hours"] += _to_num(r.get("expected_hours") if r.get("expected_hours") is not None else r.get("max_hours"))
         projects[proj]["employees"].add(r.get("employee", ""))
 
     for p in projects.values():
         p["revenue"] = round(p["revenue"], 2)
         p["cost"] = round(p["cost"], 2)
         p["profit"] = round(p["profit"], 2)
+        if p["approved_hours"] > 0:
+            p["avg_utilisation"] = round((p["hours"] / p["approved_hours"]) * 100, 2)
+        else:
+            p["avg_utilisation"] = 0
         p["employees"] = len(p["employees"])
 
     return projects
@@ -226,11 +253,18 @@ def build_monthly(records: List[dict]) -> dict:
             monthly[m] = {
                 "total_revenue": 0, "total_cost": 0, "total_profit": 0,
                 "employees": set(),
+                "leave_days": 0.0, "vacation_days": 0.0, "holiday_days": 0.0,
+                "working_days": 0.0, "total_hours": 0.0,
             }
         monthly[m]["total_revenue"] += r.get("revenue") or 0
         monthly[m]["total_cost"] += r.get("cost") or 0
         monthly[m]["total_profit"] += r.get("profit") or 0
         monthly[m]["employees"].add(r.get("employee", ""))
+        monthly[m]["leave_days"] += (r.get("leave_days") or 0)
+        monthly[m]["vacation_days"] += (r.get("vacation_days") or 0)
+        monthly[m]["holiday_days"] += (r.get("holiday_days") or 0)
+        monthly[m]["working_days"] += (r.get("working_days") or 0)
+        monthly[m]["total_hours"] += (r.get("actual_hours") or 0)
 
     for v in monthly.values():
         v["total_revenue"] = round(v["total_revenue"], 2)
@@ -240,6 +274,11 @@ def build_monthly(records: List[dict]) -> dict:
         pft = v["total_profit"]
         v["avg_margin_pct"] = round((pft / rev) * 100, 2) if rev > 0 else 0
         v["employees"] = len(v["employees"])
+        v["leave_days"] = round(v["leave_days"], 2)
+        v["vacation_days"] = round(v["vacation_days"], 2)
+        v["holiday_days"] = round(v["holiday_days"], 2)
+        v["working_days"] = round(v["working_days"], 2)
+        v["total_hours"] = round(v["total_hours"], 2)
 
     return monthly
 
@@ -353,22 +392,30 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
         profit = revenue - cost
         approved_hours = _to_num(r.get("expected_hours") if r.get("expected_hours") is not None else r.get("max_hours"))
 
+        vacation_days = _to_num(r.get("vacation_days"))
+        leave_days = _to_num(r.get("leave_days"))
+        working_days = _to_num(r.get("working_days"))
+
         if employee_name not in employees:
             employees[employee_name] = {
                 "hours": 0.0,
                 "revenue": 0.0,
-                "cost": 0.0,
                 "profit": 0.0,
                 "approved_hours": 0.0,
+                "vacation_days": 0.0,
+                "leave_days": 0.0,
+                "working_days": 0.0,
                 "projects": {},
             }
 
         emp = employees[employee_name]
         emp["hours"] += hours
         emp["revenue"] += revenue
-        emp["cost"] += cost
         emp["profit"] += profit
         emp["approved_hours"] += approved_hours
+        emp["vacation_days"] += vacation_days
+        emp["leave_days"] += leave_days
+        emp["working_days"] += working_days
 
         if project_name not in emp["projects"]:
             emp["projects"][project_name] = {
@@ -392,6 +439,14 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
     for employee_name, data in employees.items():
         approved_total = data["approved_hours"]
         utilization = round((data["hours"] / approved_total) * 100, 2) if approved_total > 0 else None
+        margin_pct = round((data["profit"] / data["revenue"]) * 100, 2) if data["revenue"] > 0 else 0.0
+        
+        # Attendance calculation: match risk_engine formula
+        # Uses only vacation_days (same as risk_engine.py line 237-243)
+        vacation = data["vacation_days"]
+        working = data["working_days"]
+        leave_pct = round((vacation / working) * 100, 2) if working > 0 else 0.0
+        attendance_pct = round(100.0 - leave_pct, 2)
 
         projects = []
         for project_name, p in data["projects"].items():
@@ -414,10 +469,13 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
             "employee_name": employee_name,
             "total_hours": round(data["hours"], 2),
             "total_revenue": round(data["revenue"], 2),
-            "total_cost": round(data["cost"], 2),
             "total_profit": round(data["profit"], 2),
-            "gross_margin_pct": _calc_margin(data["revenue"], data["cost"]),
+            "margin_pct": margin_pct,
             "utilization_pct": utilization,
+            "attendance_pct": attendance_pct,
+            "vacation_days": round(data["vacation_days"], 1),
+            "leave_days": round(data["leave_days"], 1),
+            "working_days": round(data["working_days"], 1),
             "projects": projects,
             "contribution_status": contribution_status,
         })
