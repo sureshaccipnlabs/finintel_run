@@ -13,10 +13,11 @@ import time
 from .dataset import (
     GLOBAL_DATASET, build_projects, build_monthly, build_overall_summary,
     build_top_performers, build_risks, get_months_available, filter_by_range,
-    build_employee_summaries, set_on_dataset_change_callback
+    build_employee_summaries, set_on_dataset_change_callback, _trend_from_values,
+    _calc_margin
 )
 from .ai_mapper import _ollama_generate, is_ollama_available
-from .forecast_ import try_answer_forecast
+from .forecast_ import try_answer_forecast, is_likely_forecast
 
 
 # ── QA-specific JSON extraction ───────────────────────────────────────────────
@@ -136,8 +137,54 @@ def invalidate_context_cache():
     _CONTEXT_CACHE["timestamp"] = 0
 
 
+# ── Response Caching ──────────────────────────────────────────────────────────
+
+_RESPONSE_CACHE = {}
+_RESPONSE_CACHE_TTL = 300  # 5 minutes
+_RESPONSE_CACHE_MAX_SIZE = 100
+
+
+def _get_response_cache_key(question: str, data_hash: str) -> str:
+    """Generate cache key from question + data hash."""
+    normalized = question.lower().strip()
+    return hashlib.md5(f"{normalized}|{data_hash}".encode()).hexdigest()
+
+
+def _get_cached_response(question: str, data_hash: str):
+    """Return cached response if valid, else None."""
+    key = _get_response_cache_key(question, data_hash)
+    entry = _RESPONSE_CACHE.get(key)
+    if entry and (time.time() - entry["timestamp"]) < _RESPONSE_CACHE_TTL:
+        print(f"[qa_engine] Cache HIT for: {question[:50]}...")
+        return entry["response"]
+    return None
+
+
+def _cache_response(question: str, data_hash: str, response: dict):
+    """Store response in cache."""
+    if len(_RESPONSE_CACHE) >= _RESPONSE_CACHE_MAX_SIZE:
+        # Remove oldest entry
+        oldest = min(_RESPONSE_CACHE, key=lambda k: _RESPONSE_CACHE[k]["timestamp"])
+        del _RESPONSE_CACHE[oldest]
+    
+    key = _get_response_cache_key(question, data_hash)
+    _RESPONSE_CACHE[key] = {"response": response, "timestamp": time.time()}
+    print(f"[qa_engine] Cached response for: {question[:50]}...")
+
+
+def invalidate_response_cache():
+    """Clear response cache when data changes."""
+    _RESPONSE_CACHE.clear()
+    print("[qa_engine] Response cache invalidated")
+
+
 # Register cache invalidation callback with dataset module
-set_on_dataset_change_callback(invalidate_context_cache)
+def _invalidate_all_caches():
+    """Invalidate both context and response caches."""
+    invalidate_context_cache()
+    invalidate_response_cache()
+
+set_on_dataset_change_callback(_invalidate_all_caches)
 
 
 # ── Context builder ──────────────────────────────────────────────────────────
@@ -212,18 +259,24 @@ def _detect_question_scope(question: str) -> dict:
             scope["specific_employee"] = name
             break
     
+    # For project utilization questions, ONLY need PROJECTS section (not employees)
+    is_project_util_question = ("project" in q) and any(w in q for w in ["utilization", "utilisation", "util"])
+    
     # Specific metrics that need employee details (expanded)
     metric_keywords = [
         "hours", "actual hours", "billable", "billable hours", "vacation", "leave", 
-        "working days", "utilization", "utilisation", "util", "billing rate", 
+        "working days", "billing rate", 
         "cost rate", "zero hours", "no hours", "logged", "per hour", "per day",
-        "per employee", "per project", "ratio", "average", "avg", "mean",
+        "per employee", "ratio", "average", "avg", "mean",
         "below", "above", "less than", "more than", "greater than", "threshold"
     ]
-    if any(w in q for w in metric_keywords):
+    if any(w in q for w in metric_keywords) and not is_project_util_question:
         scope["needs_employee_summary"] = True
         if any(w in q for w in ["his", "her", "their", "'s"]) or re.search(r"\b[A-Z][a-z]+\b", question):
             scope["needs_employee_details"] = True
+    # Employee utilization questions need employee summary
+    if any(w in q for w in ["utilization", "utilisation", "util"]) and not is_project_util_question:
+        scope["needs_employee_summary"] = True
     
     # Risk-related keywords (expanded for natural language)
     risk_keywords = [
@@ -313,15 +366,91 @@ def _build_dataset_context(records=None, question: str = None):
     # Projects - include if needed
     if include_all or scope.get("needs_projects"):
         projects = build_projects(recs)
+        
+        # Build per-project monthly series for trends and avg utilisation
+        proj_monthly = {}
+        proj_billable = {}
+        proj_util_values = {}  # Collect utilisation_pct per project for averaging
+        for r in recs:
+            proj = r.get("project") or "Unknown"
+            month = r.get("month") or "Unknown"
+            if proj not in proj_monthly:
+                proj_monthly[proj] = {}
+                proj_billable[proj] = 0.0
+                proj_util_values[proj] = []
+            if month not in proj_monthly[proj]:
+                proj_monthly[proj][month] = {"rev": 0.0, "cost": 0.0}
+            proj_monthly[proj][month]["rev"] += float(r.get("revenue") or 0)
+            proj_monthly[proj][month]["cost"] += float(r.get("cost") or 0)
+            proj_billable[proj] += float(r.get("billable_hours") or 0)
+            # Collect utilisation_pct for averaging
+            util_pct = r.get("utilisation_pct")
+            if util_pct is not None and util_pct > 0:
+                proj_util_values[proj].append(float(util_pct))
+        
+        # Pre-calculate utilization for sorting
+        proj_utils = {}
+        for name in projects.keys():
+            util_values = proj_util_values.get(name, [])
+            proj_utils[name] = round(sum(util_values) / len(util_values), 2) if util_values else 0
+        
+        # Sort by various metrics for ranking hints
+        sorted_by_util = sorted(proj_utils.items(), key=lambda x: x[1], reverse=True)
+        sorted_by_cost = sorted(projects.items(), key=lambda x: x[1].get("cost", 0))
+        sorted_by_revenue = sorted(projects.items(), key=lambda x: x[1].get("revenue", 0), reverse=True)
+        sorted_by_profit = sorted(projects.items(), key=lambda x: x[1].get("profit", 0), reverse=True)
+        
         lines.append("=== PROJECTS ===")
+        lines.append(f"RANKING HINTS: HighestUtilization={sorted_by_util[0][0]}, LowestUtilization={sorted_by_util[-1][0]}, "
+                     f"HighestRevenue={sorted_by_revenue[0][0]}, LowestRevenue={sorted_by_revenue[-1][0]}, "
+                     f"HighestCost={sorted_by_cost[-1][0]}, LowestCost={sorted_by_cost[0][0]}, "
+                     f"HighestProfit={sorted_by_profit[0][0]}, LowestProfit={sorted_by_profit[-1][0]}")
         for name, data in sorted(projects.items(), key=lambda x: x[1]["revenue"], reverse=True):
             proj_revenue = float(data.get("revenue") or 0)
             proj_cost = float(data.get("cost") or 0)
             proj_margin = round(((proj_revenue - proj_cost) / proj_revenue) * 100, 2) if proj_revenue > 0 else 0
+            
+            # Determine project status based on margin (same logic as /projects API)
+            if proj_margin > 40:
+                proj_status = "Healthy"
+            elif proj_margin >= 30:
+                proj_status = "Optimal"
+            else:
+                proj_status = "At Risk"
+            
+            # Calculate trends from monthly series
+            monthly_data = proj_monthly.get(name, {})
+            sorted_months = sorted(monthly_data.keys(), key=lambda m: get_months_available([{"month": m}]))
+            revenue_series = [monthly_data[m]["rev"] for m in sorted_months]
+            cost_series = [monthly_data[m]["cost"] for m in sorted_months]
+            profit_series = [monthly_data[m]["rev"] - monthly_data[m]["cost"] for m in sorted_months]
+            margin_series = [_calc_margin(monthly_data[m]["rev"], monthly_data[m]["cost"]) for m in sorted_months]
+            
+            rev_trend = _trend_from_values(revenue_series)
+            cost_trend = _trend_from_values(cost_series)
+            profit_trend = _trend_from_values(profit_series)
+            margin_trend = _trend_from_values(margin_series)
+            billable_hrs = round(proj_billable.get(name, 0), 2)
+            
+            # Calculate AvgUtilisation from employee utilisation_pct values
+            util_values = proj_util_values.get(name, [])
+            avg_util = round(sum(util_values) / len(util_values), 2) if util_values else 0
+            
+            # Calculate best/worst month for this project
+            proj_months = proj_monthly.get(name, {})
+            if proj_months:
+                best_rev_month = max(proj_months.items(), key=lambda x: x[1]["rev"])[0]
+                worst_rev_month = min(proj_months.items(), key=lambda x: x[1]["rev"])[0]
+            else:
+                best_rev_month = worst_rev_month = "N/A"
+            
             lines.append(
                 f"- {name}: Revenue=${data['revenue']:,.2f}, Cost=${data.get('cost', 0):,.2f}, "
                 f"Profit=${data['profit']:,.2f}, GrossMargin={proj_margin}%, "
-                f"Utilisation={data.get('avg_utilisation', 0)}%, Employees={data['employees']}"
+                f"AvgUtilisation={avg_util}%, Employees={data['employees']}, "
+                f"BillableHours={billable_hrs}, Status={proj_status}, "
+                f"RevenueTrend={rev_trend}, CostTrend={cost_trend}, ProfitTrend={profit_trend}, MarginTrend={margin_trend}, "
+                f"BestRevenueMonth={best_rev_month}, WorstRevenueMonth={worst_rev_month}"
             )
         lines.append("")
 
@@ -331,6 +460,14 @@ def _build_dataset_context(records=None, question: str = None):
         lines.append("=== MONTHLY ===")
         # Sort months chronologically using the same order as get_months_available
         sorted_months = [m for m in months if m in monthly]
+        
+        # Add ranking hints for months
+        if sorted_months:
+            sorted_by_revenue = sorted(sorted_months, key=lambda m: monthly[m].get('total_revenue', 0), reverse=True)
+            sorted_by_profit = sorted(sorted_months, key=lambda m: monthly[m].get('total_profit', 0), reverse=True)
+            lines.append(f"RANKING HINTS: HighestRevenue={sorted_by_revenue[0]}, LowestRevenue={sorted_by_revenue[-1]}, "
+                         f"HighestProfit={sorted_by_profit[0]}, LowestProfit={sorted_by_profit[-1]}")
+        
         for m in sorted_months:
             data = monthly[m]
             is_last = (m == months[-1]) if months else False
@@ -348,12 +485,23 @@ def _build_dataset_context(records=None, question: str = None):
         if scope and scope.get("specific_employee"):
             emp_name = scope["specific_employee"].lower()
             employee_summaries = [e for e in employee_summaries if emp_name in e["employee_name"].lower()]
-        lines.append("=== EMPLOYEES ===")
+        
+        # Add ranking hints for employees
+        if employee_summaries:
+            sorted_by_util = sorted(employee_summaries, key=lambda x: x.get('utilization_pct') or 0, reverse=True)
+            sorted_by_revenue = sorted(employee_summaries, key=lambda x: x.get('total_revenue') or 0, reverse=True)
+            sorted_by_profit = sorted(employee_summaries, key=lambda x: x.get('total_profit') or 0, reverse=True)
+            lines.append("=== EMPLOYEES ===")
+            lines.append(f"RANKING HINTS: HighestUtilization={sorted_by_util[0]['employee_name']}, LowestUtilization={sorted_by_util[-1]['employee_name']}, "
+                         f"HighestRevenue={sorted_by_revenue[0]['employee_name']}, LowestRevenue={sorted_by_revenue[-1]['employee_name']}, "
+                         f"HighestProfit={sorted_by_profit[0]['employee_name']}, LowestProfit={sorted_by_profit[-1]['employee_name']}")
+        else:
+            lines.append("=== EMPLOYEES ===")
         for emp in employee_summaries:
             lines.append(
                 f"- {emp['employee_name']}: Revenue=${emp['total_revenue']:,.2f}, "
                 f"Profit=${emp['total_profit']:,.2f}, Margin={emp.get('gross_margin_pct') or emp.get('margin_pct') or 0}%, "
-                f"Hours={emp['total_hours']}, Utilisation={emp['utilization_pct'] or 0}%, "
+                f"Hours={emp['total_hours']}, IndividualUtilisation={emp['utilization_pct'] or 0}%, "
                 f"Attendance={emp.get('attendance_pct', 100)}%, VacationDays={emp.get('vacation_days', 0)}"
             )
         if not employee_summaries:
@@ -392,7 +540,7 @@ def _build_dataset_context(records=None, question: str = None):
         if risks:
             lines.append("=== RISKS ===")
             for r in risks:
-                lines.append(f"- {r['employee']} ({r.get('month', '')}): {r['issue']}")
+                lines.append(f"- {r['employee']} | Project: {r.get('project', 'Unknown')} | Month: {r.get('month', '')} | Issue: {r['issue']}")
             lines.append("")
 
     return "\n".join(lines)
@@ -415,7 +563,7 @@ Q: "What is total revenue?"
 {{"summary": "Total revenue is $88,960.", "visual_type": "metric", "columns": [], "data": [{{"label": "Total Revenue", "value": 88960}}]}}
 
 Q: "Give me overall summary"
-{{"summary": "Overall financial summary.", "visual_type": "metric", "columns": [], "data": [{{"label": "Total Revenue", "value": 88960}}, {{"label": "Total Cost", "value": 77216}}, {{"label": "Total Profit", "value": 11744}}, {{"label": "Margin", "value": 13.2}}]}}
+{{"summary": "Total Revenue: $88,960, Cost: $77,216, Profit: $11,744, Margin: 13.2%", "visual_type": "metric", "columns": [], "data": [{{"label": "Total Revenue", "value": 88960}}, {{"label": "Total Cost", "value": 77216}}, {{"label": "Total Profit", "value": 11744}}, {{"label": "Margin", "value": 13.2}}]}}
 
 Q: "Top 3 employees by profit"
 {{"summary": "Top 3 employees by profit.", "visual_type": "table", "columns": ["employee", "profit"], "data": [{{"employee": "John", "profit": 50000}}, {{"employee": "Jane", "profit": 45000}}, {{"employee": "Bob", "profit": 40000}}]}}
@@ -468,6 +616,8 @@ RULES:
 15. "YTD", "year to date" = sum from January to the last available month
 16. "Q1" = Jan-Mar, "Q2" = Apr-Jun, "Q3" = Jul-Sep, "Q4" = Oct-Dec
 17. For "top N in Project X" = filter by project first, then rank
+18. IMPORTANT: For "project utilization" or "which project has highest/lowest utilization", ONLY use "AvgUtilisation" from PROJECTS section. NEVER use IndividualUtilisation from EMPLOYEES section for project-level questions.
+19. When comparing numbers, 96.6 > 96.0 > 95.0. Always compare the actual numeric values, not just the first digits.
 """
 
 
@@ -507,6 +657,28 @@ def _to_float_num(s: str):
         return None
 
 
+def _extract_value_and_band(s: str):
+    """Extract numeric value and ± band from strings like '$108,727.92 (±5.2%)'
+    
+    Returns: (value, band) where band is the percentage as a string like '±5.2%' or None
+    """
+    try:
+        txt = (s or "").strip()
+        # Extract the ± band if present
+        band = None
+        band_match = re.search(r'\(([±+-]?\d+\.?\d*%?p?p?)\)', txt)
+        if band_match:
+            band = band_match.group(1)
+            if not band.startswith('±'):
+                band = '±' + band
+        
+        # Extract the main numeric value
+        value = _to_float_num(txt)
+        return value, band
+    except Exception:
+        return None, None
+
+
 def _extract_rows(text: str):
     rows = []
     if not text:
@@ -541,49 +713,69 @@ def _extract_rows(text: str):
                 elif k == "project":
                     row["project"] = v
                 elif k == "revenue":
-                    fv = _to_float_num(v)
+                    fv, band = _extract_value_and_band(v)
                     if fv is not None:
                         row["revenue"] = fv
+                        if band is not None:
+                            row["revenue_variance"] = band
                 elif k == "cost":
                     fv = _to_float_num(v)
                     if fv is not None:
                         row["cost"] = fv
                 elif k == "profit":
-                    fv = _to_float_num(v)
+                    fv, band = _extract_value_and_band(v)
                     if fv is not None:
                         row["profit"] = fv
+                        if band is not None:
+                            row["profit_variance"] = band
                 elif k == "headcount":
-                    fv = _to_float_num(v)
+                    fv, band = _extract_value_and_band(v)
                     if fv is not None:
                         row["headcount"] = int(round(fv))
+                        if band is not None:
+                            row["headcount_variance"] = band
                 elif k in ("utilization", "utilisation"):
-                    fv = _to_float_num(v)
+                    fv, band = _extract_value_and_band(v)
                     if fv is not None:
                         row["utilization_pct"] = fv
+                        if band is not None:
+                            row["utilization_variance"] = band
                 elif k in ("hours", "hrs"):
-                    fv = _to_float_num(v)
+                    fv, band = _extract_value_and_band(v)
                     if fv is not None:
                         row["hours"] = fv
+                        if band is not None:
+                            row["hours_variance"] = band
                 elif k in ("leaves", "leave", "pto", "time off", "timeoff"):
-                    fv = _to_float_num(v)
+                    fv, band = _extract_value_and_band(v)
                     if fv is not None:
                         row["leave_days"] = fv
+                        if band is not None:
+                            row["leave_days_variance"] = band
                 elif k in ("vacation", "vacations"):
-                    fv = _to_float_num(v)
+                    fv, band = _extract_value_and_band(v)
                     if fv is not None:
                         row["vacation_days"] = fv
+                        if band is not None:
+                            row["vacation_days_variance"] = band
                 elif k in ("holidays", "holiday"):
-                    fv = _to_float_num(v)
+                    fv, band = _extract_value_and_band(v)
                     if fv is not None:
                         row["holiday_days"] = fv
+                        if band is not None:
+                            row["holiday_days_variance"] = band
                 elif k.replace(" ", "") in ("workingdays", "workdays", "workdayscount"):
-                    fv = _to_float_num(v)
+                    fv, band = _extract_value_and_band(v)
                     if fv is not None:
                         row["working_days"] = fv
+                        if band is not None:
+                            row["working_days_variance"] = band
                 elif k.startswith("margin") or "margin" in k.replace(" ", ""):
-                    fv = _to_float_num(v)
+                    fv, band = _extract_value_and_band(v)
                     if fv is not None:
                         row["margin_pct"] = fv
+                        if band is not None:
+                            row["margin_variance"] = band
                 elif k.replace(" ", "") in ("billrate", "billingrate"):
                     fv = _to_float_num(v)
                     if fv is not None:
@@ -667,8 +859,22 @@ def _format_value(key: str, value) -> str:
     
     key_lower = key.lower().replace(" ", "_")
     
-    # Currency fields
-    if key_lower in ("revenue", "cost", "profit", "billing_rate", "bill_rate", "cost_rate"):
+    # Currency fields - also match month-based columns like "February 2026 Revenue" or just "February 2026" (when it's revenue data)
+    currency_keywords = ("revenue", "cost", "profit", "billing_rate", "bill_rate", "cost_rate")
+    is_currency = key_lower in currency_keywords or any(kw in key_lower for kw in currency_keywords)
+    
+    # Also treat month columns as currency if value looks like a large number (likely revenue/cost)
+    # But exclude if key contains non-currency keywords like "hours", "days", "count"
+    if not is_currency and isinstance(value, (int, float)) and value > 1000:
+        non_currency_keywords = ["hours", "hour", "days", "day", "count", "headcount", "employees", "utilization", "utilisation", "margin", "attendance"]
+        if not any(nc in key_lower for nc in non_currency_keywords):
+            # Check if key looks like a month (e.g., "February 2026", "March 2026")
+            month_patterns = ["january", "february", "march", "april", "may", "june", 
+                             "july", "august", "september", "october", "november", "december"]
+            if any(m in key_lower for m in month_patterns):
+                is_currency = True
+    
+    if is_currency:
         try:
             num = float(value) if not isinstance(value, (int, float)) else value
             return f"${num:,.2f}"
@@ -1030,6 +1236,8 @@ def ask(question: str, time_range: str = None) -> dict:
 
     Returns: {"summary": str, "visual_type": str, "columns": list, "data": list, "sources": dict}
     """
+    _start_time = time.time()
+    
     records = GLOBAL_DATASET
     if not records:
         return {
@@ -1044,16 +1252,33 @@ def ask(question: str, time_range: str = None) -> dict:
     if time_range:
         records = filter_by_range(records, time_range)
 
+    # ── Check response cache ──
+    data_hash = _compute_dataset_hash(records)
+    cached_response = _get_cached_response(question, data_hash)
+    if cached_response:
+        print(f"[qa_engine] Total time: {time.time() - _start_time:.2f}s (cached)")
+        return cached_response
+
     # Forecast intent: use AI forecaster (forecast_.py) only
+    # Note: try_answer_forecast now uses fast keyword check internally
+    _fc_start = time.time()
     fc_answer = try_answer_forecast(question, records)
+    print(f"[qa_engine] Forecast check took {time.time() - _fc_start:.2f}s (likely_forecast={is_likely_forecast(question)})")
     if fc_answer is not None:
         rows = _extract_rows(fc_answer)
         if rows:
             preferred_cols = [
                 "month", "quarter",
                 "project", "employee",
-                "revenue", "cost", "profit", "headcount", "utilization_pct",
-                "leave_days", "vacation_days", "holiday_days", "working_days", "hours",
+                "revenue", "revenue_variance", "cost", "profit", "profit_variance",
+                "margin_pct", "margin_variance",
+                "headcount", "headcount_variance",
+                "utilization_pct", "utilization_variance",
+                "hours", "hours_variance",
+                "leave_days", "leave_days_variance",
+                "vacation_days", "vacation_days_variance",
+                "holiday_days", "holiday_days_variance",
+                "working_days", "working_days_variance",
             ]
             present = []
             for c in preferred_cols:
@@ -1106,11 +1331,16 @@ def ask(question: str, time_range: str = None) -> dict:
         }
 
     # Build targeted context based on question (smart context selection)
+    _ctx_start = time.time()
     context = _get_cached_context(records, question=question)
+    print(f"[qa_engine] Context build took {time.time() - _ctx_start:.2f}s")
+    
     prompt = _QA_PROMPT.format(context=context, question=question)
 
     try:
+        _llm_start = time.time()
         raw_response = _ollama_generate(prompt, timeout=120)
+        print(f"[qa_engine] LLM call took {time.time() - _llm_start:.2f}s")
     except Exception as e:
         return {
             "summary": f"LLM query failed: {str(e)}",
@@ -1120,6 +1350,7 @@ def ask(question: str, time_range: str = None) -> dict:
             "sources": {},
         }
 
+    print(f"[qa_engine] Total time: {time.time() - _start_time:.2f}s")
     # Parse the JSON from the LLM
     parsed_json = _extract_qa_json(raw_response)
     
@@ -1187,6 +1418,18 @@ def ask(question: str, time_range: str = None) -> dict:
     if visual_type == "table":
         summary_text = _llm_table_name(summary_text, raw_columns, raw_data)
         
+        # Remove duplicate rows (LLM sometimes repeats data)
+        if raw_data:
+            seen = set()
+            unique_data = []
+            for row in raw_data:
+                # Create a hashable key from row values
+                row_key = tuple(sorted((k, str(v)) for k, v in row.items()))
+                if row_key not in seen:
+                    seen.add(row_key)
+                    unique_data.append(row)
+            raw_data = unique_data
+        
         # Pivot table if it has repeating entity+month combinations
         raw_data, raw_columns = _pivot_table_if_needed(raw_data, raw_columns)
         
@@ -1220,7 +1463,7 @@ def ask(question: str, time_range: str = None) -> dict:
         formatted_data = raw_data
     
     # Construct the final, UI-friendly payload
-    return {
+    result = {
         "summary": summary_text,
         "visual_type": visual_type,
         "columns": formatted_cols,
@@ -1232,4 +1475,9 @@ def ask(question: str, time_range: str = None) -> dict:
             "forecast": False,
         }
     }
+    
+    # ── Cache the response ──
+    _cache_response(question, data_hash, result)
+    
+    return result
 

@@ -496,12 +496,13 @@ def build_top_performers(records: List[dict], limit: int = 5) -> List[dict]:
 def build_risks(records: List[dict]) -> List[dict]:
     risks = []
     for r in records:
+        project = r.get("project", "Unknown")
         if (r.get("profit") or 0) < 0:
-            risks.append({"employee": r["employee"], "month": r.get("month"), "issue": "LOSS_MAKING", "profit": r.get("profit") or 0})
+            risks.append({"employee": r["employee"], "project": project, "month": r.get("month"), "issue": "LOSS_MAKING", "profit": r.get("profit") or 0})
         if (r.get("vacation_days") or 0) >= 3:
-            risks.append({"employee": r["employee"], "month": r.get("month"), "issue": "HIGH_LEAVE", "vacation_days": r.get("vacation_days") or 0})
+            risks.append({"employee": r["employee"], "project": project, "month": r.get("month"), "issue": "HIGH_LEAVE", "vacation_days": r.get("vacation_days") or 0})
         if (r.get("utilisation_pct") or 0) < 80:
-            risks.append({"employee": r["employee"], "month": r.get("month"), "issue": "LOW_UTILISATION", "utilisation_pct": r.get("utilisation_pct") or 0})
+            risks.append({"employee": r["employee"], "project": project, "month": r.get("month"), "issue": "LOW_UTILISATION", "utilisation_pct": r.get("utilisation_pct") or 0})
     return risks
 
 

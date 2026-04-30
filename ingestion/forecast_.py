@@ -19,6 +19,75 @@ from .dataset import (
 from .ai_mapper import _ollama_generate, is_ollama_available, _extract_json
 
 
+# ── Fast keyword-based forecast detection ─────────────────────────────────────
+
+# Keywords that strongly indicate a forecast question
+_FORECAST_KEYWORDS = [
+    # Prediction verbs
+    "forecast", "predict", "projection", "estimate", "projected",
+    "anticipate", "foresee", "extrapolate", "project forward",
+    # Time-based
+    "next month", "next quarter", "next year", "upcoming",
+    "next week", "coming month", "coming quarter", "following month",
+    # Future tense
+    "will be", "would be", "expected to", "expecting", "expect",
+    # Planning & scenarios
+    "future", "outlook", "budget for", "plan for", "planning",
+    "target for", "what if", "scenario", "simulation",
+    # Growth
+    "grow to", "reach by", "trend forward",
+]
+
+# Future month/quarter patterns (e.g., "July 2026", "Q3 2026")
+_FUTURE_PERIOD_PATTERN = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*202[5-9]\b"
+    r"|\bq[1-4]\s*202[5-9]\b"
+    r"|\b202[5-9]\s*q[1-4]\b",
+    re.IGNORECASE
+)
+
+# Keywords that indicate NOT a forecast (historical/current data queries)
+_NON_FORECAST_KEYWORDS = [
+    "show me", "list", "what is", "what are", "how much", "how many",
+    "give me", "current", "total", "who is", "who are", "which",
+    "top", "bottom", "best", "worst", "compare", "comparison",
+    "details", "summary", "report", "breakdown",
+    "last month", "previous", "so far", "to date", "ytd",
+]
+
+
+def is_likely_forecast(question: str) -> bool:
+    """
+    Fast keyword-based check to determine if a question is likely a forecast.
+    Returns True if forecast keywords are found, False otherwise.
+    This avoids expensive LLM calls for obvious non-forecast questions.
+    """
+    if not question:
+        return False
+    
+    q = question.lower().strip()
+    
+    # Check for explicit non-forecast keywords first (quick exit)
+    for kw in _NON_FORECAST_KEYWORDS:
+        if kw in q:
+            _debug(f"is_likely_forecast: Found non-forecast keyword '{kw}', returning False")
+            return False
+    
+    # Check for forecast keywords
+    for kw in _FORECAST_KEYWORDS:
+        if kw in q:
+            _debug(f"is_likely_forecast: Found forecast keyword '{kw}', returning True")
+            return True
+    
+    # Check for future period patterns
+    if _FUTURE_PERIOD_PATTERN.search(q):
+        _debug(f"is_likely_forecast: Found future period pattern, returning True")
+        return True
+    
+    _debug(f"is_likely_forecast: No forecast indicators found, returning False")
+    return False
+
+
 def _fmt_money(v: float) -> str:
     return f"${v:,.2f}"
 
@@ -1025,6 +1094,12 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
     if not recs:
         _debug("No records available, returning None")
         return None
+    
+    # ── OPTIMIZATION: Fast keyword check before expensive LLM call ──
+    if not is_likely_forecast(question):
+        _debug("Keyword check says not a forecast, skipping LLM call")
+        return None
+    
     months = get_months_available(recs)
     if not months:
         _debug("No months available, returning insufficient data message")
@@ -1037,7 +1112,7 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
     known_emps = _distinct_values(recs, "employee")
     _debug(f"Known projects: {known_projects[:5]}..., Known employees: {known_emps[:5]}...")
 
-    # --- LLM-based question parsing (primary) ---
+    # --- LLM-based question parsing (only if keyword check passed) ---
     llm_parsed = _llm_parse_question(question, known_projects, known_emps)
     use_llm = llm_parsed and llm_parsed.get("is_forecast") is True
     _debug(f"LLM parsing result: use_llm={use_llm}")
