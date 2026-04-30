@@ -78,8 +78,8 @@ def _is_future_date(question: str) -> bool:
     if re.search(r"\bnext\s+\d+\s+(?:months?|quarters?)\b", q, re.IGNORECASE):
         return True
     
-    # Check for "N months/quarters ahead" patterns
-    if re.search(r"\b(?:one|two|three|four|five|six|\d+)\s+(?:months?|quarters?)\s+ahead\b", q, re.IGNORECASE):
+    # Check for "N months/quarters ahead" patterns (including "few")
+    if re.search(r"\b(?:one|two|three|four|five|six|few|\d+)\s+(?:months?|quarters?)\s+ahead\b", q, re.IGNORECASE):
         return True
     
     # Check for fiscal year patterns (FY26, FY2026, FY 26)
@@ -89,6 +89,13 @@ def _is_future_date(question: str) -> bool:
         if fy_year < 100:
             fy_year += 2000  # FY26 -> 2026
         if fy_year > current_year:
+            return True
+    
+    # Check for year-only future patterns: "for 2027", "in 2028"
+    year_only_match = re.search(r"\b(?:for|in)\s*(20\d{2})\b", q)
+    if year_only_match:
+        year = int(year_only_match.group(1))
+        if year > current_year:
             return True
     
     # Extract explicit dates and compare
@@ -124,6 +131,14 @@ def _is_past_date(question: str) -> bool:
     current_month = today.month
     
     q = question.lower()
+    
+    # Check for year-only patterns: "in 2024", "for 2024", "2024 revenue"
+    year_only_match = re.search(r"\b(?:in|for|during)?\s*(20\d{2})\b", q)
+    if year_only_match:
+        year = int(year_only_match.group(1))
+        # If year is in the past, it's a past date
+        if year < current_year:
+            return True
     
     for match in _DATE_EXTRACT_PATTERN.finditer(q):
         groups = match.groups()
@@ -175,10 +190,19 @@ def is_likely_forecast(question: str) -> bool:
         return False
 
     q = question.lower().strip()
+    
+    has_past = _is_past_date(question)
+    has_future = _is_future_date(question)
+    
+    # If question has BOTH past and future dates, future wins (it's a forecast)
+    # e.g., "compare 2024 vs forecast for 2027"
+    if has_past and has_future:
+        _debug("is_likely_forecast: Has both past and future dates, future wins - returning True")
+        return True
 
-    # 1. Check for PAST dates FIRST (dynamically compared to today) - NOT forecasts
-    if _is_past_date(question):
-        _debug("is_likely_forecast: Found past date, returning False")
+    # 1. Check for PAST dates (dynamically compared to today) - NOT forecasts
+    if has_past:
+        _debug("is_likely_forecast: Found past date only, returning False")
         return False
 
     # 2. Check for non-forecast keywords
@@ -689,6 +713,25 @@ def _find_target_months(question: str, base: dt.date) -> List[dt.date]:
             results.append(dt.date(int(y), int(mnum), 1))
         except Exception:
             continue
+    return results
+
+
+def _find_target_year(question: str, base: dt.date) -> List[dt.date]:
+    """Extract year-only patterns like 'for 2027', 'in 2028' and expand to all 12 months."""
+    if not question:
+        return []
+    results: List[dt.date] = []
+    current_year = base.year
+    
+    # Match patterns like "for 2027", "in 2028", "forecast 2027"
+    for match in re.finditer(r"\b(?:for|in|forecast)\s+(20\d{2})\b", question.lower()):
+        year = int(match.group(1))
+        # Only expand future years
+        if year > current_year:
+            for month in range(1, 13):
+                d = dt.date(year, month, 1)
+                if d not in results:
+                    results.append(d)
     return results
 
 
@@ -1373,6 +1416,15 @@ def _parse_llm_explicit_periods(periods: List[str], base: dt.date) -> Tuple[List
             start_month = dt.date(yr, (qn - 1) * 3 + 1, 1)
             explicit_quarter = (qn, yr, start_month, f"Q{qn} {yr}")
             continue
+        # Try year-only format: "2027", "2028" - expand to all 12 months
+        ym = re.match(r"^(\d{4})$", p)
+        if ym:
+            yr = int(ym.group(1))
+            for month in range(1, 13):
+                d = dt.date(yr, month, 1)
+                if d not in explicit_months:
+                    explicit_months.append(d)
+            continue
         # Try month format: July 2026, Jul 2026, etc.
         for fmt in ("%B %Y", "%b %Y", "%B-%Y", "%b-%Y"):
             try:
@@ -1456,7 +1508,12 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
 
         # Default horizon if none specified
         if not months_n and not quarters_n and not explicit_months and not explicit_quarter:
-            months_n = 1  # default to next month
+            # Check for year-only patterns like "forecast for 2027" before defaulting
+            year_months = _find_target_year(question, base)
+            if year_months:
+                explicit_months = year_months
+            else:
+                months_n = 1  # default to next month
 
         # Metrics
         metrics = llm_metrics if llm_metrics else ["revenue", "profit"]
@@ -1504,6 +1561,11 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         quarters_n = _select_quarters_count(q)
         explicit_quarter = _find_target_quarter(q)
         explicit_months = _find_target_months(q, base)
+        
+        # Check for year-only patterns like "forecast for 2027"
+        year_months = _find_target_year(q, base)
+        if year_months and not explicit_months:
+            explicit_months = year_months
 
         intent = bool(months_n or quarters_n or explicit_quarter or explicit_months) \
                  or any(w in q for w in ["forecast", "predict", "projection", "estimate"]) \
