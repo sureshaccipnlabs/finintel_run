@@ -355,7 +355,7 @@ def build_project_summaries(records: List[dict]) -> List[dict]:
         if gross_margin_pct > 40:
             status = "Healthy"
         elif gross_margin_pct >= 30:
-            status = "Optimal"
+            status = "Average"
         else:
             status = "At Risk"
 
@@ -406,6 +406,7 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
                 "vacation_days": 0.0,
                 "leave_days": 0.0,
                 "working_days": 0.0,
+                "monthly": {},
                 "projects": {},
             }
 
@@ -418,6 +419,12 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
         emp["vacation_days"] += vacation_days
         emp["leave_days"] += leave_days
         emp["working_days"] += working_days
+
+        month = r.get("month") or "Unknown"
+        if month not in emp["monthly"]:
+            emp["monthly"][month] = {"revenue": 0.0, "cost": 0.0}
+        emp["monthly"][month]["revenue"] += revenue
+        emp["monthly"][month]["cost"] += cost
 
         if project_name not in emp["projects"]:
             emp["projects"][project_name] = {
@@ -442,6 +449,12 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
         approved_total = data["approved_hours"]
         utilization = round((data["hours"] / approved_total) * 100, 2) if approved_total > 0 else None
         gross_margin_pct = _calc_margin(data["revenue"], data["cost"])
+
+        ordered_months = sorted(data["monthly"].keys(), key=_month_sort_key)
+        revenue_series = [round(data["monthly"][m]["revenue"], 2) for m in ordered_months]
+        cost_series = [round(data["monthly"][m]["cost"], 2) for m in ordered_months]
+        profit_series = [round(rev - cst, 2) for rev, cst in zip(revenue_series, cost_series)]
+        margin_series = [_calc_margin(rev, cst) for rev, cst in zip(revenue_series, cost_series)]
         
         # Attendance calculation: match risk_engine formula
         # Uses only vacation_days (same as risk_engine.py line 237-243)
@@ -465,7 +478,7 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
         elif employee_name in low_contributors:
             contribution_status = "Low"
         else:
-            contribution_status = "Optimal"
+            contribution_status = "Average"
 
         output.append({
             "employee_name": employee_name,
@@ -481,6 +494,12 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
             "working_days": round(data["working_days"], 1),
             "projects": projects,
             "contribution_status": contribution_status,
+            "trends": {
+                "revenue_trend": _trend_from_values(revenue_series),
+                "cost_trend": _trend_from_values(cost_series),
+                "profit_trend": _trend_from_values(profit_series),
+                "margin_trend": _trend_from_values(margin_series),
+            },
         })
 
     output.sort(key=lambda x: x["total_profit"], reverse=True)
