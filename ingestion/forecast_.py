@@ -18,7 +18,7 @@ from .dataset import (
     _parse_month_date,
     GLOBAL_DATASET,
 )
-from .ai_mapper import _ollama_generate, is_ollama_available, _extract_json
+from .ai_mapper import _llm_generate, is_llm_available, _extract_json
 
 # ── Fast keyword-based forecast detection ─────────────────────────────────────
 
@@ -374,7 +374,7 @@ def _llm_parse_question(question: str, known_projects: List[str], known_employee
     Use LLM to parse a forecast question into structured parameters.
     Returns dict with: is_forecast, metrics, scope, targets, horizon_type, horizon_value, explicit_periods
     """
-    if not is_ollama_available():
+    if not is_llm_available():
         return None
     prompt = f"""You are a financial data assistant. Determine if this question is asking for a FUTURE FORECAST or just querying EXISTING/HISTORICAL data.
 
@@ -419,7 +419,7 @@ If is_forecast=true, also fill in:
 - explicit_periods: specific periods like ["July 2026", "Q3 2026"]
 """
     try:
-        raw = _ollama_generate(prompt, timeout=30)
+        raw = _llm_generate(prompt, timeout=30)
         _debug(f"LLM raw response: {raw[:500] if raw else 'None'}...")
         parsed = _extract_json(raw)
         if isinstance(parsed, dict):
@@ -485,7 +485,7 @@ If is_forecast=true, also fill in:
 
 
 def _llm_advise_settings(question: str, months: List[str], series: Dict[str, List[float]]) -> Optional[dict]:
-    if not is_ollama_available():
+    if not is_llm_available():
         return None
     snap = _last_n_snapshot(months, series, n=6)
     lines = []
@@ -517,7 +517,7 @@ def _llm_advise_settings(question: str, months: List[str], series: Dict[str, Lis
     lines.append("Now respond with strict JSON only.")
     prompt = "\n".join(lines)
     try:
-        raw = _ollama_generate(prompt, timeout=60)
+        raw = _llm_generate(prompt, timeout=60)
         cfg = _extract_json(raw)
         if isinstance(cfg, dict):
             return cfg
