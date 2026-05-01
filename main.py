@@ -345,8 +345,14 @@ def get_metrics(time_range: Optional[str] = Query(None, alias="range")):
 
 # ── GET /projects — Project-level breakdown ─────────────────────────────
 @app.get("/projects")
-def get_projects(time_range: Optional[str] = Query(None, alias="range")):
+def get_projects(
+    time_range: Optional[str] = Query(None, alias="range"),
+    project: Optional[str] = Query(None),
+):
     filtered = filter_by_range(GLOBAL_DATASET, time_range)
+    if project:
+        project_lc = project.strip().lower()
+        filtered = [r for r in filtered if (r.get("project") or "").strip().lower() == project_lc]
     return {
         "time_range": time_range or "ALL",
         "months_considered": get_months_available(filtered),
