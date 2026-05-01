@@ -26,8 +26,8 @@ OPENAI_URL = os.environ.get("OPENAI_URL", "https://api.openai.com/v1/chat/comple
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-AI_PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
-AI_PROVIDER_ORDER = os.environ.get("AI_PROVIDER_ORDER", "ollama,openai")
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "openai").strip().lower()
+AI_PROVIDER_ORDER = os.environ.get("AI_PROVIDER_ORDER", "openai,ollama")
 
 TARGET_FIELDS = [
     "name", "project", "billing_rate", "cost_rate",
