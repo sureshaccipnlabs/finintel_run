@@ -1139,6 +1139,7 @@ def _build_employee_scorecards(timelines: dict[str, list[dict]]) -> list[dict]:
             "latest_month":    latest.get("month") or "",
             "performance":     perf,
             "total_revenue":   round(sum(_num(r.get("revenue")) for r in records), 2),
+            "total_cost":      round(sum(_num(r.get("cost")) for r in records), 2),
             "total_profit":    round(sum(_num(r.get("revenue")) - _num(r.get("cost")) for r in records), 2),
             "avg_utilisation": round(sum(_num(r.get("utilisation_pct")) for r in records) / max(len(records),1), 1),
         })
@@ -1362,13 +1363,14 @@ Top 10 risks detected:
 Employee scorecards:
 {scorecard_text}
 
-Write exactly 3 strategic management insights in plain English.
-Each insight must:
-- Be 1–2 sentences
+Output exactly 3 insights. Rules:
+- Start the FIRST word of insight 1 directly — no intro sentence, no preamble, no title
+- No numbering, no bullet points, no labels
+- Each insight is 1-2 sentences
 - Include a specific number from the data
-- Tell management what to DO, not just what is happening
-- Be addressed to a senior HR or Finance leader
-No bullet numbering. Separate insights with a blank line.
+- Tell management what to DO
+- Separate insights with a blank line
+- Do NOT write anything before the first insight
 """
 
 
@@ -1407,11 +1409,17 @@ def _get_ai_insights(records: list[dict], risks: list[dict], scorecards: list[di
         scorecard_text="\n".join(sc_lines) or "None",
     )
 
+    print(f"[ai_insights] is_llm_available={is_llm_available()}")
     if is_llm_available():
         try:
-            return _llm_generate(prompt, timeout=90).strip()
+            print(f"[ai_insights] calling LLM, prompt length={len(prompt)}")
+            result = _llm_generate(prompt, timeout=180).strip()
+            print(f"[ai_insights] LLM returned {len(result)} chars")
+            return result
         except Exception as e:
             print(f"[risk_engine] LLM insight failed: {e}")
+    else:
+        print("[ai_insights] LLM not available — skipping")
 
     return ""
 
@@ -1523,9 +1531,17 @@ def get_risks_and_recommendations(
     scorecards = _build_employee_scorecards(timelines)
 
     # ── AI strategic insights ─────────────────────────────────────────────
-    ai_insights = ""
+    ai_insights = []
     if include_ai_insights and action_risks:
-        ai_insights = _get_ai_insights(records, action_risks, scorecards)
+        raw = _get_ai_insights(records, action_risks, scorecards)
+        _FILLER_STARTS = (
+            "here are", "below are", "the following", "as requested",
+            "strategic", "insights:", "sure,", "certainly,", "of course,",
+        )
+        ai_insights = [
+            line.strip() for line in raw.split("\n")
+            if line.strip() and not any(line.strip().lower().startswith(f) for f in _FILLER_STARTS)
+        ]
 
     # ── Clean _score from output (internal field) ─────────────────────────
     for r in all_risks:
@@ -1586,7 +1602,7 @@ def _empty_response() -> dict:
                                  "missing_fields": {}, "notes": "No records available for risk analysis."},
         "sources":             [],
         "employee_scorecards": [],
-        "ai_insights":         "",
+        "ai_insights":         [],
         "summary":             {},
         "meta":                {"time_range": "ALL", "total_employees": 0, "total_risks": 0,
                                 "action_needed": 0, "records_analysed": 0},
