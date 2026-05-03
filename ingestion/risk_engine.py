@@ -225,10 +225,10 @@ def employee_performance_score(emp_records: list[dict]) -> dict:
       Attendance           30%  — low leave = consistent availability
 
     Bands:
-      80–100 → Star
-      60–79  → Solid
-      40–59  → Watch
-       0–39  → At Risk
+      71–100 → High
+      41-70 → Average
+      0-40  → Low
+
     """
     total_rev    = sum(_num(r.get("revenue"))        for r in emp_records)
     total_cost   = sum(_num(r.get("cost"))           for r in emp_records)
@@ -260,17 +260,15 @@ def employee_performance_score(emp_records: list[dict]) -> dict:
     leave_score = max(0.0, 100.0 - leave_pct * 4.0)
 
     composite = round(
-        margin_score * 0.40 + util_score * 0.30 + leave_score * 0.30, 1
+        (margin_score + util_score + leave_score) / 3, 1
     )
 
-    if composite >= 80:
-        band = "Star"
-    elif composite >= 60:
-        band = "Solid"
-    elif composite >= 40:
-        band = "Watch"
+    if composite >= 71:
+        band = "High"
+    elif composite >= 41:
+        band = "Average"
     else:
-        band = "At Risk"
+        band = "Low"
 
     return {
         "score":     composite,
@@ -394,6 +392,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                 "gap_pct":        round(gap, 2),
                 "billing_rate":   billing_rate,
                 "cost_rate":      cost_rate,
+                "total_cost":     round(total_cost, 2),
             },
             "linked_employees": [name],
             "revenue_contribution_pct": revenue_pct,
@@ -425,6 +424,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                 "metrics": {
                     "billing_rate": billing_rate,
                     "cost_rate":    cost_rate,
+                    "total_cost":   round(total_cost, 2),
                     "rate_ratio":   round(rate_ratio, 3),
                     "buffer_pct":   round(buffer_pct, 2),
                 },
@@ -484,6 +484,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
             "metrics": {
                 "consecutive_overload_months": consecutive_overload,
                 "avg_utilisation_pct": round(avg_overload, 1),
+                "total_cost": round(total_cost, 2),
                 "months": months_str[-consecutive_overload:],
             },
             "linked_employees": [name],
@@ -523,6 +524,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                     "leave_pct_latest":   round(recent_leave_pct, 1),
                     "billable_drop_pct":  round(billable_drop, 1),
                     "latest_month":       latest_month,
+                    "total_cost":         round(total_cost, 2),
                     "estimated_replacement_cost": round(total_rev / max(n, 1) * 3, 2),
                 },
                 "linked_employees": [name],
@@ -554,6 +556,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                 "metrics": {
                     "util_series":    [round(u, 1) for u in utils[-3:]],
                     "total_drop_pct": round(drop, 1),
+                    "total_cost":     round(total_cost, 2),
                     "months":         months_str[-3:],
                 },
                 "linked_employees": [name],
@@ -591,6 +594,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                     "working_days": work_d,
                     "leave_pct":    round(lv_pct, 1),
                     "month":        month_lbl,
+                    "total_cost":   round(total_cost, 2),
                     "estimated_revenue_impact": round(rev_lost, 2) if rev_lost else None,
                 },
                 "linked_employees": [name],
@@ -622,6 +626,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                 "avg_utilisation_pct": round(avg_util, 1),
                 "target_pct":          THRESHOLDS["utilisation_low"],
                 "hours_gap":           round(hours_gap, 1),
+                "total_cost":          round(total_cost, 2),
                 "estimated_rev_gap":   round(rev_gap, 2),
             },
             "linked_employees": [name],
@@ -657,6 +662,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
             "metrics": {
                 "consecutive_bench_months": consecutive_bench,
                 "avg_utilisation_pct": round(avg_util, 1),
+                "total_cost": round(total_cost, 2),
                 "bench_cost": round(bench_cost, 2),
                 "months": months_str[-consecutive_bench:],
             },
@@ -693,6 +699,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                 "metrics": {
                     "consecutive_ceiling_months": consecutive_ceiling,
                     "approved_hours_per_month": _num(latest.get("approved_hours") or latest.get("max_hours") or latest.get("expected_hours")),
+                    "total_cost": round(total_cost, 2),
                 },
                 "linked_employees": [name],
                 "revenue_contribution_pct": revenue_pct,
@@ -723,6 +730,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
                     "months_on_record": n,
                     "avg_utilisation_pct": round(avg_util, 1),
                     "target_pct": THRESHOLDS["onboarding_util_min"],
+                    "total_cost": round(total_cost, 2),
                 },
                 "linked_employees": [name],
                 "revenue_contribution_pct": revenue_pct,
@@ -755,6 +763,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
             "metrics": {
                 "avg_margin_pct":     round(avg_margin, 2),
                 "avg_utilisation_pct": round(avg_util, 2),
+                "total_cost":         round(total_cost, 2),
                 "total_profit":       round(total_profit, 2),
                 "performance_score":  perf["score"],
                 "performance_band":   perf["band"],
@@ -787,6 +796,7 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
             "metrics": {
                 "avg_margin_pct":      round(avg_margin, 2),
                 "avg_utilisation_pct": round(avg_util, 2),
+                "total_cost":          round(total_cost, 2),
                 "months_covered":      n,
             },
             "linked_employees": [name],
@@ -879,7 +889,7 @@ def _detect_project_risks(records: list[dict]) -> list[dict]:
                 "owner":    "Account Manager + Finance",
                 "deadline": "Next contract review",
                 "metrics":  {"margin_pct": round(margin,2), "revenue": round(rev,2),
-                             "profit": round(profit,2), "employees": n_emps},
+                             "total_cost": round(cost,2), "profit": round(profit,2), "employees": n_emps},
                 "linked_employees": [],
                 "revenue_contribution_pct": rev_pct,
             })
@@ -1129,6 +1139,7 @@ def _build_employee_scorecards(timelines: dict[str, list[dict]]) -> list[dict]:
             "latest_month":    latest.get("month") or "",
             "performance":     perf,
             "total_revenue":   round(sum(_num(r.get("revenue")) for r in records), 2),
+            "total_cost":      round(sum(_num(r.get("cost")) for r in records), 2),
             "total_profit":    round(sum(_num(r.get("revenue")) - _num(r.get("cost")) for r in records), 2),
             "avg_utilisation": round(sum(_num(r.get("utilisation_pct")) for r in records) / max(len(records),1), 1),
         })
@@ -1352,13 +1363,14 @@ Top 10 risks detected:
 Employee scorecards:
 {scorecard_text}
 
-Write exactly 3 strategic management insights in plain English.
-Each insight must:
-- Be 1–2 sentences
+Output exactly 3 insights. Rules:
+- Start the FIRST word of insight 1 directly — no intro sentence, no preamble, no title
+- No numbering, no bullet points, no labels
+- Each insight is 1-2 sentences
 - Include a specific number from the data
-- Tell management what to DO, not just what is happening
-- Be addressed to a senior HR or Finance leader
-No bullet numbering. Separate insights with a blank line.
+- Tell management what to DO
+- Separate insights with a blank line
+- Do NOT write anything before the first insight
 """
 
 
@@ -1397,11 +1409,17 @@ def _get_ai_insights(records: list[dict], risks: list[dict], scorecards: list[di
         scorecard_text="\n".join(sc_lines) or "None",
     )
 
+    print(f"[ai_insights] is_llm_available={is_llm_available()}")
     if is_llm_available():
         try:
-            return _llm_generate(prompt, timeout=90).strip()
+            print(f"[ai_insights] calling LLM, prompt length={len(prompt)}")
+            result = _llm_generate(prompt, timeout=180).strip()
+            print(f"[ai_insights] LLM returned {len(result)} chars")
+            return result
         except Exception as e:
             print(f"[risk_engine] LLM insight failed: {e}")
+    else:
+        print("[ai_insights] LLM not available — skipping")
 
     return ""
 
@@ -1412,8 +1430,9 @@ def _get_ai_insights(records: list[dict], risks: list[dict], scorecards: list[di
 
 def get_risks_and_recommendations(
     time_range: Optional[str] = None,
+    project: Optional[str] = None,
     max_items: int = 8,
-    include_positive: bool = True,
+    include_positive: bool = False,
     include_ai_insights: bool = True,
 ) -> dict:
     """
@@ -1446,6 +1465,11 @@ def get_risks_and_recommendations(
 
     if time_range:
         records = filter_by_range(records, time_range)
+    if not records:
+        return _empty_response()
+
+    if project:
+        records = [r for r in records if (r.get("project") or "").lower() == project.lower()]
     if not records:
         return _empty_response()
 
@@ -1507,13 +1531,23 @@ def get_risks_and_recommendations(
     scorecards = _build_employee_scorecards(timelines)
 
     # ── AI strategic insights ─────────────────────────────────────────────
-    ai_insights = ""
+    ai_insights = []
     if include_ai_insights and action_risks:
-        ai_insights = _get_ai_insights(records, action_risks, scorecards)
+        raw = _get_ai_insights(records, action_risks, scorecards)
+        _FILLER_STARTS = (
+            "here are", "below are", "the following", "as requested",
+            "strategic", "insights:", "sure,", "certainly,", "of course,",
+        )
+        ai_insights = [
+            line.strip() for line in raw.split("\n")
+            if line.strip() and not any(line.strip().lower().startswith(f) for f in _FILLER_STARTS)
+        ]
 
     # ── Clean _score from output (internal field) ─────────────────────────
     for r in all_risks:
         r.pop("_score", None)
+
+    projects_at_risk = sorted({r["project"] for r in action_risks if r.get("project")})
 
     action_tracker = _build_action_tracker(recommendations)
     executive_summary = _build_executive_summary(all_risks, recommendations)
@@ -1533,6 +1567,7 @@ def get_risks_and_recommendations(
         "recommendations":     recommendations,
         "action_tracker":      action_tracker,
         "project_risk_heatmap": project_risk_heatmap,
+        "projects_at_risk":    projects_at_risk,
         "data_quality":        data_quality,
         "sources":             explainability_sources,
         "employee_scorecards": scorecards,
@@ -1566,11 +1601,12 @@ def _empty_response() -> dict:
         "recommendations":     [],
         "action_tracker":      [],
         "project_risk_heatmap": [],
+        "projects_at_risk":    [],
         "data_quality":        {"confidence": "LOW", "completeness_pct": 0.0,
                                  "missing_fields": {}, "notes": "No records available for risk analysis."},
         "sources":             [],
         "employee_scorecards": [],
-        "ai_insights":         "",
+        "ai_insights":         [],
         "summary":             {},
         "meta":                {"time_range": "ALL", "total_employees": 0, "total_risks": 0,
                                 "action_needed": 0, "records_analysed": 0},
