@@ -1547,6 +1547,8 @@ def get_risks_and_recommendations(
     for r in all_risks:
         r.pop("_score", None)
 
+    projects_at_risk = sorted({r["project"] for r in action_risks if r.get("project")})
+
     action_tracker = _build_action_tracker(recommendations)
     executive_summary = _build_executive_summary(all_risks, recommendations)
     data_quality = _build_data_quality_summary(records)
@@ -1565,6 +1567,7 @@ def get_risks_and_recommendations(
         "recommendations":     recommendations,
         "action_tracker":      action_tracker,
         "project_risk_heatmap": project_risk_heatmap,
+        "projects_at_risk":    projects_at_risk,
         "data_quality":        data_quality,
         "sources":             explainability_sources,
         "employee_scorecards": scorecards,
@@ -1598,6 +1601,7 @@ def _empty_response() -> dict:
         "recommendations":     [],
         "action_tracker":      [],
         "project_risk_heatmap": [],
+        "projects_at_risk":    [],
         "data_quality":        {"confidence": "LOW", "completeness_pct": 0.0,
                                  "missing_fields": {}, "notes": "No records available for risk analysis."},
         "sources":             [],
