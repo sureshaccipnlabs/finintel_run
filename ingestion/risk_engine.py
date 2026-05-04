@@ -243,21 +243,9 @@ def employee_performance_score(emp_records: list[dict]) -> dict:
     leave_pct    = (leave_days / work_days * 100) if work_days > 0 else 0.0
 
     # Scores (each 0–100)
-    # Margin: 50%+ margin = perfect 100. Negative = 0.
-    margin_score = max(0.0, min(margin / 50.0 * 100.0, 100.0))
-
-    # Utilisation: 90–100% = perfect. Below 75 = declining. Above 110 = over-stretched.
-    if utilisation >= 90 and utilisation <= 105:
-        util_score = 100.0
-    elif utilisation > 105:
-        util_score = max(0.0, 100.0 - (utilisation - 105) * 3)   # penalise overload
-    elif utilisation >= 75:
-        util_score = 60.0 + (utilisation - 75) / 15.0 * 40.0
-    else:
-        util_score = max(0.0, utilisation / 75.0 * 60.0)
-
-    # Attendance: 0% leave = 100. 25%+ leave = 0.
-    leave_score = max(0.0, 100.0 - leave_pct * 4.0)
+    margin_score  = max(0.0, min(margin, 100.0))
+    util_score    = max(0.0, min(utilisation, 100.0))
+    leave_score   = max(0.0, min(100.0 - leave_pct, 100.0))
 
     composite = round(
         (margin_score + util_score + leave_score) / 3, 1
