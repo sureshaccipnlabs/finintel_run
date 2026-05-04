@@ -9,6 +9,7 @@ Supported formats:
 """
 
 import json
+import os
 import re
 import zipfile
 import xml.etree.ElementTree as ET
@@ -22,6 +23,10 @@ from .field_mapper import build_column_mapping, mapping_report, apply_mapping
 from .record_parser import parse_record
 from .dataset import append_records, GLOBAL_DATASET
 from .text_parser import parse_freeform_text, is_freeform_text, looks_like_timesheet_text
+
+
+def _is_cost_ai_fallback_enabled() -> bool:
+    return str(os.environ.get("COST_SHEET_AI_FALLBACK", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _extract_filename_target_months(filename: str):
@@ -111,11 +116,17 @@ def _rebuild_overall_summary_from_sheets(sheets: dict) -> dict:
 
 
 def _norm_emp(v: str) -> str:
-    return " ".join(str(v or "").strip().title().split())
+    text = str(v or "").strip()
+    if text.lower() in {"", "nan", "none", "null", "nat"}:
+        return ""
+    return " ".join(text.title().split())
 
 
 def _norm_proj(v: str) -> str:
-    return " ".join(str(v or "").strip().lower().split())
+    text = str(v or "").strip()
+    if text.lower() in {"", "nan", "none", "null", "nat"}:
+        return ""
+    return " ".join(text.lower().split())
 
 
 def _to_rate(v) -> Optional[float]:
@@ -131,24 +142,301 @@ def _to_rate(v) -> Optional[float]:
         return None
 
 
+def _clean_cell_text(v) -> str:
+    text = str(v or "").strip()
+    if text.lower() in {"", "nan", "none", "null", "nat"}:
+        return ""
+    return text
+
+
+def _norm_header(v) -> str:
+    text = _clean_cell_text(v).lower()
+    if not text:
+        return ""
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def _is_placeholder_header(v) -> bool:
+    h = _norm_header(v)
+    if not h:
+        return True
+    if h.startswith("unnamed"):
+        return True
+    if re.fullmatch(r"col\s*\d+", h):
+        return True
+    return False
+
+
+def _score_employee_header(v) -> int:
+    if _is_placeholder_header(v):
+        return 0
+    h = _norm_header(v)
+    tokens = set(h.split())
+    score = 0
+    if h in {"employee", "employee name", "resource", "resource name", "consultant", "consultant name", "staff", "staff name", "name", "emp", "emp name"}:
+        score = max(score, 4)
+    if tokens.intersection({"employee", "emp", "resource", "consultant", "staff"}):
+        score = max(score, 3)
+    if "name" in tokens:
+        score = max(score, 2)
+    return score
+
+
+def _score_cost_header(v) -> int:
+    if _is_placeholder_header(v):
+        return 0
+    h = _norm_header(v)
+    tokens = set(h.split())
+    score = 0
+    if h in {"cost", "cost rate", "ctc", "pay rate", "internal rate", "resource cost", "cost hr", "cost per hour", "cost rate per hour"}:
+        score = max(score, 4)
+    if "ctc" in tokens:
+        score = max(score, 4)
+    if "cost" in tokens and tokens.intersection({"rate", "hr", "hour", "per"}):
+        score = max(score, 3)
+    if "cost" in tokens:
+        score = max(score, 2)
+    return score
+
+
+def _score_project_header(v) -> int:
+    if _is_placeholder_header(v):
+        return 0
+    h = _norm_header(v)
+    tokens = set(h.split())
+    if h in {"project", "project name", "client", "account", "engagement"}:
+        return 4
+    if tokens.intersection({"project", "client", "account", "engagement"}):
+        return 3
+    return 0
+
+
+def _pick_best_column(raw_cols: list[str], scorer) -> tuple[Optional[str], int]:
+    best_col = None
+    best_score = 0
+    for c in raw_cols:
+        s = scorer(c)
+        if s > best_score:
+            best_col = c
+            best_score = s
+    return best_col, best_score
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _ai_detect_cost_columns(rows: list[list[str]]) -> Optional[tuple[Optional[int], int, int, Optional[int]]]:
+    if not _is_cost_ai_fallback_enabled():
+        return None
+
+    try:
+        from . import ai_mapper
+    except Exception:
+        return None
+
+    if not hasattr(ai_mapper, "is_llm_available") or not ai_mapper.is_llm_available():
+        return None
+    if not hasattr(ai_mapper, "_llm_generate"):
+        return None
+
+    preview = []
+    max_rows = min(30, len(rows))
+    for i in range(max_rows):
+        row = rows[i]
+        cells = [str(c or "")[:80] for c in row[:30]]
+        preview.append(f"{i}: {cells}")
+
+    prompt = (
+        "You are analyzing a cost-rate spreadsheet. "
+        "Identify column indexes for employee name, project (optional), and cost rate. "
+        "Header may be on any row.\n\n"
+        "Rows:\n"
+        + "\n".join(preview)
+        + "\n\nReturn ONLY JSON: "
+          "{\"header_row\": <int|null>, \"employee_col\": <int>, \"cost_col\": <int>, \"project_col\": <int|null>}"
+    )
+
+    try:
+        raw = ai_mapper._llm_generate(prompt, timeout=45)
+    except Exception:
+        return None
+
+    parser = getattr(ai_mapper, "_extract_json", None)
+    parsed = parser(raw) if callable(parser) else None
+    if not parsed:
+        parsed = _extract_json_object(raw)
+    if not isinstance(parsed, dict):
+        return None
+
+    def _to_int_or_none(v):
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    header_row = _to_int_or_none(parsed.get("header_row"))
+    employee_col = _to_int_or_none(parsed.get("employee_col"))
+    cost_col = _to_int_or_none(parsed.get("cost_col"))
+    project_col = _to_int_or_none(parsed.get("project_col"))
+    if employee_col is None or cost_col is None:
+        return None
+    return header_row, employee_col, cost_col, project_col
+
+
+def _extract_cost_rates_by_indices(
+    rows: list[list[str]],
+    employee_col: int,
+    cost_col: int,
+    project_col: Optional[int] = None,
+    start_row: int = 0,
+) -> tuple[dict, dict, int, int]:
+    employee_rates: dict[str, float] = {}
+    employee_project_rates: dict[tuple[str, str], float] = {}
+    rows_scanned = 0
+    mapped_rows = 0
+    sampled_names: list[str] = []
+
+    for ridx in range(max(0, start_row), len(rows)):
+        row = rows[ridx]
+        rows_scanned += 1
+        if employee_col >= len(row) or cost_col >= len(row):
+            continue
+
+        emp = _norm_emp(row[employee_col])
+        rate = _to_rate(row[cost_col])
+        if not emp or rate is None or rate <= 0:
+            continue
+
+        employee_rates[emp] = rate
+        mapped_rows += 1
+        if len(sampled_names) < 6:
+            sampled_names.append(emp)
+
+        if project_col is not None and project_col < len(row):
+            proj = _norm_proj(row[project_col])
+            if proj:
+                employee_project_rates[(emp, proj)] = rate
+
+    low_names = [n.lower() for n in sampled_names]
+    junk_tokens = {"month", "months", "year", "total", "summary", "cost", "project"}
+    junk_hits = sum(1 for n in low_names if n in junk_tokens or n.isdigit())
+    if mapped_rows > 0 and (mapped_rows < 2 or junk_hits >= max(1, len(low_names) // 2)):
+        return {}, {}, rows_scanned, 0
+
+    return employee_rates, employee_project_rates, rows_scanned, mapped_rows
+
+
+def _extract_cost_rates_from_raw_dataframe(df: pd.DataFrame) -> tuple[dict, dict, int, int]:
+    employee_rates: dict[str, float] = {}
+    employee_project_rates: dict[tuple[str, str], float] = {}
+    rows_scanned = 0
+    mapped_rows = 0
+    if df is None or df.empty:
+        return employee_rates, employee_project_rates, rows_scanned, mapped_rows
+
+    rows = [[_clean_cell_text(v) for v in r] for r in df.values.tolist()]
+    if not rows:
+        return employee_rates, employee_project_rates, rows_scanned, mapped_rows
+
+    def _is_plausible_result(er: dict, mr: int) -> bool:
+        if mr < 2 or not er:
+            return False
+        names = [str(k).strip().lower() for k in er.keys()]
+        junk_tokens = {"month", "months", "year", "total", "summary", "cost", "project"}
+        junk_hits = sum(1 for n in names if n in junk_tokens or n.isdigit())
+        return junk_hits < max(1, len(names) // 2)
+
+    best_header_idx = None
+    best_score = -1
+    scan_upto = min(40, len(rows))
+    for i in range(scan_upto):
+        row = rows[i]
+        emp_score = max((_score_employee_header(c) for c in row), default=0)
+        cost_score = max((_score_cost_header(c) for c in row), default=0)
+        proj_score = max((_score_project_header(c) for c in row), default=0)
+        score = emp_score + cost_score + proj_score
+        if emp_score >= 2 and cost_score >= 2 and score > best_score:
+            best_header_idx = i
+            best_score = score
+
+    if best_header_idx is not None:
+        headers = []
+        used = set()
+        for j, h in enumerate(rows[best_header_idx]):
+            base = _clean_cell_text(h) or f"col_{j}"
+            candidate = base
+            k = 2
+            while candidate in used:
+                candidate = f"{base}_{k}"
+                k += 1
+            headers.append(candidate)
+            used.add(candidate)
+
+        data_rows = rows[best_header_idx + 1 :]
+        if data_rows:
+            df2 = pd.DataFrame(data_rows, columns=headers)
+            er, epr, rs, mr = _extract_cost_rates_from_dataframe(df2)
+            employee_rates.update(er)
+            employee_project_rates.update(epr)
+            rows_scanned += rs
+            mapped_rows += mr
+            if _is_plausible_result(employee_rates, mapped_rows):
+                return employee_rates, employee_project_rates, rows_scanned, mapped_rows
+
+    ai_detected = _ai_detect_cost_columns(rows)
+    if ai_detected:
+        header_row, emp_col, cost_col, proj_col = ai_detected
+        start_row = (header_row + 1) if header_row is not None else 0
+        er, epr, rs, mr = _extract_cost_rates_by_indices(
+            rows,
+            employee_col=emp_col,
+            cost_col=cost_col,
+            project_col=proj_col,
+            start_row=start_row,
+        )
+        employee_rates.update(er)
+        employee_project_rates.update(epr)
+        rows_scanned += rs
+        mapped_rows += mr
+
+    if not _is_plausible_result(employee_rates, mapped_rows):
+        return {}, {}, rows_scanned, 0
+
+    return employee_rates, employee_project_rates, rows_scanned, mapped_rows
+
+
 def _extract_cost_rates_from_dataframe(df: pd.DataFrame) -> tuple[dict, dict, int, int]:
     employee_rates: dict[str, float] = {}
     employee_project_rates: dict[tuple[str, str], float] = {}
     rows_scanned = 0
     mapped_rows = 0
 
-    employee_keys = ("employee", "emp", "name", "resource", "consultant", "staff")
-    cost_keys = ("cost rate", "cost_rate", "ctc", "pay rate", "internal rate", "cost/hr", "resource cost", "cost")
-    project_keys = ("project", "client", "account", "engagement")
-
     raw_cols = [str(c).strip() for c in df.columns]
-    cols_norm = {c: str(c).strip().lower() for c in raw_cols}
+    emp_col, emp_score = _pick_best_column(raw_cols, _score_employee_header)
+    cost_col, cost_score = _pick_best_column(raw_cols, _score_cost_header)
+    proj_col, proj_score = _pick_best_column(raw_cols, _score_project_header)
+    if proj_score < 2:
+        proj_col = None
 
-    emp_col = next((c for c in raw_cols if any(k in cols_norm[c] for k in employee_keys)), None)
-    cost_col = next((c for c in raw_cols if any(k in cols_norm[c] for k in cost_keys)), None)
-    proj_col = next((c for c in raw_cols if any(k in cols_norm[c] for k in project_keys)), None)
-
-    if not emp_col or not cost_col:
+    if not emp_col or not cost_col or emp_score < 2 or cost_score < 2:
         return employee_rates, employee_project_rates, rows_scanned, mapped_rows
 
     for _, row in df.iterrows():
@@ -414,6 +702,15 @@ def extract_cost_rates_from_excel(filepath: str) -> dict:
             if df is None or df.empty:
                 continue
             er, epr, rs, mr = _extract_cost_rates_from_dataframe(df)
+            if mr == 0:
+                try:
+                    raw_df = pd.read_excel(filepath, sheet_name=sheet, dtype=str, header=None)
+                except Exception:
+                    raw_df = None
+                if raw_df is not None and not raw_df.empty:
+                    er2, epr2, rs2, mr2 = _extract_cost_rates_from_raw_dataframe(raw_df)
+                    if mr2 > mr:
+                        er, epr, rs, mr = er2, epr2, rs2, mr2
             employee_rates.update(er)
             employee_project_rates.update(epr)
             rows_scanned += rs

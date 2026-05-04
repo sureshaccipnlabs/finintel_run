@@ -32,6 +32,12 @@ def _looks_like_cost_reference(filename: str) -> bool:
     return any(t in name for t in tokens)
 
 
+def _looks_like_cost_map_result(cost_map: dict | None) -> bool:
+    if not cost_map or cost_map.get("error"):
+        return False
+    return bool((cost_map.get("employee_rates") or {}) or (cost_map.get("employee_project_rates") or {}))
+
+
 def _extract_month_scope_from_filename(filename: str):
     name = (filename or "")
     months = re.findall(
@@ -98,11 +104,15 @@ async def ingest(files: List[UploadFile] = File(...)):
 
         cost_map = None
         ext = os.path.splitext(item["filename"])[1].lower()
-        if ext in (".xlsx", ".xls") and _looks_like_cost_reference(item["filename"]):
+        if ext in (".xlsx", ".xls"):
             try:
-                cost_map = extract_cost_rates_from_excel(item["tmp_path"])
+                maybe_cost_map = extract_cost_rates_from_excel(item["tmp_path"])
+                # Keep filename heuristic, but also allow content-detected cost sheets.
+                if _looks_like_cost_reference(item["filename"]) or _looks_like_cost_map_result(maybe_cost_map):
+                    cost_map = maybe_cost_map
             except Exception as e:
-                cost_map = {"error": str(e), "employee_rates": {}, "employee_project_rates": {}}
+                if _looks_like_cost_reference(item["filename"]):
+                    cost_map = {"error": str(e), "employee_rates": {}, "employee_project_rates": {}}
 
         try:
             os.unlink(item["tmp_path"])
