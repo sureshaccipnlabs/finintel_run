@@ -163,7 +163,14 @@ def _trend_direction(values: list[float], min_delta: float = 0.0) -> str:
 
 
 def _money(v: float) -> str:
-    return f"${abs(v):,.2f}"
+    return f"${v:,.0f}"
+
+
+def _norm_project_name(v: Optional[str]) -> str:
+    text = str(v or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text.lower()
 
 
 def _pct(v: float) -> str:
@@ -1457,7 +1464,11 @@ def get_risks_and_recommendations(
         return _empty_response()
 
     if project:
-        records = [r for r in records if (r.get("project") or "").lower() == project.lower()]
+        wanted_project = _norm_project_name(project)
+        records = [
+            r for r in records
+            if _norm_project_name(r.get("project")) == wanted_project
+        ]
     if not records:
         return _empty_response()
 
