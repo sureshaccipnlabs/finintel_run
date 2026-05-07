@@ -6,6 +6,7 @@ from ingestion.ingest import (
     ingest_file,
     extract_cost_rates_from_excel,
     apply_cost_rates_to_global_dataset,
+    apply_latest_known_cost_rates_to_global_dataset,
 )
 from ingestion.dataset import (
     GLOBAL_DATASET, transform_to_api_format, filter_by_range,
@@ -51,9 +52,85 @@ def _extract_month_scope_from_filename(filename: str):
     return month_set, year_set
 
 
+def _month_token_to_number(month_token: str) -> Optional[int]:
+    lookup = {
+        "JAN": 1,
+        "FEB": 2,
+        "MAR": 3,
+        "APR": 4,
+        "MAY": 5,
+        "JUN": 6,
+        "JUL": 7,
+        "AUG": 8,
+        "SEP": 9,
+        "OCT": 10,
+        "NOV": 11,
+        "DEC": 12,
+    }
+    return lookup.get((month_token or "").upper()[:3])
+
+
+def _extract_month_year_points_from_filename(filename: str) -> list[tuple[int, int]]:
+    name = filename or ""
+    direct = re.findall(
+        r"(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)\D*(\d{2,4})",
+        name,
+        flags=re.IGNORECASE,
+    )
+    points = []
+    seen = set()
+
+    if direct:
+        for mon, yr in direct:
+            mon_num = _month_token_to_number(mon)
+            if not mon_num:
+                continue
+            year_int = int(str(yr)[-2:]) + 2000
+            key = (year_int, mon_num)
+            if key not in seen:
+                seen.add(key)
+                points.append(key)
+        return points
+
+    months = re.findall(
+        r"(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)",
+        name,
+        flags=re.IGNORECASE,
+    )
+    years = re.findall(r"\b(\d{4}|\d{2})\b", name)
+    if not months or not years:
+        return []
+
+    year_int = int(str(years[-1])[-2:]) + 2000
+    for mon in months:
+        mon_num = _month_token_to_number(mon)
+        if not mon_num:
+            continue
+        key = (year_int, mon_num)
+        if key not in seen:
+            seen.add(key)
+            points.append(key)
+    return points
+
+
 def _looks_like_timesheet_file(filename: str) -> bool:
     name = (filename or "").lower()
     return ("timesheet" in name) and not _looks_like_cost_reference(name)
+
+
+def _build_gross_margin_note(records: list) -> Optional[str]:
+    if not records:
+        return None
+    total = len(records)
+    with_cost = sum(1 for r in records if r.get("cost_rate") not in (None, "", 0, 0.0))
+    if with_cost == 0:
+        return "No cost data available for the uploaded timesheets"
+    if with_cost < total:
+        return (
+            f"Cost data is partial ({with_cost}/{total} records with cost rate). "
+            "Gross margin uses available rates, including latest prior-month fallback when exact month cost is missing."
+        )
+    return None
 
 app = FastAPI(title="FinIntel AI", description="AI-powered Financial Document Intelligence System")
 
@@ -142,6 +219,7 @@ async def ingest(files: List[UploadFile] = File(...)):
     total_updated_records = 0
     total_updated_employee_only = 0
     total_untouched_records = 0
+    cost_rate_history = []
     for row in results:
         cm = row.get("cost_map")
         api_row = {
@@ -167,6 +245,33 @@ async def ingest(files: List[UploadFile] = File(...)):
         merged_employee_rates.update(employee_rates)
         merged_employee_project_rates.update(employee_project_rates)
 
+        filename = row.get("filename") or ""
+        month_year_points = _extract_month_year_points_from_filename(filename)
+        if not month_year_points:
+            month_tokens, year_tokens = _extract_month_scope_from_filename(filename)
+            inferred_years = set(year_tokens or set())
+            if not inferred_years and timesheet_year_scope:
+                inferred_years = set(timesheet_year_scope)
+            if month_tokens and inferred_years:
+                for y in sorted(inferred_years):
+                    try:
+                        year_int = 2000 + int(str(y)[-2:])
+                    except Exception:
+                        continue
+                    for mon in sorted(month_tokens):
+                        mon_num = _month_token_to_number(mon)
+                        if mon_num:
+                            month_year_points.append((year_int, mon_num))
+
+        for year_int, month_int in month_year_points:
+            cost_rate_history.append({
+                "year": year_int,
+                "month": month_int,
+                "employee_rates": employee_rates,
+                "employee_project_rates": employee_project_rates,
+                "filename": filename,
+            })
+
         allowed_months, allowed_years = _extract_month_scope_from_filename(row.get("filename") or "")
 
         effective_months = set(allowed_months) if allowed_months else set()
@@ -186,7 +291,7 @@ async def ingest(files: List[UploadFile] = File(...)):
                 "applied_month_scope": [],
                 "applied_year_scope": sorted(effective_years) if effective_years else None,
                 "merge_stats": merge_stats,
-                "skipped_reason": "COST_MONTH_MISMATCH_WITH_TIMESHEET",
+                "skipped_reason": "NO_EXACT_MONTH_MATCH_USED_FOR_FALLBACK",
             })
             continue
 
@@ -209,6 +314,11 @@ async def ingest(files: List[UploadFile] = File(...)):
             "merge_stats": merge_stats,
         })
 
+    fallback_stats = apply_latest_known_cost_rates_to_global_dataset(cost_rate_history)
+    total_updated_records += int(fallback_stats.get("updated_records", 0) or 0)
+    total_updated_employee_only += int(fallback_stats.get("updated_employee_only", 0) or 0)
+    total_untouched_records += int(fallback_stats.get("untouched_records", 0) or 0)
+
     cost_merge_summary = None
     if merged_employee_rates or merged_employee_project_rates:
         cost_merge_summary = {
@@ -220,6 +330,7 @@ async def ingest(files: List[UploadFile] = File(...)):
                 "updated_employee_only": total_updated_employee_only,
                 "untouched_records": total_untouched_records,
             },
+            "fallback_merge_stats": fallback_stats,
             "sources": cost_sources,
         }
 
@@ -271,6 +382,13 @@ def _build_data_warnings(records: list) -> list:
             "affected_employees": names,
             "count": len(missing_cost),
         })
+        if len(missing_cost) == total:
+            warnings.append({
+                "level": "error",
+                "code": "NO_COST_DATA_AVAILABLE",
+                "message": "No cost data available for the uploaded timesheets",
+                "count": len(missing_cost),
+            })
 
     if missing_hours:
         names = sorted({r.get("employee", "?") for r in missing_hours})[:5]
@@ -366,6 +484,7 @@ def get_projects(
     return {
         "time_range": time_range or "ALL",
         "months_considered": get_months_available(filtered),
+        "gross_margin_note": _build_gross_margin_note(filtered),
         "projects": build_project_summaries(filtered),
     }
 
@@ -380,6 +499,7 @@ def get_employees(time_range: Optional[str] = Query(None, alias="range"), projec
     return {
         "time_range": time_range or "ALL",
         "count": len(employees),
+        "gross_margin_note": _build_gross_margin_note(filtered),
         "employees": employees,
     }
 

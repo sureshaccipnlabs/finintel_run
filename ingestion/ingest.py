@@ -83,6 +83,48 @@ def _month_parts_from_text(text) -> tuple[Optional[str], Optional[str]]:
     return month, year
 
 
+def _month_token_to_number(month_token: Optional[str]) -> Optional[int]:
+    if not month_token:
+        return None
+    lookup = {
+        "JAN": 1,
+        "FEB": 2,
+        "MAR": 3,
+        "APR": 4,
+        "MAY": 5,
+        "JUN": 6,
+        "JUL": 7,
+        "AUG": 8,
+        "SEP": 9,
+        "OCT": 10,
+        "NOV": 11,
+        "DEC": 12,
+    }
+    return lookup.get(str(month_token).strip().upper()[:3])
+
+
+def _apply_rate_to_record(rec: dict, new_rate: float) -> None:
+    rec["cost_rate"] = float(new_rate)
+
+    actual_hours = float(rec.get("actual_hours") or 0)
+    rec["cost"] = round(actual_hours * float(new_rate), 2)
+
+    billing_rate = rec.get("billing_rate")
+    if billing_rate not in (None, "", 0, 0.0):
+        billable_hours = float(rec.get("billable_hours") or actual_hours)
+        rec["revenue"] = round(billable_hours * float(billing_rate), 2)
+
+    revenue = rec.get("revenue")
+    cost = rec.get("cost")
+    if revenue is not None and cost is not None:
+        rec["profit"] = round(float(revenue) - float(cost), 2)
+        rec["margin_pct"] = round((rec["profit"] / float(revenue)) * 100, 2) if float(revenue) > 0 else 0
+
+    flags = rec.get("validation_flags") or []
+    if "MISSING_COST_RATE" in flags:
+        rec["validation_flags"] = [f for f in flags if f != "MISSING_COST_RATE"]
+
+
 def _sheet_month_key(sheet_name: str, sheet_data: dict) -> Optional[str]:
     by_name = _month_key_from_text(sheet_name)
     if by_name:
@@ -771,26 +813,96 @@ def apply_cost_rates_to_global_dataset(
         if new_rate is None:
             continue
 
-        rec["cost_rate"] = float(new_rate)
+        _apply_rate_to_record(rec, float(new_rate))
 
-        actual_hours = float(rec.get("actual_hours") or 0)
-        rec["cost"] = round(actual_hours * float(new_rate), 2)
+        updated += 1
 
-        billing_rate = rec.get("billing_rate")
-        if billing_rate not in (None, "", 0, 0.0):
-            billable_hours = float(rec.get("billable_hours") or actual_hours)
-            rec["revenue"] = round(billable_hours * float(billing_rate), 2)
+    return {
+        "updated_records": updated,
+        "updated_employee_only": updated_employee_only,
+        "untouched_records": untouched,
+    }
 
-        revenue = rec.get("revenue")
-        cost = rec.get("cost")
-        if revenue is not None and cost is not None:
-            rec["profit"] = round(float(revenue) - float(cost), 2)
-            rec["margin_pct"] = round((rec["profit"] / float(revenue)) * 100, 2) if float(revenue) > 0 else 0
 
-        flags = rec.get("validation_flags") or []
-        if "MISSING_COST_RATE" in flags:
-            rec["validation_flags"] = [f for f in flags if f != "MISSING_COST_RATE"]
+def apply_latest_known_cost_rates_to_global_dataset(cost_rate_history: list[dict]) -> dict:
+    """
+    Apply fallback cost rates for records still missing cost_rate using the latest
+    available cost sheet month that is <= the record month.
+    """
+    if not cost_rate_history:
+        return {
+            "updated_records": 0,
+            "updated_employee_only": 0,
+            "untouched_records": 0,
+        }
 
+    sorted_history = sorted(
+        [
+            h
+            for h in cost_rate_history
+            if isinstance(h, dict)
+            and h.get("year") is not None
+            and h.get("month") is not None
+            and (h.get("employee_rates") or h.get("employee_project_rates"))
+        ],
+        key=lambda x: (int(x.get("year")), int(x.get("month"))),
+    )
+
+    if not sorted_history:
+        return {
+            "updated_records": 0,
+            "updated_employee_only": 0,
+            "untouched_records": 0,
+        }
+
+    updated = 0
+    updated_employee_only = 0
+    untouched = 0
+
+    for rec in GLOBAL_DATASET:
+        current_rate = rec.get("cost_rate")
+        if current_rate not in (None, "", 0, 0.0):
+            untouched += 1
+            continue
+
+        rec_month_token, rec_year_token = _month_parts_from_text(rec.get("month"))
+        rec_month = _month_token_to_number(rec_month_token)
+        if rec_month is None or not rec_year_token:
+            continue
+
+        try:
+            rec_year = 2000 + int(rec_year_token)
+        except Exception:
+            continue
+
+        valid_candidates = [
+            h
+            for h in sorted_history
+            if (int(h.get("year")), int(h.get("month"))) <= (rec_year, rec_month)
+        ]
+        if not valid_candidates:
+            continue
+
+        chosen = valid_candidates[-1]
+        employee_rates = chosen.get("employee_rates") or {}
+        employee_project_rates = chosen.get("employee_project_rates") or {}
+        employees_with_project_rates = {emp for emp, _ in employee_project_rates.keys()}
+
+        emp = _norm_emp(rec.get("employee"))
+        proj = _norm_proj(rec.get("project"))
+        if not emp:
+            continue
+
+        new_rate = employee_project_rates.get((emp, proj)) if proj else None
+        if new_rate is None:
+            if emp not in employees_with_project_rates:
+                new_rate = employee_rates.get(emp)
+                if new_rate is not None:
+                    updated_employee_only += 1
+        if new_rate is None:
+            continue
+
+        _apply_rate_to_record(rec, float(new_rate))
         updated += 1
 
     return {
