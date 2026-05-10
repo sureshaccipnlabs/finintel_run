@@ -299,9 +299,27 @@ def _classify_section(header):
 
 
 # ── Metadata helpers ─────────────────────────────────────────────────────
+_COLUMN_HEADER_SIGNALS = {
+    "name", "hours", "date", "days", "rate", "billing", "cost", "actual",
+    "approved", "leave", "holiday", "vacation", "designation", "department",
+    "joining", "on-board", "onboard", "remarks", "total", "sl", "serial",
+}
+
+
+def _is_table_header_row(row):
+    """Return True if the row looks like a column-header row (has 2+ column-label cells)."""
+    hits = sum(
+        1 for v in row
+        if v and any(sig in clean(v).lower() for sig in _COLUMN_HEADER_SIGNALS)
+    )
+    return hits >= 2
+
+
 def _extract_project_from_metadata(rows):
     """Scan the first few rows for a project name label + value pair."""
     for i, row in enumerate(rows[:6]):
+        if _is_table_header_row(row):
+            continue  # skip column-header rows — adjacent cells are column labels, not project names
         for j, v in enumerate(row):
             label = clean(v).lower()
             if label in ("project", "project name", "client", "client name", "account"):
