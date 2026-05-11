@@ -949,8 +949,21 @@ def ingest_file(filepath: str, time_range: Optional[str] = None, original_filena
                     ts_result["sheets"] = filtered_sheets
                     ts_result["overall_summary"] = _rebuild_overall_summary_from_sheets(filtered_sheets)
 
+            # Derive a project/company hint from the filename to fill empty project fields.
+            # e.g. "FinIntel - Timesheet for FEBRUARY-2026.xlsx" → "FinIntel"
+            _fname_hint = Path(original_filename or filepath).stem
+            _proj_hint_m = re.match(
+                r"^([A-Za-z][A-Za-z0-9_\-\.& ]+?)\s*[-–—]\s*(timesheet|sheet|ts|report|data)",
+                _fname_hint,
+                flags=re.IGNORECASE,
+            )
+            _filename_project = _proj_hint_m.group(1).strip() if _proj_hint_m else None
+
             all_employees = []
             for sheet in ts_result.get("sheets", {}).values():
+                for emp in sheet.get("employees", []):
+                    if _filename_project and not emp.get("project"):
+                        emp["project"] = _filename_project
                 all_employees.extend(sheet.get("employees", []))
             append_records(all_employees, filename=original_filename or filepath)
 
