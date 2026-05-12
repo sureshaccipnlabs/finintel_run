@@ -48,6 +48,16 @@ FIELD_PATTERNS = {
                       "time off", "pto", "absent", "days off"],
     "working_days":  ["working days", "work days", "days worked",
                       "business days", "workdays"],
+    "on_board_date": ["on board date", "onboard date", "on-board date",
+                      "joining date", "join date", "date of joining",
+                      "doj", "start date", "commencement date"],
+    "role":          ["role", "designation", "job title", "job role",
+                      "position", "level", "grade", "band", "title"],
+    "status":        ["status", "emp status", "employee status",
+                      "active status", "employment status"],
+    "billable_hours_per_day": ["billable hours per day", "billable hrs per day",
+                               "billable hours/day", "bill hrs/day", "daily billable hours",
+                               "billable hrs/day", "bhpd"],
 }
 
 # Prevent false positives: if a cell matches field X but contains one of
@@ -57,6 +67,12 @@ FIELD_EXCLUSIONS = {
                       "sow", "role"],
     "project":       ["rate", "hour", "cost", "amount", "days", "billing",
                       "role", "sow", "designation", "title"],
+    "role":          ["project", "client", "account", "rate", "hour", "cost",
+                      "amount", "billing", "leave", "vacation", "working"],
+    "status":        ["rate", "hour", "cost", "amount", "billing", "project",
+                      "days", "leave", "vacation"],
+    "billable_hours_per_day": ["total", "max", "expected", "actual", "final",
+                               "approved", "budgeted"],
     "billing_rate":  ["final", "amount", "total", "cost", "ctc"],
     "cost_rate":     ["billing", "bill", "charge", "sell"],
     "actual_hours":  ["max", "approved", "budgeted", "billable"],
@@ -336,6 +352,111 @@ def _extract_project_from_metadata(rows):
     return None
 
 
+def _parse_team_sheet(rows):
+    """
+    Parse a 'Team' / 'Staff' metadata sheet and return a lookup dict keyed by
+    lowercased employee name.  Each value:
+      {status, active, billable_hours_per_day, role, on_board_date}
+    Status values: "Active"/"Inactive" or 1/0 — both normalised to bool active.
+    """
+    if not rows:
+        return {}
+
+    # Find header row (first row with both a name-like and status-like cell)
+    header_idx = None
+    header = None
+    for i, row in enumerate(rows[:8]):
+        if not row:
+            continue
+        cells = [clean(v).lower() for v in row]
+        if any("name" in c for c in cells) and any("status" in c for c in cells):
+            header_idx = i
+            header = row
+            break
+
+    if header is None or header_idx is None:
+        return {}
+
+    def _col(keywords):
+        for j, v in enumerate(header):
+            lbl = clean(v).lower()
+            if any(kw in lbl for kw in keywords):
+                return j
+        return None
+
+    name_col    = _col(["name"])
+    status_col  = _col(["status"])
+    bhpd_col    = _col(["billable hours per day", "billable hrs per day",
+                         "billable hours/day", "bhpd", "daily billable"])
+    role_col    = _col(["role", "designation", "job title", "job role"])
+    onboard_col = _col(["onboard date", "on-board date", "joining date",
+                        "join date", "date of joining", "doj", "start date"])
+
+    if name_col is None:
+        return {}
+
+    lookup = {}
+    for row in rows[header_idx + 1:]:
+        if not row:
+            continue
+        name_val = clean(row[name_col]) if name_col < len(row) else ""
+        if not name_val or name_val.lower() in SKIP_NAMES:
+            continue
+
+        # Status — accept "Active"/"Inactive" text or 1/0 numeric
+        active = True
+        if status_col is not None and status_col < len(row) and row[status_col] is not None:
+            sv = row[status_col]
+            if isinstance(sv, (int, float)):
+                active = (int(sv) == 1)
+            else:
+                active = clean(sv).lower() not in ("inactive", "0", "no", "false", "n")
+
+        # Billable hours per day
+        bhpd = 0.0
+        if bhpd_col is not None and bhpd_col < len(row):
+            try:
+                bhpd = float(row[bhpd_col] or 0)
+            except (ValueError, TypeError):
+                bhpd = 0.0
+
+        # Role
+        role_val = ""
+        if role_col is not None and role_col < len(row):
+            role_val = clean(row[role_col])
+
+        # On-board date
+        on_board_val = None
+        if onboard_col is not None and onboard_col < len(row) and row[onboard_col]:
+            raw = row[onboard_col]
+            if isinstance(raw, (datetime, date)):
+                d = raw.date() if isinstance(raw, datetime) else raw
+                on_board_val = d.isoformat()
+            else:
+                s = str(raw).strip()
+                for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%d-%b-%Y"):
+                    try:
+                        on_board_val = datetime.strptime(s[:10], fmt).date().isoformat()
+                        break
+                    except ValueError:
+                        continue
+
+        lookup[name_val.lower()] = {
+            "active":                active,
+            "status":                "active" if active else "inactive",
+            "billable_hours_per_day": bhpd,
+            "role":                  role_val,
+            "on_board_date":         on_board_val,
+        }
+
+    return lookup
+
+
+# Sheet names that indicate a Team/Staff metadata sheet (not a timesheet)
+_TEAM_SHEET_NAMES = {"team", "teams", "team members", "staff", "employees",
+                     "roster", "headcount", "resources", "personnel"}
+
+
 def _extract_month_label(rows, sheet_name):
     # 1. Look for MONTH / YEAR label-value pairs in metadata rows
     for i, row in enumerate(rows[:6]):
@@ -426,6 +547,10 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
     max_idx     = col_map.get("max_hours")
     leaves_idx  = col_map.get("leaves")
     wd_idx      = col_map.get("working_days")
+    onboard_idx = col_map.get("on_board_date")
+    role_idx    = col_map.get("role")
+    status_idx  = col_map.get("status")
+    bhpd_idx    = col_map.get("billable_hours_per_day")
 
     if name_idx is None:
         name_idx = 0
@@ -503,17 +628,63 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
             if pv and not is_date(r[project_idx]):
                 project = pv
 
+        # Extract on-board / joining date if column exists
+        on_board_raw = r[onboard_idx] if onboard_idx is not None and onboard_idx < len(r) else None
+        on_board_date_val = None
+        if on_board_raw:
+            if isinstance(on_board_raw, (datetime, date)):
+                on_board_date_val = on_board_raw.date() if isinstance(on_board_raw, datetime) else on_board_raw
+            else:
+                try:
+                    on_board_date_val = datetime.strptime(str(on_board_raw).strip(), "%Y-%m-%d").date()
+                except ValueError:
+                    for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%d-%b-%Y", "%b %d %Y"):
+                        try:
+                            on_board_date_val = datetime.strptime(str(on_board_raw).strip(), fmt).date()
+                            break
+                        except ValueError:
+                            continue
+
+        # Extract role / designation
+        role_val = ""
+        if role_idx is not None and role_idx < len(r) and r[role_idx]:
+            rv = clean(r[role_idx])
+            if rv and not is_date(r[role_idx]):
+                role_val = rv
+
+        # Extract employee status (Active/Inactive or 1/0)
+        emp_active = True
+        if status_idx is not None and status_idx < len(r) and r[status_idx] is not None:
+            sv = r[status_idx]
+            if isinstance(sv, (int, float)):
+                emp_active = (int(sv) == 1)
+            else:
+                emp_active = clean(sv).lower() not in ("inactive", "0", "no", "false", "n")
+
+        # Extract billable hours per day from main sheet (if column exists)
+        bhpd_val = 0.0
+        if bhpd_idx is not None and bhpd_idx < len(r):
+            try:
+                bhpd_val = float(r[bhpd_idx] or 0)
+            except (ValueError, TypeError):
+                bhpd_val = 0.0
+
         employees[name] = {
-            "project":       project,
-            "billing_rate":  _safe_float(r, rate_idx),
-            "cost_rate":     _safe_float(r, cost_idx),
-            "actual_hours":  actual_hours,
-            "billable_hours":_safe_float(r, billable_idx) or _safe_float(r, sub_billable_idx),
-            "expected_hours":_safe_float(r, max_idx),
-            "vacation_days": leave_days,
-            "leave_days":    leave_days,
-            "holiday_days":  daily["holiday_days"],
-            "working_days":  working_days,
+            "project":                project,
+            "role":                   role_val,
+            "active":                 emp_active,
+            "joining_status":         "active" if emp_active else "inactive",
+            "billing_rate":           _safe_float(r, rate_idx),
+            "cost_rate":              _safe_float(r, cost_idx),
+            "actual_hours":           actual_hours,
+            "billable_hours":         _safe_float(r, billable_idx) or _safe_float(r, sub_billable_idx),
+            "expected_hours":         _safe_float(r, max_idx),
+            "vacation_days":          leave_days,
+            "leave_days":             leave_days,
+            "holiday_days":           daily["holiday_days"],
+            "working_days":           working_days,
+            "on_board_date":          on_board_date_val.isoformat() if on_board_date_val else None,
+            "billable_hours_per_day": bhpd_val,
         }
         found_any = True
 
@@ -689,6 +860,11 @@ def _build_employee_record(name, data, month_label):
     billable_hours = data.get("billable_hours", 0) or actual_hours
     expected_hours = data.get("expected_hours", 0)
     working_days   = data.get("working_days", 0)
+
+    # Fallback: if billable_hours is still 0, compute from billable_hours_per_day
+    bhpd = data.get("billable_hours_per_day") or 0.0
+    if not billable_hours and bhpd and working_days:
+        billable_hours = round(working_days * bhpd, 2)
     leave_days     = data.get("leave_days", data.get("vacation_days", 0))
     holiday_days   = data.get("holiday_days", 0)
     vacation_days  = leave_days
@@ -729,6 +905,11 @@ def _build_employee_record(name, data, month_label):
         "employee": name,
         "project": data.get("project", ""),
         "month": month_label,
+        "on_board_date":          data.get("on_board_date"),
+        "role":                   data.get("role") or "",
+        "active":                 data.get("active", True),
+        "joining_status":         data.get("joining_status", "active"),
+        "billable_hours_per_day": bhpd,
         "working_days": working_days,
         "leave_days": leave_days,
         "holiday_days": holiday_days,
@@ -812,6 +993,17 @@ def parse_timesheet(filepath, target_month=None):
         "sheets": {}
     }
 
+    # ── Parse Team/Staff sheet first (if present) ─────────────────────────
+    # Team sheets provide authoritative status, role, billable_hours_per_day
+    # for each employee, independent of which timesheet tab is active.
+    team_lookup = {}
+    for sn in wb.sheetnames:
+        sn_lower = sn.strip().lower()
+        if sn_lower in _TEAM_SHEET_NAMES:
+            t_rows = [list(r) for r in wb[sn].iter_rows(values_only=True)]
+            team_lookup = _parse_team_sheet(t_rows)
+            break
+
     def _norm_month_text(s):
         s = str(s).upper().replace("-", "").replace(" ", "").replace("'", "")
         s = re.sub(r"20(\d{2})", r"\1", s)
@@ -891,6 +1083,40 @@ def parse_timesheet(filepath, target_month=None):
                 normalize_record(_build_employee_record(name, data, month_label))
                 for name, data in merged.items()
             ]
+
+            # ── Enrich with Team sheet metadata ───────────────────────
+            if team_lookup:
+                for emp in employees:
+                    key = (emp.get("employee") or "").lower()
+                    meta = team_lookup.get(key)
+                    # Fuzzy match if exact miss
+                    if meta is None:
+                        for tkey, tval in team_lookup.items():
+                            if key in tkey or tkey in key:
+                                meta = tval
+                                break
+                    if meta:
+                        # Status from team sheet overrides main sheet status
+                        if not meta["active"]:
+                            emp["active"] = False
+                            emp["joining_status"] = "inactive"
+                        # Fill missing role from team sheet
+                        if not emp.get("role") and meta.get("role"):
+                            emp["role"] = meta["role"]
+                        # Fill missing on_board_date
+                        if not emp.get("on_board_date") and meta.get("on_board_date"):
+                            emp["on_board_date"] = meta["on_board_date"]
+                        # Apply billable_hours_per_day fallback if still 0
+                        if not emp.get("billable_hours") and meta.get("billable_hours_per_day"):
+                            wd = emp.get("working_days") or 0
+                            bhpd = meta["billable_hours_per_day"]
+                            if wd and bhpd:
+                                emp["billable_hours"] = round(wd * bhpd, 2)
+                                # Recompute revenue with updated billable hours
+                                rate = emp.get("billing_rate") or 0
+                                if rate:
+                                    emp["revenue"] = round(emp["billable_hours"] * rate, 2)
+                                    emp["profit"]  = round(emp["revenue"] - emp.get("cost", 0), 2)
 
             # ── Per-sheet analytics ───────────────────────────────────
             projects = {}

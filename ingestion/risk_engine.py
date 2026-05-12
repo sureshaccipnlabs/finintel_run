@@ -298,7 +298,16 @@ def _detect_employee_risks(name: str, monthly_records: list[dict], overall_reven
     total_cost  = sum(_num(r.get("cost"))         for r in monthly_records)
     total_hours = sum(_num(r.get("actual_hours")) for r in monthly_records)
     total_leave = sum(_num(r.get("vacation_days"))for r in monthly_records)
-    appr_hours  = sum(_num(r.get("approved_hours") or r.get("max_hours") or r.get("expected_hours")) for r in monthly_records)
+    # Capacity (max_hours) is per-person-per-month, not per-project.
+    # When the same employee has multiple project records in one month, summing
+    # max_hours would double-count capacity. Instead, take the max per month.
+    _cap_by_month: dict = {}
+    for r in monthly_records:
+        mon = r.get("month") or ""
+        cap = _num(r.get("approved_hours") or r.get("max_hours") or r.get("expected_hours"))
+        if cap > 0:
+            _cap_by_month[mon] = max(_cap_by_month.get(mon, 0.0), cap)
+    appr_hours  = sum(_cap_by_month.values()) if _cap_by_month else 0.0
     total_profit= total_rev - total_cost
     avg_margin  = (total_profit / total_rev * 100) if total_rev > 0 else 0.0
     avg_util    = (total_hours / appr_hours * 100) if appr_hours > 0 else (
@@ -1127,8 +1136,12 @@ def _build_employee_scorecards(timelines: dict[str, list[dict]]) -> list[dict]:
     for name, records in timelines.items():
         perf = employee_performance_score(records)
         latest = records[-1]
+        role = next((r.get("role") for r in records if r.get("role")), "") or ""
+        on_board = next((r.get("on_board_date") for r in records if r.get("on_board_date")), "") or ""
         cards.append({
             "employee":        name,
+            "role":            role,
+            "on_board_date":   on_board,
             "project":         latest.get("project") or "Unknown",
             "months_covered":  len(records),
             "latest_month":    latest.get("month") or "",
@@ -1476,18 +1489,66 @@ def get_risks_and_recommendations(
     overall   = build_overall_summary(records)
     total_rev = overall.get("total_revenue") or 1.0
 
-    # ── Build employee timelines ──────────────────────────────────────────
-    timelines = _build_employee_timelines(records)
+    # ── Separate active vs future-joiner records ─────────────────────────
+    active_records = [r for r in records if r.get("active", True)]
+    future_joiners = [r for r in records if not r.get("active", True)]
+
+    # ── Build employee timelines (active only) ────────────────────────────
+    timelines = _build_employee_timelines(active_records)
 
     # ── Detect all risks ──────────────────────────────────────────────────
     all_risks: list[dict] = []
+
+    # Risks for inactive / future-joining employees
+    seen_fj: set = set()
+    for r in future_joiners:
+        name = r.get("employee") or ""
+        if name in seen_fj:
+            continue
+        seen_fj.add(name)
+        joining_status = r.get("joining_status", "inactive")
+        if joining_status == "upcoming":
+            risk_type = "INVALID_ONBOARD_DATE"
+            description = (
+                f"{name} appears in {r.get('month')} timesheet but on-board date "
+                f"({r.get('on_board_date')}) is in the future. "
+                f"Excluded from active analytics."
+            )
+            recommendation = (
+                f"Verify with HR whether {name}'s on-board date ({r.get('on_board_date')}) "
+                f"is correct, or if they were added to the timesheet prematurely."
+            )
+        else:
+            risk_type = "INACTIVE_EMPLOYEE"
+            description = (
+                f"{name} is marked as Inactive in the team roster "
+                f"but appears in the {r.get('month')} timesheet. "
+                f"Excluded from active analytics."
+            )
+            recommendation = (
+                f"Confirm with HR whether {name} is off-boarded or on extended leave. "
+                f"Remove from timesheet if no longer active."
+            )
+        all_risks.append({
+            "type":       risk_type,
+            "category":   "data_quality",
+            "severity":   "medium",
+            "entity":     name,
+            "project":    r.get("project") or "unknown",
+            "description": description,
+            "recommendation": recommendation,
+            "owner":    "HR / Data Owner",
+            "deadline": "Within 1 week",
+            "metrics":  {"on_board_date": r.get("on_board_date"), "timesheet_month": r.get("month"),
+                         "joining_status": joining_status},
+        })
 
     for name, emp_records in timelines.items():
         emp_risks = _detect_employee_risks(name, emp_records, total_rev)
         all_risks.extend(emp_risks)
 
-    all_risks.extend(_detect_project_risks(records))
-    all_risks.extend(_detect_trend_risks(records))
+    all_risks.extend(_detect_project_risks(active_records))
+    all_risks.extend(_detect_trend_risks(active_records))
 
     # Score and sort
     for r in all_risks:
@@ -1550,9 +1611,22 @@ def get_risks_and_recommendations(
 
     action_tracker = _build_action_tracker(recommendations)
     executive_summary = _build_executive_summary(all_risks, recommendations)
-    data_quality = _build_data_quality_summary(records)
+    data_quality = _build_data_quality_summary(active_records)
     project_risk_heatmap = _build_project_risk_heatmap(all_risks)
     explainability_sources = _build_explainability_sources(all_risks)
+
+    # Build upcoming_joiners summary
+    upcoming_joiners = []
+    for r in future_joiners:
+        name = r.get("employee") or ""
+        if not any(u["employee"] == name for u in upcoming_joiners):
+            upcoming_joiners.append({
+                "employee":    name,
+                "project":     r.get("project") or "",
+                "on_board_date": r.get("on_board_date") or "",
+                "timesheet_month": r.get("month") or "",
+                "note": f"Joining {r.get('on_board_date')} — not yet active",
+            })
 
     return {
         "overview":            _build_risk_overview(all_risks),
@@ -1570,14 +1644,16 @@ def get_risks_and_recommendations(
         "data_quality":        data_quality,
         "sources":             explainability_sources,
         "employee_scorecards": scorecards,
+        "upcoming_joiners":    upcoming_joiners,
         "ai_insights":         ai_insights,
-        "summary":             overall,
+        "summary":             build_overall_summary(active_records),
         "meta": {
-            "time_range":        time_range or "ALL",
-            "total_employees":   len(timelines),
-            "total_risks":       len(all_risks),
-            "action_needed":     sum(1 for r in all_risks if r.get("severity") in ("critical","high")),
-            "records_analysed":  len(records),
+            "time_range":          time_range or "ALL",
+            "total_employees":     len(timelines),
+            "upcoming_joiners":    len(upcoming_joiners),
+            "total_risks":         len(all_risks),
+            "action_needed":       sum(1 for r in all_risks if r.get("severity") in ("critical","high")),
+            "records_analysed":    len(active_records),
         },
     }
 

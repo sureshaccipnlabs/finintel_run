@@ -215,7 +215,32 @@ def get_months_available(records: List[dict] = None) -> List[str]:
     return sorted(months_set, key=_sort_key)
 
 
+def active_only(records: List[dict]) -> List[dict]:
+    """Return only records where active is not explicitly False."""
+    return [r for r in records if r.get("active", True)]
+
+
+def get_upcoming_joiners(records: List[dict]) -> List[dict]:
+    """Return deduplicated list of future-joiner employee records."""
+    seen = set()
+    result = []
+    for r in records:
+        if not r.get("active", True):
+            name = r.get("employee") or ""
+            if name not in seen:
+                seen.add(name)
+                result.append({
+                    "employee":        name,
+                    "project":         r.get("project") or "",
+                    "on_board_date":   r.get("on_board_date") or "",
+                    "timesheet_month": r.get("month") or "",
+                    "joining_status":  r.get("joining_status", "upcoming"),
+                })
+    return result
+
+
 def build_projects(records: List[dict]) -> dict:
+    records = active_only(records)
     projects = {}
     for r in records:
         proj = r.get("project") or "Unknown"
@@ -246,6 +271,7 @@ def build_projects(records: List[dict]) -> dict:
 
 
 def build_monthly(records: List[dict]) -> dict:
+    records = active_only(records)
     monthly = {}
     for r in records:
         m = r.get("month", "Unknown")
@@ -284,6 +310,7 @@ def build_monthly(records: List[dict]) -> dict:
 
 
 def build_overall_summary(records: List[dict]) -> dict:
+    records = active_only(records)
     total_rev = 0.0
     total_cost = 0.0
     total_hours = 0.0
@@ -311,6 +338,7 @@ def build_overall_summary(records: List[dict]) -> dict:
 
 
 def build_project_summaries(records: List[dict]) -> List[dict]:
+    records = active_only(records)
     projects = {}
 
     for r in records:
@@ -380,6 +408,7 @@ def build_project_summaries(records: List[dict]) -> List[dict]:
 
 
 def build_employee_summaries(records: List[dict]) -> List[dict]:
+    records = active_only(records)
     employees = {}
 
     for r in records:
@@ -406,9 +435,17 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
                 "vacation_days": 0.0,
                 "leave_days": 0.0,
                 "working_days": 0.0,
+                "role": "",
+                "on_board_date": "",
                 "monthly": {},
                 "projects": {},
             }
+
+        # Capture role and on_board_date (take first non-empty value)
+        if not employees[employee_name]["role"] and r.get("role"):
+            employees[employee_name]["role"] = r.get("role") or ""
+        if not employees[employee_name]["on_board_date"] and r.get("on_board_date"):
+            employees[employee_name]["on_board_date"] = r.get("on_board_date") or ""
 
         emp = employees[employee_name]
         emp["hours"] += hours
@@ -482,6 +519,8 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
 
         output.append({
             "employee_name": employee_name,
+            "role": data.get("role") or "",
+            "on_board_date": data.get("on_board_date") or "",
             "total_hours": round(data["hours"], 2),
             "total_revenue": round(data["revenue"], 2),
             "total_cost": round(data["cost"], 2),
@@ -507,6 +546,7 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
 
 
 def build_top_performers(records: List[dict], limit: int = 5) -> List[dict]:
+    records = active_only(records)
     emp_profit = {}
     for r in records:
         name = r.get("employee", "")

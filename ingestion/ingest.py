@@ -911,6 +911,78 @@ def apply_latest_known_cost_rates_to_global_dataset(cost_rate_history: list[dict
         "untouched_records": untouched,
     }
 
+def _flag_future_joiner(emp: dict, warnings: list) -> None:
+    """
+    Flag an employee record as inactive if:
+    (a) on_board_date is after the timesheet month (future joiner), OR
+    (b) joining_status is already 'inactive' (set by Team sheet status column).
+    Appends a warning entry in both cases.
+    """
+    from datetime import datetime as _dt
+    emp_name     = emp.get("employee") or ""
+    month_label  = emp.get("month") or ""
+    on_board_str = emp.get("on_board_date")
+
+    # Case (b): already marked inactive by Team sheet
+    if emp.get("joining_status") == "inactive" or emp.get("active") is False:
+        emp["active"] = False
+        emp["joining_status"] = "inactive"
+        warnings.append({
+            "type": "INACTIVE_EMPLOYEE",
+            "employee": emp_name,
+            "on_board_date": on_board_str or "",
+            "timesheet_month": month_label,
+            "message": (
+                f"{emp_name} is marked as Inactive in the team roster. "
+                f"Excluded from active analytics."
+            ),
+        })
+        return
+
+    # Case (a): future on-board date
+    if not on_board_str:
+        emp.setdefault("active", True)
+        emp.setdefault("joining_status", "active")
+        return
+    try:
+        on_board = _dt.strptime(str(on_board_str).strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        emp.setdefault("active", True)
+        emp.setdefault("joining_status", "active")
+        return
+
+    record_date = None
+    for fmt in ("%B %Y", "%b %Y", "%b'%y", "%B'%y"):
+        try:
+            record_date = _dt.strptime(month_label.strip(), fmt).date().replace(day=1)
+            break
+        except ValueError:
+            continue
+
+    if record_date is None:
+        emp.setdefault("active", True)
+        emp.setdefault("joining_status", "active")
+        return
+
+    if on_board > record_date:
+        emp["active"] = False
+        emp["joining_status"] = "upcoming"
+        warnings.append({
+            "type": "FUTURE_JOINER",
+            "employee": emp_name,
+            "on_board_date": on_board_str,
+            "timesheet_month": month_label,
+            "message": (
+                f"{emp_name}'s on-board date ({on_board.strftime('%b %d, %Y')}) "
+                f"is after the timesheet period ({month_label}). "
+                f"Excluded from active analytics."
+            ),
+        })
+    else:
+        emp.setdefault("active", True)
+        emp.setdefault("joining_status", "active")
+
+
 def ingest_file(filepath: str, time_range: Optional[str] = None, original_filename: Optional[str] = None) -> dict:
     errors = []
 
@@ -950,9 +1022,15 @@ def ingest_file(filepath: str, time_range: Optional[str] = None, original_filena
                     ts_result["overall_summary"] = _rebuild_overall_summary_from_sheets(filtered_sheets)
 
             all_employees = []
+            future_joiner_warnings = []
             for sheet in ts_result.get("sheets", {}).values():
+                for emp in sheet.get("employees", []):
+                    _flag_future_joiner(emp, future_joiner_warnings)
                 all_employees.extend(sheet.get("employees", []))
             append_records(all_employees, filename=original_filename or filepath)
+
+            if future_joiner_warnings:
+                ts_result.setdefault("warnings", []).extend(future_joiner_warnings)
 
             return ts_result
 
