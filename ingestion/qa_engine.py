@@ -66,13 +66,28 @@ def _extract_qa_json(text: str):
         return json.loads(_clean_qa_json(text))
     except json.JSONDecodeError:
         pass
-    # Try extracting from markdown code block
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(_clean_qa_json(m.group(1)))
-        except json.JSONDecodeError:
-            pass
+    # Try extracting from markdown code blocks (pick best candidate)
+    matches = list(re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL))
+    if matches:
+        best_obj = None
+        best_score = -1
+        for m in matches:
+            try:
+                obj = json.loads(_clean_qa_json(m.group(1)))
+            except json.JSONDecodeError:
+                continue
+            # Score candidates: prefer dicts with keys, especially with 'data'/'summary'
+            score = 0
+            if isinstance(obj, dict):
+                score += len(obj.keys())
+                if "data" in obj:
+                    score += 5
+                if "summary" in obj:
+                    score += 3
+            if score > best_score:
+                best_obj, best_score = obj, score
+        if best_obj is not None and best_score > 0:
+            return best_obj
     # Greedy: find outermost { ... }
     depth, start = 0, None
     for i, ch in enumerate(text):
@@ -351,6 +366,15 @@ def _detect_question_scope(question: str) -> dict:
         scope["needs_employee_summary"] = True
         scope["needs_risks"] = True
     
+    # Threshold-style queries: include employee details and monthly to expose per-record metrics
+    threshold_markers = ["<=", ">=", "<", ">", "≤", "≥", "below", "under", "above", "over",
+                         "less than", "more than", "greater than", "at most", "at least",
+                         "no more than", "no less than", "not more than", "not less than"]
+    if any(m in q for m in threshold_markers) or "margin" in q:
+        scope["needs_employee_summary"] = True
+        scope["needs_employee_details"] = True
+        scope["needs_monthly"] = True
+    
     return scope
 
 
@@ -540,10 +564,11 @@ def _build_dataset_context(records=None, question: str = None):
         for r in filtered_recs[:30]:
             rev = r.get('revenue') or 0
             pft = r.get('profit') or 0
+            mar = _calc_margin(rev, r.get('cost') or (rev - pft))
             lines.append(
                 f"- {r.get('employee', '?')} | {r.get('project', '?')} | {r.get('month', '?')} | "
                 f"Hours={r.get('actual_hours', 0)}, Vacation={r.get('vacation_days', 0)}, "
-                f"Revenue=${rev:,.2f}, Profit=${pft:,.2f}, "
+                f"Revenue=${rev:,.2f}, Profit=${pft:,.2f}, Margin={mar}%, "
                 f"Utilisation={r.get('utilisation_pct', 0)}%"
             )
         if len(filtered_recs) > 30:
@@ -570,7 +595,6 @@ You are FinIntel AI. Answer from this data:
 {context}
 ---
 Question: {question}
-
 Return ONLY valid JSON. No text before or after the JSON.
 
 EXAMPLES:
@@ -1050,6 +1074,158 @@ def _pivot_table_if_needed(data: list, columns: list) -> tuple:
     return pivoted_data, pivoted_columns
 
 
+def _filter_table_by_margin_threshold(question: str, data: list, columns: list) -> tuple:
+    """Filter table rows by explicit thresholds in the question for margin, utilization, revenue, cost, or profit.
+    Supports symbols (<, >, <=, >=, ≤, ≥) and verbal forms (below/under/above/over, at most/at least, no/not more/less than, etc.).
+    Applies to columns whose name contains the target metric (case-insensitive).
+    Returns (filtered_data, columns). If no threshold/metric found, returns inputs unchanged.
+    """
+    try:
+        q = (question or "").lower()
+        comp = None
+        thr = None
+
+        # Try to bind operator to 'margin'
+        m = re.search(r"margin\s*(<=|>=|≤|≥|<|>)\s*(\d+(?:\.\d+)?)", q)
+        if m:
+            op = m.group(1)
+            comp = op if op in ("<", ">", "<=", ">=") else ("<=" if op == "≤" else ">=")
+            thr = float(m.group(2))
+            metric = "margin"
+        # Verbal strict less/greater
+        elif "margin" in q and ("below" in q or "under" in q):
+            comp = "<"; metric = "margin"
+            mt = re.search(r"(?:below|under)\s*(\d+(?:\.\d+)?)", q)
+            thr = float(mt.group(1)) if mt else None
+        elif "margin" in q and ("above" in q or "over" in q):
+            comp = ">"; metric = "margin"
+            mt = re.search(r"(?:above|over)\s*(\d+(?:\.\d+)?)", q)
+            thr = float(mt.group(1)) if mt else None
+        # Verbal inclusive less/greater (<=, >=) synonyms
+        elif "margin" in q and re.search(r"less than or equal to|at most|no more than|not more than", q):
+            comp = "<="; metric = "margin"
+            mt = re.search(r"(?:less than or equal to|at most|no more than|not more than)\s*(\d+(?:\.\d+)?)", q)
+            thr = float(mt.group(1)) if mt else None
+        elif "margin" in q and re.search(r"greater than or equal to|at least|no less than|not less than", q):
+            comp = ">="; metric = "margin"
+            mt = re.search(r"(?:greater than or equal to|at least|no less than|not less than)\s*(\d+(?:\.\d+)?)", q)
+            thr = float(mt.group(1)) if mt else None
+        # Utilization variants (utilization/utilisation/avg utilisation)
+        if comp is None:
+            u = re.search(r"(avg\s*util(?:ization|isation)?|util(?:ization|isation)?)\s*(<=|>=|≤|≥|<|>)\s*(\d+(?:\.\d+)?)", q)
+            if u:
+                op = u.group(2)
+                comp = op if op in ("<", ">", "<=", ">=") else ("<=" if op == "≤" else ">=")
+                thr = float(u.group(3))
+                metric = "util"
+        if comp is None and ("utilization" in q or "utilisation" in q or "avg util" in q or "util " in q):
+            if ("below" in q or "under" in q):
+                comp = "<"; mt = re.search(r"(?:below|under)\s*(\d+(?:\.\d+)?)", q); thr = float(mt.group(1)) if mt else None; metric = "util"
+            elif ("above" in q or "over" in q):
+                comp = ">"; mt = re.search(r"(?:above|over)\s*(\d+(?:\.\d+)?)", q); thr = float(mt.group(1)) if mt else None; metric = "util"
+            elif re.search(r"less than or equal to|at most|no more than|not more than", q):
+                comp = "<="; mt = re.search(r"(?:less than or equal to|at most|no more than|not more than)\s*(\d+(?:\.\d+)?)", q); thr = float(mt.group(1)) if mt else None; metric = "util"
+            elif re.search(r"greater than or equal to|at least|no less than|not less than", q):
+                comp = ">="; mt = re.search(r"(?:greater than or equal to|at least|no less than|not less than)\s*(\d+(?:\.\d+)?)", q); thr = float(mt.group(1)) if mt else None; metric = "util"
+
+        # Revenue/Cost/Profit thresholds
+        if comp is None:
+            # Symbolic forms tied to metric keyword
+            metrics = (
+                ("revenue", ("revenue", "rev")),
+                ("cost", ("cost", "expense", "spend", "spending")),
+                ("profit", ("profit", "earnings")),
+            )
+            for met, kws in metrics:
+                pat = r"(?:" + "|".join(re.escape(k) for k in kws) + r")\s*(<=|>=|≤|≥|<|>)\s*(\d+(?:\.\d+)?)"
+                m2 = re.search(pat, q)
+                if m2:
+                    op = m2.group(1)
+                    comp = op if op in ("<", ">", "<=", ">=") else ("<=" if op == "≤" else ">=")
+                    thr = float(m2.group(2))
+                    metric = met
+                    break
+        if comp is None:
+            # Verbal strict/inclusive forms
+            if any(w in q for w in ("revenue", "rev")):
+                metric = "revenue"
+            elif any(w in q for w in ("cost", "expense", "spend", "spending")):
+                metric = "cost"
+            elif any(w in q for w in ("profit", "earnings")):
+                metric = "profit"
+            else:
+                metric = None
+
+            if metric is not None:
+                if ("below" in q or "under" in q):
+                    comp = "<"; mt = re.search(r"(?:below|under)\s*(\d+(?:\.\d+)?)", q); thr = float(mt.group(1)) if mt else None
+                elif ("above" in q or "over" in q):
+                    comp = ">"; mt = re.search(r"(?:above|over)\s*(\d+(?:\.\d+)?)", q); thr = float(mt.group(1)) if mt else None
+                elif re.search(r"less than or equal to|at most|no more than|not more than", q):
+                    comp = "<="; mt = re.search(r"(?:less than or equal to|at most|no more than|not more than)\s*(\d+(?:\.\d+)?)", q); thr = float(mt.group(1)) if mt else None
+                elif re.search(r"greater than or equal to|at least|no less than|not less than", q):
+                    comp = ">="; mt = re.search(r"(?:greater than or equal to|at least|no less than|not less than)\s*(\d+(?:\.\d+)?)", q); thr = float(mt.group(1)) if mt else None
+
+        if not comp or thr is None or not isinstance(data, list) or not data:
+            return data, columns
+
+        # Determine target metric and find appropriate column key
+        target = metric if 'metric' in locals() else None
+        keys = []
+        look = (columns or [])
+        if target == "util":
+            patterns = ("util", "utilization", "utilisation", "avgutil", "avg_util", "avg utilisation", "avg utilization")
+        elif target == "revenue":
+            patterns = ("revenue", "rev")
+        elif target == "cost":
+            patterns = ("cost", "expense", "spend", "spending")
+        elif target == "profit":
+            patterns = ("profit", "earnings")
+        else:
+            patterns = ("margin", "gross_margin", "grossmargin")
+        for k in look:
+            kl = str(k).lower()
+            if any(p in kl for p in patterns):
+                keys.append(k)
+        if not keys and isinstance(data[0], dict):
+            for k in data[0].keys():
+                kl = str(k).lower()
+                if any(p in kl for p in patterns):
+                    keys.append(k)
+        if not keys:
+            return data, columns
+        key = keys[0]
+
+        kept = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            v = row.get(key)
+            if isinstance(v, (int, float)):
+                vnum = float(v)
+            else:
+                vnum = _to_float_num(str(v))
+            if vnum is None:
+                continue
+            if (
+                (comp == '<' and vnum < thr) or
+                (comp == '>' and vnum > thr) or
+                (comp == '<=' and vnum <= thr) or
+                (comp == '>=' and vnum >= thr)
+            ):
+                kept.append(row)
+        # Debug: log threshold filtering result
+        try:
+            metric_name = target or "unknown"
+            print(f"[qa_engine] Threshold filter: metric={metric_name}, op={comp}, thr={thr} -> kept {len(kept)}/{len(data)}")
+        except Exception:
+            pass
+
+        return kept, columns
+    except Exception:
+        return data, columns
+
+
 def _format_data_keys(data: list, columns: list) -> list:
     """Rename keys in data rows to match formatted column names and format values."""
     if not data or not columns:
@@ -1434,6 +1610,8 @@ def ask(question: str, time_range: str = None) -> dict:
     
     if visual_type == "table":
         summary_text = _llm_table_name(summary_text, raw_columns, raw_data)
+        # Enforce explicit margin threshold if present in the question
+        raw_data, raw_columns = _filter_table_by_margin_threshold(question, raw_data, raw_columns)
         
         # Remove duplicate rows (LLM sometimes repeats data)
         if raw_data:
