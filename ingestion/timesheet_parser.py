@@ -241,7 +241,6 @@ def _map_columns(header, fields=None):
     if fields is None:
         fields = list(FIELD_PATTERNS.keys())
     mapped = {f: _smart_find_col(header, f) for f in fields}
-
     # Resolve conflicts: if two fields map to the same column, keep the more
     # specific one (max_hours beats billable_hours on the same column)
     idx_to_field = {}
@@ -734,12 +733,13 @@ def _parse_with_patterns(rows):
     merged = {}
     for h_idx in fortnight_headers:
         header = rows[h_idx]
-        col_map = _map_columns(header, ["name", "project", "leaves", "working_days", "max_hours"])
+        col_map = _map_columns(header, ["name", "project", "leaves", "working_days", "max_hours", "on_board_date"])
         fort_data = _extract_employees(rows, h_idx, col_map)
         for name, data in fort_data.items():
             if name not in merged:
                 merged[name] = {k: 0 for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "leave_days", "holiday_days", "working_days"]}
-                merged[name]["project"] = data["project"]
+                merged[name]["project"]       = data["project"]
+                merged[name]["on_board_date"] = data.get("on_board_date")
             for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "leave_days", "holiday_days", "working_days"]:
                 merged[name][k] += data.get(k, 0)
 

@@ -79,4 +79,5 @@ def normalize_record(rec: dict) -> dict:
         "is_profitable": rec.get("is_profitable"),
         "is_valid": rec.get("is_valid", True),
         "_source": rec.get("_source", "timesheet_parser"),
+        "on_board_date":          rec.get("on_board_date"),
     }
