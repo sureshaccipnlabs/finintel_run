@@ -9,6 +9,8 @@ import json
 import re
 import hashlib
 import time
+import os
+import logging
 
 from .dataset import (
     GLOBAL_DATASET, build_projects, build_monthly, build_overall_summary,
@@ -17,6 +19,22 @@ from .dataset import (
     _calc_margin
 )
 from .ai_mapper import _llm_generate, is_llm_available
+
+# ── Debug Logging Configuration ───────────────────────────────────────────────
+DEBUG = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
+
+_logger = logging.getLogger("qa_engine")
+if not _logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[%(asctime)s] [qa_engine] %(message)s", datefmt="%H:%M:%S"))
+    _logger.addHandler(_handler)
+    _logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+
+def _log(msg: str, level: str = "info"):
+    """Structured logger for qa_engine (respects DEBUG env var for debug level)."""
+    if level == "debug" and not DEBUG:
+        return
+    getattr(_logger, level if hasattr(_logger, level) else "info")(msg)
 
 # Use legacy forecast_ module (set USE_NEW_FORECAST=False to use old implementation)
 USE_NEW_FORECAST = False  # Set to True to use new OOP module
@@ -562,6 +580,62 @@ def _build_dataset_context(records=None, question: str = None):
                 f"BestRevenueMonth={best_rev_month}, WorstRevenueMonth={worst_rev_month}"
             )
         lines.append("")
+
+    # Month-specific data section - ADD when specific month is mentioned
+    # This provides accurate month-specific metrics without breaking trend/comparison queries
+    if scope and scope.get("specific_month"):
+        month_key = scope["specific_month"].lower()
+        # Find full month name for display
+        month_names = {
+            "jan": "January", "feb": "February", "mar": "March", "apr": "April",
+            "may": "May", "jun": "June", "jul": "July", "aug": "August",
+            "sep": "September", "oct": "October", "nov": "November", "dec": "December",
+            "january": "January", "february": "February", "march": "March", "april": "April",
+            "june": "June", "july": "July", "august": "August",
+            "september": "September", "october": "October", "november": "November", "december": "December"
+        }
+        display_month = month_names.get(month_key, month_key.capitalize())
+        
+        # Filter records for this specific month
+        month_filtered_recs = [r for r in recs if month_key in (r.get("month") or "").lower()]
+        
+        if month_filtered_recs:
+            lines.append(f"=== DATA FOR {display_month.upper()} ONLY ===")
+            lines.append(f"NOTE: Use this section when answering questions about {display_month} specifically.")
+            
+            # Build month-specific project data
+            month_projects = build_projects(month_filtered_recs)
+            if month_projects:
+                lines.append("Projects:")
+                for name, data in sorted(month_projects.items(), key=lambda x: x[1]["revenue"], reverse=True):
+                    proj_revenue = float(data.get("revenue") or 0)
+                    proj_cost = float(data.get("cost") or 0)
+                    proj_profit = proj_revenue - proj_cost
+                    proj_margin = round((proj_profit / proj_revenue) * 100, 2) if proj_revenue > 0 else 0
+                    lines.append(
+                        f"- {name}: Revenue=${proj_revenue:,.2f}, Cost=${proj_cost:,.2f}, "
+                        f"Profit=${proj_profit:,.2f}, Margin={proj_margin}%"
+                    )
+            
+            # Build month-specific employee data
+            month_employees = build_employee_summaries(month_filtered_recs)
+            if month_employees:
+                lines.append("Employees:")
+                for emp in sorted(month_employees, key=lambda x: x.get('total_revenue') or 0, reverse=True)[:10]:
+                    lines.append(
+                        f"- {emp['employee_name']}: Revenue=${emp['total_revenue']:,.2f}, "
+                        f"Profit=${emp['total_profit']:,.2f}, Hours={emp['total_hours']}, "
+                        f"Utilization={emp.get('utilization_pct') or 0}%"
+                    )
+            
+            # Month totals
+            month_overall = build_overall_summary(month_filtered_recs)
+            lines.append(
+                f"Month Totals: Revenue=${month_overall['total_revenue']:,.2f}, "
+                f"Cost=${month_overall['total_cost']:,.2f}, Profit=${month_overall['total_profit']:,.2f}, "
+                f"Margin={month_overall['avg_margin_pct']}%"
+            )
+            lines.append("")
 
     # Monthly - include if needed (sorted chronologically)
     if include_all or scope.get("needs_monthly"):
@@ -1365,7 +1439,7 @@ def ask(question: str, time_range: str = None) -> dict:
     data_hash = _compute_dataset_hash(records)
     cached_response = _get_cached_response(question, data_hash)
     if cached_response:
-        print(f"[qa_engine] Total time: {time.time() - _start_time:.2f}s (cached)")
+        _log(f"Total time: {time.time() - _start_time:.2f}s (cached)")
         return cached_response
 
     # Forecast intent: use AI forecaster
@@ -1373,7 +1447,7 @@ def ask(question: str, time_range: str = None) -> dict:
     _fc_start = time.time()
     _forecast_module = "forecast (OOP)" if _USING_NEW_FORECAST else "forecast_ (legacy)"
     fc_answer = try_answer_forecast(question, records)
-    print(f"[qa_engine] Forecast check took {time.time() - _fc_start:.2f}s (module={_forecast_module}, likely_forecast={is_likely_forecast(question)})")
+    _log(f"Forecast check took {time.time() - _fc_start:.2f}s (module={_forecast_module}, likely_forecast={is_likely_forecast(question)})", level="debug")
     if fc_answer is not None:
         rows = _extract_rows(fc_answer)
         if rows:
@@ -1460,7 +1534,7 @@ def ask(question: str, time_range: str = None) -> dict:
             "sources": {},
         }
 
-    print(f"[qa_engine] Total time: {time.time() - _start_time:.2f}s")
+    _log(f"Total time: {time.time() - _start_time:.2f}s")
     # Parse the JSON from the LLM
     parsed_json = _extract_qa_json(raw_response)
     

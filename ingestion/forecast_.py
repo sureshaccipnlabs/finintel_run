@@ -1,15 +1,27 @@
 import math
 import re
 import os
+import logging
 import datetime as dt
 from typing import List, Dict, Optional, Tuple
 
+# Respect both DEBUG and DEBUG_FORECAST env vars
+DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 DEBUG_FORECAST = os.environ.get("DEBUG_FORECAST", "").lower() in ("1", "true", "yes")
+_DEBUG_ENABLED = DEBUG or DEBUG_FORECAST
+
+# Structured logger for forecast_
+_f_logger = logging.getLogger("forecast_")
+if not _f_logger.handlers:
+    _f_handler = logging.StreamHandler()
+    _f_handler.setFormatter(logging.Formatter("[%(asctime)s] [forecast_] %(message)s", datefmt="%H:%M:%S"))
+    _f_logger.addHandler(_f_handler)
+    _f_logger.setLevel(logging.DEBUG if _DEBUG_ENABLED else logging.INFO)
 
 
 def _debug(msg: str):
-    if DEBUG_FORECAST:
-        print(f"[forecast_ DEBUG] {msg}")
+    if _DEBUG_ENABLED:
+        _f_logger.debug(msg)
 
 
 from .dataset import (
@@ -1525,6 +1537,27 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         elif llm_horizon_type == "explicit_quarter":
             pass  # explicit_quarter already set
 
+        # Prefer explicit month names in the question over a generic months_n from LLM
+        # Example: "Forecast revenue ... September" should target September, not next month
+        if not explicit_months:
+            regex_months = _find_target_months(question, base)
+            if regex_months:
+                explicit_months = regex_months
+                months_n = None
+                quarters_n = None
+
+        # Prefer explicit quarter mention like "q3" or "q 3" when LLM didn't provide it
+        if explicit_quarter is None:
+            m_q = re.search(r"(?i)\bq\s*([1-4])\b", question)
+            if m_q:
+                qn = int(m_q.group(1))
+                curr_q = ((base.month - 1) // 3) + 1
+                year = base.year if qn >= curr_q else base.year + 1
+                start_month = dt.date(year, (qn - 1) * 3 + 1, 1)
+                explicit_quarter = (qn, year, start_month, f"Q{qn} {year}")
+                months_n = None
+                quarters_n = None
+
         # Default horizon if none specified
         if not months_n and not quarters_n and not explicit_months and not explicit_quarter:
             # Check for year-only patterns like "forecast for 2027" before defaulting
@@ -1532,14 +1565,57 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
             if year_months:
                 explicit_months = year_months
             else:
+                # Final fallback: default to next month
                 months_n = 1  # default to next month
 
-        # Metrics
-        metrics = llm_metrics if llm_metrics else ["revenue", "profit"]
+        # Metrics — prefer LLM metrics; otherwise do a light keyword scan before defaulting
+        if llm_metrics:
+            metrics = llm_metrics
+        else:
+            ql = (question or "").lower()
+            scan_pairs = [
+                ("revenue", "revenue"),
+                ("profit", "profit"),
+                ("cost", "cost"),
+                ("total hours", "total_hours"),
+                ("hours", "total_hours"),
+                ("utilization", "utilization"),
+                ("utilisation", "utilization"),
+                ("headcount", "headcount"),
+                ("vacation days", "vacation_days"),
+                ("vacation", "vacation_days"),
+                ("leave days", "leave_days"),
+                ("leaves", "leave_days"),
+                ("holidays", "holiday_days"),
+                ("holiday", "holiday_days"),
+                ("working days", "working_days"),
+                ("workdays", "working_days"),
+            ]
+            found: List[str] = []
+            for kw, m in scan_pairs:
+                if kw in ql and m not in found:
+                    found.append(m)
+            metrics = found if found else ["revenue", "profit"]
 
         # Scope and targets
         scope = llm_scope if llm_scope in ("overall", "project", "employee") else "overall"
         targets: List[str] = []
+
+        # Fix: If LLM provides targets but scope is "overall", infer scope from target type
+        if llm_targets and scope == "overall":
+            # Check if targets match known projects or employees
+            kp_lower = {p.lower() for p in known_projects}
+            ke_lower = {e.lower() for e in known_emps}
+            for t in llm_targets:
+                t_lower = t.lower()
+                if any(t_lower in p or p in t_lower for p in kp_lower):
+                    scope = "project"
+                    _debug(f"Inferred scope='project' from target '{t}'")
+                    break
+                elif any(t_lower in e or e in t_lower for e in ke_lower):
+                    scope = "employee"
+                    _debug(f"Inferred scope='employee' from target '{t}'")
+                    break
 
         # Validate and match targets
         if scope == "project" and llm_targets:
@@ -1555,8 +1631,26 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
                             matched.append(orig)
             matched = sorted(set(matched))
             if not matched:
-                return f"Project not found\n- No matching project for '{', '.join(llm_targets)}'"
-            targets = matched
+                # Cross-entity fallback: if targets match employees, switch scope
+                ke_norm = {_norm_key(e): e for e in known_emps}
+                matched_e: List[str] = []
+                for t in llm_targets:
+                    nn = _norm_key(t)
+                    if nn in ke_norm:
+                        matched_e.append(ke_norm[nn])
+                    else:
+                        for kn, orig in ke_norm.items():
+                            if nn and (nn in kn or kn in nn):
+                                matched_e.append(orig)
+                matched_e = sorted(set(matched_e))
+                if matched_e:
+                    _debug(f"LLM scope 'project' had no project matches; switching to employee targets: {matched_e}")
+                    scope = "employee"
+                    targets = matched_e
+                else:
+                    return f"Project not found\n- No matching project for '{', '.join(llm_targets)}'"
+            else:
+                targets = matched
         elif scope == "employee" and llm_targets:
             ke_norm = {_norm_key(e): e for e in known_emps}
             matched_e: List[str] = []
@@ -1570,8 +1664,26 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
                             matched_e.append(orig)
             matched_e = sorted(set(matched_e))
             if not matched_e:
-                return f"Employee not found\n- No matching employee for '{', '.join(llm_targets)}'"
-            targets = matched_e
+                # Cross-entity fallback: if targets match projects, switch scope
+                kp_norm = {_norm_key(p): p for p in known_projects}
+                matched_p: List[str] = []
+                for t in llm_targets:
+                    nn = _norm_key(t)
+                    if nn in kp_norm:
+                        matched_p.append(kp_norm[nn])
+                    else:
+                        for kn, orig in kp_norm.items():
+                            if nn and (nn in kn or kn in nn):
+                                matched_p.append(orig)
+                matched_p = sorted(set(matched_p))
+                if matched_p:
+                    _debug(f"LLM scope 'employee' had no employee matches; switching to project targets: {matched_p}")
+                    scope = "project"
+                    targets = matched_p
+                else:
+                    return f"Employee not found\n- No matching employee for '{', '.join(llm_targets)}'"
+            else:
+                targets = matched_e
 
     else:
         # --- Regex-based fallback (when LLM unavailable or says not a forecast) ---
