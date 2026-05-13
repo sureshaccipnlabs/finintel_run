@@ -734,7 +734,9 @@ def _parse_with_patterns(rows):
     merged = {}
     for h_idx in fortnight_headers:
         header = rows[h_idx]
-        col_map = _map_columns(header, ["name", "project", "leaves", "working_days", "max_hours"])
+        col_map = _map_columns(header, ["name", "project", "leaves", "working_days",
+                                        "max_hours", "on_board_date", "role",
+                                        "status", "billable_hours_per_day"])
         fort_data = _extract_employees(rows, h_idx, col_map)
         for name, data in fort_data.items():
             if name not in merged:
@@ -742,6 +744,10 @@ def _parse_with_patterns(rows):
                 merged[name]["project"] = data["project"]
             for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "leave_days", "holiday_days", "working_days"]:
                 merged[name][k] += data.get(k, 0)
+            # Carry metadata fields from first fortnight (non-additive)
+            for meta_k in ["on_board_date", "role", "active", "joining_status", "billable_hours_per_day"]:
+                if not merged[name].get(meta_k) and data.get(meta_k) is not None:
+                    merged[name][meta_k] = data[meta_k]
 
     # Overlay summary (rates + authoritative totals)
     if summary_headers:
@@ -770,6 +776,10 @@ def _parse_with_patterns(rows):
                         merged[name]["vacation_days"] = sm["vacation_days"]
                     if sm.get("leave_days"):
                         merged[name]["leave_days"] = sm["leave_days"]
+                    # Pull metadata from summary if not already set from fortnights
+                    for meta_k in ["on_board_date", "role", "active", "joining_status", "billable_hours_per_day"]:
+                        if not merged[name].get(meta_k) and sm.get(meta_k) is not None:
+                            merged[name][meta_k] = sm[meta_k]
                 else:
                     merged[name].setdefault("billing_rate", 0)
                     merged[name].setdefault("cost_rate", 0)
