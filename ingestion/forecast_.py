@@ -1458,7 +1458,18 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         _debug("No months available, returning insufficient data message")
         return "Insufficient historical data to estimate a forecast."
     last_label = months[-1]
-    base = _parse_month_date(last_label) or dt.date.today().replace(day=1)
+    # Determine anchor: today for "next" phrasing, else last data month
+    anchor_today = bool(
+        re.search(r"\bnext\s+\d+\s*(months?|quarters?)\b", q)
+        or any(w in q for w in [
+            "next month", "next quarter", "next year",
+            "coming month", "coming months", "upcoming",
+            "from today", "from now"
+        ])
+    )
+    base_from_data = _parse_month_date(last_label)
+    base = dt.date.today().replace(day=1) if anchor_today else (base_from_data or dt.date.today().replace(day=1))
+    _debug(f"Forecast anchor: {'today' if anchor_today else 'data_last'}; base={base.strftime('%B %Y')}")
 
     # Collect known entities for LLM context
     known_projects = _distinct_values(recs, "project")
