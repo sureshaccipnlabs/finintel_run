@@ -29,6 +29,7 @@ from .dataset import (
     get_months_available,
     _parse_month_date,
     GLOBAL_DATASET,
+    match_entities_by_word_boundary,
 )
 from .ai_mapper import _llm_generate, is_llm_available, _extract_json
 
@@ -1496,6 +1497,8 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
     known_emps = _distinct_values(recs, "employee")
     _debug(f"Known projects: {known_projects[:5]}..., Known employees: {known_emps[:5]}...")
 
+    # Use shared matcher from dataset for consistent entity resolution across modules
+
     # --- LLM-based question parsing (only if keyword check passed) ---
     llm_parsed = _llm_parse_question(question, known_projects, known_emps)
     use_llm = llm_parsed and llm_parsed.get("is_forecast") is True
@@ -1619,30 +1622,10 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
 
         # Validate and match targets
         if scope == "project" and llm_targets:
-            kp_norm = {_norm_key(p): p for p in known_projects}
-            matched: List[str] = []
-            for t in llm_targets:
-                nn = _norm_key(t)
-                if nn in kp_norm:
-                    matched.append(kp_norm[nn])
-                else:
-                    for kn, orig in kp_norm.items():
-                        if nn and (nn in kn or kn in nn):
-                            matched.append(orig)
-            matched = sorted(set(matched))
+            matched: List[str] = match_entities_by_word_boundary(llm_targets, known_projects)
             if not matched:
                 # Cross-entity fallback: if targets match employees, switch scope
-                ke_norm = {_norm_key(e): e for e in known_emps}
-                matched_e: List[str] = []
-                for t in llm_targets:
-                    nn = _norm_key(t)
-                    if nn in ke_norm:
-                        matched_e.append(ke_norm[nn])
-                    else:
-                        for kn, orig in ke_norm.items():
-                            if nn and (nn in kn or kn in nn):
-                                matched_e.append(orig)
-                matched_e = sorted(set(matched_e))
+                matched_e: List[str] = match_entities_by_word_boundary(llm_targets, known_emps)
                 if matched_e:
                     _debug(f"LLM scope 'project' had no project matches; switching to employee targets: {matched_e}")
                     scope = "employee"
@@ -1652,30 +1635,10 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
             else:
                 targets = matched
         elif scope == "employee" and llm_targets:
-            ke_norm = {_norm_key(e): e for e in known_emps}
-            matched_e: List[str] = []
-            for t in llm_targets:
-                nn = _norm_key(t)
-                if nn in ke_norm:
-                    matched_e.append(ke_norm[nn])
-                else:
-                    for kn, orig in ke_norm.items():
-                        if nn and (nn in kn or kn in nn):
-                            matched_e.append(orig)
-            matched_e = sorted(set(matched_e))
+            matched_e: List[str] = match_entities_by_word_boundary(llm_targets, known_emps)
             if not matched_e:
                 # Cross-entity fallback: if targets match projects, switch scope
-                kp_norm = {_norm_key(p): p for p in known_projects}
-                matched_p: List[str] = []
-                for t in llm_targets:
-                    nn = _norm_key(t)
-                    if nn in kp_norm:
-                        matched_p.append(kp_norm[nn])
-                    else:
-                        for kn, orig in kp_norm.items():
-                            if nn and (nn in kn or kn in nn):
-                                matched_p.append(orig)
-                matched_p = sorted(set(matched_p))
+                matched_p: List[str] = match_entities_by_word_boundary(llm_targets, known_projects)
                 if matched_p:
                     _debug(f"LLM scope 'employee' had no employee matches; switching to project targets: {matched_p}")
                     scope = "project"
@@ -1718,17 +1681,7 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         # Extra: if a concrete 'project X' was asked, try to map to known projects; if no match, stop early
         req_projects = _extract_requested_projects(question)
         if req_projects:
-            kp_norm = {_norm_key(p): p for p in known_projects}
-            matched: List[str] = []
-            for rp in req_projects:
-                nn = _norm_key(rp)
-                if nn in kp_norm:
-                    matched.append(kp_norm[nn])
-                else:
-                    for kn, orig in kp_norm.items():
-                        if nn and (nn in kn or kn in nn):
-                            matched.append(orig)
-            matched = sorted(set(matched))
+            matched: List[str] = match_entities_by_word_boundary(req_projects, known_projects)
             if not matched:
                 return f"Project not found\n- No matching project for '{', '.join(req_projects)}'"
             scope = "project"
@@ -1737,17 +1690,7 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         # Extra: explicit employee guard
         req_employees = _extract_requested_employees(question)
         if req_employees:
-            ke_norm = {_norm_key(e): e for e in known_emps}
-            matched_e: List[str] = []
-            for re_emp in req_employees:
-                nn = _norm_key(re_emp)
-                if nn in ke_norm:
-                    matched_e.append(ke_norm[nn])
-                else:
-                    for kn, orig in ke_norm.items():
-                        if nn and (nn in kn or kn in nn):
-                            matched_e.append(orig)
-            matched_e = sorted(set(matched_e))
+            matched_e: List[str] = match_entities_by_word_boundary(req_employees, known_emps)
             if not matched_e:
                 return f"Employee not found\n- No matching employee for '{', '.join(req_employees)}'"
             scope = "employee"

@@ -16,7 +16,7 @@ from .dataset import (
     GLOBAL_DATASET, build_projects, build_monthly, build_overall_summary,
     build_top_performers, build_risks, get_months_available, filter_by_range,
     build_employee_summaries, set_on_dataset_change_callback, _trend_from_values,
-    _calc_margin
+    _calc_margin, match_entities_by_word_boundary
 )
 from .ai_mapper import _llm_generate, is_llm_available
 
@@ -349,6 +349,7 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
                 # Definitely a project
                 scope["needs_projects"] = True
                 scope["specific_project"] = actual_projects_original.get(word_clean, word.title())
+                _log(f"Detected project: '{word_clean}' -> '{scope['specific_project']}'", "debug")
             elif is_employee and not is_project:
                 # Definitely an employee
                 scope["needs_employee_summary"] = True
@@ -386,6 +387,24 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
                 scope["specific_employee"] = name
                 break
     
+    # Apply shared entity matcher to reinforce specific project/employee detection
+    try:
+        projects_list = list(actual_projects_original.values()) if actual_projects_original else []
+        employees_list = list(actual_employees_original.values()) if actual_employees_original else []
+        matched_projects = match_entities_by_word_boundary([question], projects_list) if question else []
+        matched_employees = match_entities_by_word_boundary([question], employees_list) if question else []
+        if matched_projects and not scope.get("specific_project"):
+            scope["needs_projects"] = True
+            if len(matched_projects) == 1:
+                scope["specific_project"] = matched_projects[0]
+        if matched_employees and not scope.get("specific_employee"):
+            scope["needs_employee_summary"] = True
+            scope["needs_employee_details"] = True
+            if len(matched_employees) == 1:
+                scope["specific_employee"] = matched_employees[0]
+    except Exception:
+        pass
+
     # For project utilization questions, ONLY need PROJECTS section (not employees)
     is_project_util_question = ("project" in q) and any(w in q for w in ["utilization", "utilisation", "util"])
     
@@ -506,9 +525,13 @@ def _build_dataset_context(records=None, question: str = None):
                 proj_billable[proj] = 0.0
                 proj_util_values[proj] = []
             if month not in proj_monthly[proj]:
-                proj_monthly[proj][month] = {"rev": 0.0, "cost": 0.0}
+                proj_monthly[proj][month] = {"rev": 0.0, "cost": 0.0, "util_vals": []}
             proj_monthly[proj][month]["rev"] += float(r.get("revenue") or 0)
             proj_monthly[proj][month]["cost"] += float(r.get("cost") or 0)
+            # Track utilization per month for monthly trends
+            util_pct_month = r.get("utilisation_pct")
+            if util_pct_month is not None and util_pct_month > 0:
+                proj_monthly[proj][month]["util_vals"].append(float(util_pct_month))
             proj_billable[proj] += float(r.get("billable_hours") or 0)
             # Collect utilisation_pct for averaging
             util_pct = r.get("utilisation_pct")
@@ -528,11 +551,37 @@ def _build_dataset_context(records=None, question: str = None):
         sorted_by_profit = sorted(projects.items(), key=lambda x: x[1].get("profit", 0), reverse=True)
         
         lines.append("=== PROJECTS ===")
-        lines.append(f"RANKING HINTS: HighestUtilization={sorted_by_util[0][0]}, LowestUtilization={sorted_by_util[-1][0]}, "
-                     f"HighestRevenue={sorted_by_revenue[0][0]}, LowestRevenue={sorted_by_revenue[-1][0]}, "
-                     f"HighestCost={sorted_by_cost[-1][0]}, LowestCost={sorted_by_cost[0][0]}, "
-                     f"HighestProfit={sorted_by_profit[0][0]}, LowestProfit={sorted_by_profit[-1][0]}")
-        for name, data in sorted(projects.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        lines.append(f"AVAILABLE PROJECTS (use EXACT names): {', '.join(sorted(projects.keys()))}")
+        
+        # Filter to specific project if requested
+        specific_proj = scope.get("specific_project") if scope else None
+        _log(f"Building context: specific_project={specific_proj}, all_projects={list(projects.keys())}", "debug")
+        if specific_proj:
+            # Case-insensitive match to find the actual project name
+            specific_proj_lower = specific_proj.lower()
+            matched_proj = None
+            for p in projects.keys():
+                if p.lower() == specific_proj_lower:
+                    matched_proj = p
+                    break
+            if matched_proj:
+                _log(f"Filtering to project: {matched_proj}", "debug")
+                lines.append(f">>> IMPORTANT: User is asking about PROJECT '{matched_proj}' ONLY. Use ONLY the data below for '{matched_proj}'. <<<")
+                lines.append(f"FILTERED TO PROJECT: {matched_proj}")
+                projects_to_show = {matched_proj: projects[matched_proj]}
+            else:
+                _log(f"Project '{specific_proj}' not found in {list(projects.keys())}", "debug")
+                lines.append(f"WARNING: Requested project '{specific_proj}' not found. Showing all projects.")
+                projects_to_show = projects
+        else:
+            projects_to_show = projects
+        
+        if not specific_proj:
+            lines.append(f"RANKING HINTS: HighestUtilization={sorted_by_util[0][0]}, LowestUtilization={sorted_by_util[-1][0]}, "
+                         f"HighestRevenue={sorted_by_revenue[0][0]}, LowestRevenue={sorted_by_revenue[-1][0]}, "
+                         f"HighestCost={sorted_by_cost[-1][0]}, LowestCost={sorted_by_cost[0][0]}, "
+                         f"HighestProfit={sorted_by_profit[0][0]}, LowestProfit={sorted_by_profit[-1][0]}")
+        for name, data in sorted(projects_to_show.items(), key=lambda x: x[1]["revenue"], reverse=True):
             proj_revenue = float(data.get("revenue") or 0)
             proj_cost = float(data.get("cost") or 0)
             proj_margin = round(((proj_revenue - proj_cost) / proj_revenue) * 100, 2) if proj_revenue > 0 else 0
@@ -552,11 +601,17 @@ def _build_dataset_context(records=None, question: str = None):
             cost_series = [monthly_data[m]["cost"] for m in sorted_months]
             profit_series = [monthly_data[m]["rev"] - monthly_data[m]["cost"] for m in sorted_months]
             margin_series = [_calc_margin(monthly_data[m]["rev"], monthly_data[m]["cost"]) for m in sorted_months]
+            # Calculate per-month utilization averages
+            util_series = []
+            for m in sorted_months:
+                uvals = monthly_data[m].get("util_vals", [])
+                util_series.append(round(sum(uvals) / len(uvals), 2) if uvals else 0)
             
             rev_trend = _trend_from_values(revenue_series)
             cost_trend = _trend_from_values(cost_series)
             profit_trend = _trend_from_values(profit_series)
             margin_trend = _trend_from_values(margin_series)
+            util_trend = _trend_from_values(util_series)
             billable_hrs = round(proj_billable.get(name, 0), 2)
             
             # Calculate AvgUtilisation from employee utilisation_pct values
@@ -576,8 +631,9 @@ def _build_dataset_context(records=None, question: str = None):
                 f"Profit=${data['profit']:,.2f}, GrossMargin={proj_margin}%, "
                 f"AvgUtilisation={avg_util}%, Employees={data['employees']}, "
                 f"BillableHours={billable_hrs}, Status={proj_status}, "
-                f"RevenueTrend={rev_trend}, CostTrend={cost_trend}, ProfitTrend={profit_trend}, MarginTrend={margin_trend}, "
-                f"BestRevenueMonth={best_rev_month}, WorstRevenueMonth={worst_rev_month}"
+                f"RevenueTrend={rev_trend}, CostTrend={cost_trend}, ProfitTrend={profit_trend}, MarginTrend={margin_trend}, UtilTrend={util_trend}, "
+                f"BestRevenueMonth={best_rev_month}, WorstRevenueMonth={worst_rev_month}, "
+                f"MonthlyBreakdown=[{', '.join(f'{m}:Rev=${monthly_data[m]["rev"]:,.0f}/Cost=${monthly_data[m]["cost"]:,.0f}/Util={round(sum(monthly_data[m].get("util_vals", [0])) / max(len(monthly_data[m].get("util_vals", [1])), 1), 1)}%' for m in sorted_months)}]"
             )
         lines.append("")
 
@@ -781,6 +837,9 @@ Q: "Compare Project Alpha vs Project Beta"
 Q: "Top 3 employees in Project Alpha"
 {{"summary": "Top 3 employees in Project Alpha by profit.", "visual_type": "table", "columns": ["employee", "project", "profit"], "data": [{{"employee": "John", "project": "Alpha", "profit": 8000}}, {{"employee": "Jane", "project": "Alpha", "profit": 6000}}, {{"employee": "Bob", "project": "Alpha", "profit": 4000}}]}}
 
+Q: "Barclays project details" or "Project X details"
+{{"summary": "BARCLAYS project details: Revenue=$50,000, Cost=$30,000, Profit=$20,000, Margin=40%, Utilization=85%, Employees=5, Status=Healthy", "visual_type": "metric", "columns": [], "data": [{{"label": "Revenue", "value": 50000}}, {{"label": "Cost", "value": 30000}}, {{"label": "Profit", "value": 20000}}, {{"label": "Margin %", "value": 40}}, {{"label": "Utilization %", "value": 85}}, {{"label": "Employees", "value": 5}}, {{"label": "Status", "value": "Healthy"}}]}}
+
 RULES:
 1. "metric" for totals, counts, averages, summaries - use label/value pairs
 2. "table" for lists, rankings, breakdowns with multiple columns
@@ -801,6 +860,14 @@ RULES:
 17. For "top N in Project X" = filter by project first, then rank
 18. IMPORTANT: For "project utilization" or "which project has highest/lowest utilization", ONLY use "AvgUtilisation" from PROJECTS section. NEVER use IndividualUtilisation from EMPLOYEES section for project-level questions.
 19. When comparing numbers, 96.6 > 96.0 > 95.0. Always compare the actual numeric values, not just the first digits.
+
+ANTI-HALLUCINATION (CRITICAL):
+20. ONLY use data explicitly provided in the context above. NEVER invent, estimate, or assume values.
+21. If a project/employee name is asked but NOT found in the data, respond: {{"summary": "No data found for [name]. Available projects: [list from data]", "visual_type": "text", "columns": [], "data": []}}
+22. Project names are CASE-SENSITIVE and must match EXACTLY as shown in PROJECTS section (e.g., "BARCLAYS" not "Barclays", "CRYSTAL" not "Crystal").
+23. If the question mentions a name similar to but not exactly matching a project/employee, clarify: "Did you mean [exact name from data]?"
+24. NEVER mix data from different projects. Each project's metrics are independent.
+25. For monthly breakdowns, ONLY use months explicitly listed in MonthlyBreakdown for that specific project.
 """
 
 
@@ -1517,7 +1584,18 @@ def ask(question: str, time_range: str = None) -> dict:
     # Build targeted context based on question (smart context selection)
     _ctx_start = time.time()
     context = _get_cached_context(records, question=question)
-    print(f"[qa_engine] Context build took {time.time() - _ctx_start:.2f}s")
+    _log(f"Context build took {time.time() - _ctx_start:.2f}s")
+    
+    # Debug: log context details
+    context_lines = context.split('\n')
+    context_sections = [l for l in context_lines if l.startswith('===')]
+    has_filter = any('FILTERED TO PROJECT' in l or 'IMPORTANT:' in l for l in context_lines)
+    _log(f"Context sections: {context_sections}", "debug")
+    _log(f"Context length: {len(context)} chars, {len(context_lines)} lines", "debug")
+    _log(f"Project filter active: {has_filter}", "debug")
+    if DEBUG:
+        # Log full context in debug mode
+        _log(f"--- FULL CONTEXT START ---\n{context}\n--- FULL CONTEXT END ---", "debug")
     
     prompt = _QA_PROMPT.format(context=context, question=question)
 
