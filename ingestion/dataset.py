@@ -408,6 +408,7 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
                 "working_days": 0.0,
                 "monthly": {},
                 "projects": {},
+                "designation": "",
             }
 
         emp = employees[employee_name]
@@ -419,6 +420,8 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
         emp["vacation_days"] += vacation_days
         emp["leave_days"] += leave_days
         emp["working_days"] += working_days
+        if not emp["designation"] and r.get("designation"):
+            emp["designation"] = r["designation"]
 
         month = r.get("month") or "Unknown"
         if month not in emp["monthly"]:
@@ -482,6 +485,7 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
 
         output.append({
             "employee_name": employee_name,
+            "designation": data.get("designation") or None,
             "total_hours": round(data["hours"], 2),
             "total_revenue": round(data["revenue"], 2),
             "total_cost": round(data["cost"], 2),
@@ -504,6 +508,178 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
 
     output.sort(key=lambda x: x["total_profit"], reverse=True)
     return output
+
+
+def _name_matches(candidate: str, search: str) -> bool:
+    """Case-insensitive: True when search appears anywhere in candidate (full-word or partial)."""
+    return search.lower() in candidate.lower()
+
+
+def get_employee_detail(name: str, time_range: Optional[str] = None) -> Optional[dict]:
+    """
+    Return a comprehensive merged profile for a single employee by name.
+
+    Matches case-insensitively. Aggregates records from ALL source files
+    (Crystal, Barclays, etc.) that belong to this employee.
+    Projects are kept separate (no double-counting: dedup by month+project).
+    """
+    records = filter_by_range(GLOBAL_DATASET, time_range)
+
+    # Collect all records for this employee (case-insensitive partial match)
+    emp_records = [r for r in records if _name_matches(r.get("employee") or "", name)]
+    if not emp_records:
+        return None
+
+    # Use the canonical name from the first matching record (preserve original casing)
+    canonical_name = emp_records[0]["employee"]
+
+    # ── Designation: first non-empty value across all records ──────────────
+    designation = next(
+        (r["designation"] for r in emp_records if r.get("designation")),
+        None,
+    )
+
+    # ── Build per-project aggregates ───────────────────────────────────────
+    projects: dict = {}
+    seen_month_project: set = set()
+    for r in emp_records:
+        proj = r.get("project") or "Unknown"
+        mon  = r.get("month") or "Unknown"
+        dedup_key = (_normalize_key(mon), _normalize_key(proj))
+        if dedup_key in seen_month_project:
+            continue
+        seen_month_project.add(dedup_key)
+
+        if proj not in projects:
+            projects[proj] = {
+                "project_name": proj,
+                "months": [],
+                "total_hours": 0.0,
+                "total_billable_hours": 0.0,
+                "total_expected_hours": 0.0,
+                "total_revenue": 0.0,
+                "total_cost": 0.0,
+                "total_profit": 0.0,
+                "billing_rate": r.get("billing_rate") or 0.0,
+                "cost_rate": r.get("cost_rate") or 0.0,
+                "vacation_days": 0.0,
+                "working_days": 0.0,
+                "source_files": set(),
+            }
+        p = projects[proj]
+        if mon not in p["months"]:
+            p["months"].append(mon)
+        p["total_hours"]          += _to_num(r.get("actual_hours"))
+        p["total_billable_hours"] += _to_num(r.get("billable_hours"))
+        p["total_expected_hours"] += _to_num(r.get("expected_hours"))
+        p["total_revenue"]        += _to_num(r.get("revenue"))
+        p["total_cost"]           += _to_num(r.get("cost"))
+        p["total_profit"]         += _to_num(r.get("revenue")) - _to_num(r.get("cost"))
+        p["vacation_days"]        += _to_num(r.get("vacation_days"))
+        p["working_days"]         += _to_num(r.get("working_days"))
+        if not p["billing_rate"] and r.get("billing_rate"):
+            p["billing_rate"] = r["billing_rate"]
+        if not p["cost_rate"] and r.get("cost_rate"):
+            p["cost_rate"] = r["cost_rate"]
+        if r.get("_source_file"):
+            p["source_files"].add(r["_source_file"])
+
+    # ── Finalise project entries ───────────────────────────────────────────
+    project_list = []
+    for p in projects.values():
+        months_sorted = sorted(p["months"], key=lambda m: _parse_month_date(m) or dt.date.min)
+        utilisation = (
+            round(p["total_hours"] / p["total_expected_hours"] * 100, 2)
+            if p["total_expected_hours"] > 0 else None
+        )
+        margin_pct = _calc_margin(p["total_revenue"], p["total_cost"])
+        project_list.append({
+            "project_name":          p["project_name"],
+            "months":                months_sorted,
+            "month_count":           len(months_sorted),
+            "total_hours":           round(p["total_hours"], 2),
+            "total_billable_hours":  round(p["total_billable_hours"], 2),
+            "total_expected_hours":  round(p["total_expected_hours"], 2),
+            "utilisation_pct":       utilisation,
+            "total_revenue":         round(p["total_revenue"], 2),
+            "total_cost":            round(p["total_cost"], 2),
+            "total_profit":          round(p["total_profit"], 2),
+            "gross_margin_pct":      margin_pct,
+            "billing_rate":          p["billing_rate"],
+            "cost_rate":             p["cost_rate"],
+            "vacation_days":         round(p["vacation_days"], 1),
+            "working_days":          round(p["working_days"], 1),
+            "source_files":          sorted(p["source_files"]),
+        })
+    project_list.sort(key=lambda x: x["total_hours"], reverse=True)
+
+    # ── Combined totals (across all projects, deduped) ─────────────────────
+    total_hours    = round(sum(p["total_hours"]    for p in project_list), 2)
+    total_revenue  = round(sum(p["total_revenue"]  for p in project_list), 2)
+    total_cost     = round(sum(p["total_cost"]     for p in project_list), 2)
+    total_profit   = round(total_revenue - total_cost, 2)
+    total_expected = round(sum(p["total_expected_hours"] for p in project_list), 2)
+    total_vacation = round(sum(p["vacation_days"]  for p in project_list), 1)
+    total_working  = round(sum(p["working_days"]   for p in project_list), 1)
+    overall_util   = round(total_hours / total_expected * 100, 2) if total_expected > 0 else None
+    leave_pct      = round(total_vacation / total_working * 100, 2) if total_working > 0 else 0.0
+    attendance_pct = round(100.0 - leave_pct, 2)
+    gross_margin   = _calc_margin(total_revenue, total_cost)
+
+    # ── Monthly breakdown (across all projects combined) ───────────────────
+    monthly_breakdown: dict = {}
+    seen_mb: set = set()
+    for r in emp_records:
+        proj = r.get("project") or "Unknown"
+        mon  = r.get("month") or "Unknown"
+        dedup_key = (_normalize_key(mon), _normalize_key(proj))
+        if dedup_key in seen_mb:
+            continue
+        seen_mb.add(dedup_key)
+        if mon not in monthly_breakdown:
+            monthly_breakdown[mon] = {"total_hours": 0.0, "total_revenue": 0.0, "projects": {}}
+        mb = monthly_breakdown[mon]
+        mb["total_hours"]   += _to_num(r.get("actual_hours"))
+        mb["total_revenue"] += _to_num(r.get("revenue"))
+        mb["projects"][proj] = {
+            "hours":    round(_to_num(r.get("actual_hours")), 2),
+            "billable": round(_to_num(r.get("billable_hours")), 2),
+            "revenue":  round(_to_num(r.get("revenue")), 2),
+        }
+    for mb in monthly_breakdown.values():
+        mb["total_hours"]   = round(mb["total_hours"], 2)
+        mb["total_revenue"] = round(mb["total_revenue"], 2)
+
+    ordered_months = sorted(monthly_breakdown.keys(), key=lambda m: _parse_month_date(m) or dt.date.min)
+
+    # ── All source files ───────────────────────────────────────────────────
+    all_sources = sorted({r.get("_source_file", "") for r in emp_records if r.get("_source_file")})
+    all_project_names = [p["project_name"] for p in project_list]
+
+    return {
+        "employee_name":    canonical_name,
+        "designation":      designation,
+        "projects":         project_list,
+        "project_names":    all_project_names,
+        "source_files":     all_sources,
+        "months_active":    ordered_months,
+        "combined": {
+            "total_hours":       total_hours,
+            "total_revenue":     total_revenue,
+            "total_cost":        total_cost,
+            "total_profit":      total_profit,
+            "total_expected_hours": total_expected,
+            "utilisation_pct":   overall_util,
+            "gross_margin_pct":  gross_margin,
+            "vacation_days":     total_vacation,
+            "working_days":      total_working,
+            "attendance_pct":    attendance_pct,
+        },
+        "monthly_breakdown": {
+            m: monthly_breakdown[m] for m in ordered_months
+        },
+        "records_count":    len(emp_records),
+    }
 
 
 def build_top_performers(records: List[dict], limit: int = 5) -> List[dict]:

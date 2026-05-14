@@ -14,6 +14,7 @@ from ingestion.dataset import (
     build_top_performers, get_months_available,
     clear as clear_dataset, remove_by_file, get_files_processed,
     build_project_summaries, build_employee_summaries,
+    get_employee_detail,
 )
 from ingestion.qa_engine import ask as qa_ask
 from ingestion.risk_engine import get_risks_and_recommendations
@@ -503,6 +504,69 @@ def get_employees(time_range: Optional[str] = Query(None, alias="range"), projec
         "employees": employees,
     }
 
+
+
+# ── GET /employee/{name} — Single employee merged profile ───────────────
+@app.get("/employee/{name}")
+def get_employee_profile(
+    name: str,
+    time_range: Optional[str] = Query(None, alias="range"),
+    include_risks: bool = Query(True),
+):
+    """
+    Return a merged profile for a single employee by name (case-insensitive
+    partial match). Combines data from ALL uploaded source files — e.g. both
+    Crystal and Barclays timesheets are aggregated for the same employee.
+
+    Response includes:
+      - designation  (if any source file contains a role/designation column)
+      - projects     list of each project with hours, revenue, billing rate
+      - combined     overall rolled-up metrics across all projects
+      - monthly_breakdown  per-month, per-project hours and revenue
+      - risks        workforce and financial risks detected for this employee
+    """
+    detail = get_employee_detail(name, time_range=time_range)
+    if detail is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No records found for employee '{name}'. "
+                   "Upload timesheets first via POST /ingest.",
+        )
+
+    result = {
+        "employee_name":    detail["employee_name"],
+        "designation":      detail["designation"],
+        "project_names":    detail["project_names"],
+        "source_files":     detail["source_files"],
+        "months_active":    detail["months_active"],
+        "combined":         detail["combined"],
+        "projects":         detail["projects"],
+        "monthly_breakdown": detail["monthly_breakdown"],
+        "records_count":    detail["records_count"],
+        "data_note":        (
+            f"Data merged from {len(detail['source_files'])} source file(s): "
+            + ", ".join(detail["source_files"])
+        ) if detail["source_files"] else None,
+    }
+
+    if include_risks:
+        risk_data = get_risks_and_recommendations(
+            time_range=time_range,
+            employee=name,
+            max_items=10,
+            include_positive=True,
+            include_ai_insights=False,
+        )
+        result["risks"] = {
+            "overview":         risk_data["overview"],
+            "financial_risks":  risk_data["financial_risks"],
+            "workforce_risks":  risk_data["workforce_risks"],
+            "positive_signals": risk_data["positive_signals"],
+            "recommendations":  risk_data["recommendations"],
+            "employee_scorecards": risk_data["employee_scorecards"],
+        }
+
+    return result
 
 
 # ── GET /risks-recommendations — Risk analysis + AI recommendations ──────
