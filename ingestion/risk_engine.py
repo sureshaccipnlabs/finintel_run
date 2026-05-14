@@ -1426,6 +1426,7 @@ def _get_ai_insights(records: list[dict], risks: list[dict], scorecards: list[di
 def get_risks_and_recommendations(
     time_range: Optional[str] = None,
     project: Optional[str] = None,
+    employee: Optional[str] = None,
     max_items: int = 8,
     include_positive: bool = False,
     include_ai_insights: bool = True,
@@ -1435,6 +1436,9 @@ def get_risks_and_recommendations(
 
     Args:
         time_range:         "1M" | "3M" | "6M" | "1Y" | None (all)
+        project:            filter by project name (exact, case-insensitive)
+        employee:           filter by employee name (partial, case-insensitive match)
+                            — aggregates ALL projects for that employee
         max_items:          max risks / recommendations in summary lists
         include_positive:   whether to include STAR/CONSISTENT signals
         include_ai_insights: whether to call Ollama for strategic insights
@@ -1468,6 +1472,15 @@ def get_risks_and_recommendations(
         records = [
             r for r in records
             if _norm_project_name(r.get("project")) == wanted_project
+        ]
+    if not records:
+        return _empty_response()
+
+    if employee:
+        emp_lower = employee.lower()
+        records = [
+            r for r in records
+            if emp_lower in (r.get("employee") or "").lower()
         ]
     if not records:
         return _empty_response()

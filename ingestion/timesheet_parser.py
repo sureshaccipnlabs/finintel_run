@@ -48,6 +48,9 @@ FIELD_PATTERNS = {
                       "time off", "pto", "absent", "days off"],
     "working_days":  ["working days", "work days", "days worked",
                       "business days", "workdays"],
+    "designation":   ["designation", "role", "position", "title",
+                      "job title", "job role", "level", "grade", "band",
+                      "emp type", "employee type", "category"],
 }
 
 # Prevent false positives: if a cell matches field X but contains one of
@@ -417,15 +420,16 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
     """
     header = rows[header_idx]
 
-    name_idx    = col_map.get("name")
-    project_idx = col_map.get("project")
-    rate_idx    = col_map.get("billing_rate")
-    cost_idx    = col_map.get("cost_rate")
-    actual_idx  = col_map.get("actual_hours")
-    billable_idx= col_map.get("billable_hours")
-    max_idx     = col_map.get("max_hours")
-    leaves_idx  = col_map.get("leaves")
-    wd_idx      = col_map.get("working_days")
+    name_idx         = col_map.get("name")
+    project_idx      = col_map.get("project")
+    rate_idx         = col_map.get("billing_rate")
+    cost_idx         = col_map.get("cost_rate")
+    actual_idx       = col_map.get("actual_hours")
+    billable_idx     = col_map.get("billable_hours")
+    max_idx          = col_map.get("max_hours")
+    leaves_idx       = col_map.get("leaves")
+    wd_idx           = col_map.get("working_days")
+    designation_idx  = col_map.get("designation")
 
     if name_idx is None:
         name_idx = 0
@@ -450,16 +454,42 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
 
     employees = {}
     found_any = False
+    consecutive_nameless = 0  # consecutive rows with empty name (no project value)
     for r in rows[data_start : data_end + 1]:
         if not r or name_idx >= len(r):
             if found_any:
-                break
+                consecutive_nameless += 1
+                if consecutive_nameless >= 5:
+                    break
             continue
         name_val = r[name_idx]
         if not name_val or not clean(name_val):
             if found_any:
-                break
+                # If the project column still carries a value this is a filler /
+                # continuation row inside the data block — skip it but keep scanning.
+                has_project_val = (
+                    project_idx is not None
+                    and project_idx < len(r)
+                    and r[project_idx]
+                    and not is_date(r[project_idx])
+                )
+                if has_project_val:
+                    continue  # filler row with project value → skip, do NOT increment
+
+                if project_idx is not None:
+                    # Project column exists but this row has no project value.
+                    # That is a genuine section boundary (totals row, blank separator).
+                    # Break immediately so we never wander into the next fortnight.
+                    break
+
+                # No project column at all (summary-style sections): tolerate up to
+                # 4 consecutive nameless rows before deciding it's a terminator.
+                # This lets us skip numeric-only filler rows and still find Steve.
+                consecutive_nameless += 1
+                if consecutive_nameless >= 5:
+                    break
             continue
+        consecutive_nameless = 0  # reset counter on every valid name row
         base_name = clean(name_val)
         name = base_name
         if name.lower() in SKIP_NAMES:
@@ -503,6 +533,12 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
             if pv and not is_date(r[project_idx]):
                 project = pv
 
+        designation = ""
+        if designation_idx is not None and designation_idx < len(r) and r[designation_idx]:
+            dv = clean(r[designation_idx])
+            if dv and not is_date(r[designation_idx]):
+                designation = dv
+
         employees[name] = {
             "project":       project,
             "billing_rate":  _safe_float(r, rate_idx),
@@ -514,6 +550,7 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
             "leave_days":    leave_days,
             "holiday_days":  daily["holiday_days"],
             "working_days":  working_days,
+            "designation":   designation,
         }
         found_any = True
 
@@ -729,6 +766,7 @@ def _build_employee_record(name, data, month_label):
         "employee": name,
         "project": data.get("project", ""),
         "month": month_label,
+        "designation": data.get("designation", ""),
         "working_days": working_days,
         "leave_days": leave_days,
         "holiday_days": holiday_days,
