@@ -51,6 +51,8 @@ FIELD_PATTERNS = {
     "designation":   ["designation", "role", "position", "title",
                       "job title", "job role", "level", "grade", "band",
                       "emp type", "employee type", "category"],
+    "status":        ["employment status", "emp status", "employee status",
+                      "active status", "status"],
 }
 
 # Prevent false positives: if a cell matches field X but contains one of
@@ -77,6 +79,22 @@ def clean(v):
 
 def is_date(v):
     return isinstance(v, (datetime, date))
+
+
+def _is_active_status(val) -> bool:
+    """Return True (keep) if val means Active; False (skip) if it means Inactive.
+
+    Active:   None / blank (default), 'Active' (case-insensitive), numeric != 0
+    Inactive: 'Inactive' (case-insensitive), numeric 0
+    """
+    if val is None:
+        return True
+    if isinstance(val, (int, float)):
+        return float(val) != 0.0
+    s = clean(val).strip().lower()
+    if not s:
+        return True
+    return s != "inactive"
 
 
 def _find_col(header, label):
@@ -413,10 +431,13 @@ def _find_year_near(rows, label_row):
 
 
 # ── Unified data extractor ───────────────────────────────────────────────
-def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None, default_project=None):
+def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None,
+                       default_project=None, inactive_names=None):
     """
     Generic employee extractor — works for ANY layout once you know
     header_idx and col_map {field: col_index}.
+
+    inactive_names: optional set of lowercase names to always exclude (from Team sheet).
     """
     header = rows[header_idx]
 
@@ -430,6 +451,7 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
     leaves_idx       = col_map.get("leaves")
     wd_idx           = col_map.get("working_days")
     designation_idx  = col_map.get("designation")
+    status_idx       = col_map.get("status")
 
     if name_idx is None:
         name_idx = 0
@@ -496,6 +518,19 @@ def _extract_employees(rows, header_idx, col_map, data_start=None, data_end=None
             if found_any:
                 break
             continue
+
+        # ── Activity filter ──────────────────────────────────────────────
+        # Per-row Status column: skip employees marked Inactive / 0
+        if status_idx is not None and status_idx < len(r):
+            if not _is_active_status(r[status_idx]):
+                found_any = True   # this row counts as a data row structurally
+                continue
+        # Team-sheet inactive list: skip employees flagged there
+        if inactive_names and base_name.lower() in inactive_names:
+            found_any = True
+            continue
+        # ─────────────────────────────────────────────────────────────────
+
         if name in employees:
             suffix = 2
             while f"{base_name} ({suffix})" in employees:
@@ -565,6 +600,49 @@ _SKIP_SHEET_NAMES = {"instructions", "template", "readme", "config", "settings",
                      "summary", "dashboard", "sheet1", "sheet2", "sheet3"}
 
 
+_TEAM_SHEET_NAMES = {"team", "teams", "employee list", "members",
+                     "staff", "staff list", "roster", "resources"}
+
+
+def _extract_team_inactive_names(wb) -> set:
+    """Scan any Team/roster sheet in the workbook for employees marked Inactive.
+
+    Returns a set of *lowercase* employee names to exclude from all monthly
+    sheet parsing for this workbook.
+    """
+    inactive: set = set()
+    for sn in wb.sheetnames:
+        if sn.lower().strip() not in _TEAM_SHEET_NAMES:
+            continue
+        ws = wb[sn]
+        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        for i, row in enumerate(rows[:15]):
+            if not row:
+                continue
+            name_col = status_col = None
+            for j, v in enumerate(row):
+                if v is None:
+                    continue
+                lv = clean(v).lower()
+                if name_col is None and lv == "name":
+                    name_col = j
+                if status_col is None and lv == "status":
+                    status_col = j
+            if name_col is not None and status_col is not None:
+                for dr in rows[i + 1:]:
+                    if not dr or name_col >= len(dr):
+                        continue
+                    nv = dr[name_col]
+                    sv = dr[status_col] if status_col < len(dr) else None
+                    if not nv:
+                        continue
+                    emp_name = clean(nv).lower()
+                    if emp_name and not _is_active_status(sv):
+                        inactive.add(emp_name)
+                break
+    return inactive
+
+
 def _looks_like_timesheet_sheet(rows, sheet_name):
     """Quick heuristic: does this sheet look like it could contain timesheet data?
     Always trusts actual content (headers) over sheet name."""
@@ -580,7 +658,7 @@ def _looks_like_timesheet_sheet(rows, sheet_name):
     return True
 
 
-def _parse_with_patterns(rows):
+def _parse_with_patterns(rows, inactive_names=None):
     """
     Try to parse using pattern matching.
     Handles: fortnights + summary overlay, OR summary-only sheets.
@@ -600,8 +678,8 @@ def _parse_with_patterns(rows):
     merged = {}
     for h_idx in fortnight_headers:
         header = rows[h_idx]
-        col_map = _map_columns(header, ["name", "project", "leaves", "working_days", "max_hours"])
-        fort_data = _extract_employees(rows, h_idx, col_map)
+        col_map = _map_columns(header, ["name", "project", "leaves", "working_days", "max_hours", "status"])
+        fort_data = _extract_employees(rows, h_idx, col_map, inactive_names=inactive_names)
         for name, data in fort_data.items():
             if name not in merged:
                 merged[name] = {k: 0 for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "leave_days", "holiday_days", "working_days"]}
@@ -615,7 +693,8 @@ def _parse_with_patterns(rows):
         s_header = rows[s_idx]
         s_col_map = _map_columns(s_header)
         summary_emps = _extract_employees(rows, s_idx, s_col_map,
-                                          default_project=_extract_project_from_metadata(rows))
+                                          default_project=_extract_project_from_metadata(rows),
+                                          inactive_names=inactive_names)
         if merged:
             # Overlay mode: enrich existing fortnight data
             matched_names = 0
@@ -681,7 +760,7 @@ def _build_mapping_debug(rows):
 
 
 # ── STRATEGY 2: AI full-sheet analysis ───────────────────────────────────
-def _parse_with_ai(rows, sheet_name):
+def _parse_with_ai(rows, sheet_name, inactive_names=None):
     """
     Ask the LLM to analyze the entire sheet structure and extract employees.
     Returns merged employee dict or {} on failure.
@@ -705,6 +784,7 @@ def _parse_with_ai(rows, sheet_name):
         data_start=analysis.get("data_start"),
         data_end=analysis.get("data_end"),
         default_project=default_project,
+        inactive_names=inactive_names,
     )
 
 
@@ -845,6 +925,9 @@ def parse_timesheet(filepath, target_month=None):
         sn for sn in wb.sheetnames if wb[sn].sheet_state == "visible"
     ]
 
+    # Build inactive-name set from any Team/roster sheet in this workbook.
+    inactive_names = _extract_team_inactive_names(wb)
+
     result = {
         "file": os.path.basename(filepath),
         "sheets": {}
@@ -905,12 +988,12 @@ def parse_timesheet(filepath, target_month=None):
                 continue
 
             # ── STRATEGY 1: Pattern-based parsing ─────────────────────
-            merged = _parse_with_patterns(rows)
+            merged = _parse_with_patterns(rows, inactive_names=inactive_names)
 
             # ── STRATEGY 2: AI fallback ONLY if no headers were found ─
             # If patterns found headers but no employees, AI won't help either
             if not merged and not any(_is_data_header(rows[i]) for i in range(min(30, len(rows)))):
-                merged = _parse_with_ai(rows, sheet_name)
+                merged = _parse_with_ai(rows, sheet_name, inactive_names=inactive_names)
 
             if not merged:
                 continue
