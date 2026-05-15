@@ -9,14 +9,32 @@ import json
 import re
 import hashlib
 import time
+import os
+import logging
 
 from .dataset import (
     GLOBAL_DATASET, build_projects, build_monthly, build_overall_summary,
     build_top_performers, build_risks, get_months_available, filter_by_range,
     build_employee_summaries, set_on_dataset_change_callback, _trend_from_values,
-    _calc_margin
+    _calc_margin, match_entities_by_word_boundary
 )
 from .ai_mapper import _llm_generate, is_llm_available
+
+# ── Debug Logging Configuration ───────────────────────────────────────────────
+DEBUG = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
+
+_logger = logging.getLogger("qa_engine")
+if not _logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[%(asctime)s] [qa_engine] %(message)s", datefmt="%H:%M:%S"))
+    _logger.addHandler(_handler)
+    _logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+
+def _log(msg: str, level: str = "info"):
+    """Structured logger for qa_engine (respects DEBUG env var for debug level)."""
+    if level == "debug" and not DEBUG:
+        return
+    getattr(_logger, level if hasattr(_logger, level) else "info")(msg)
 
 # Use legacy forecast_ module (set USE_NEW_FORECAST=False to use old implementation)
 USE_NEW_FORECAST = False  # Set to True to use new OOP module
@@ -203,11 +221,68 @@ def _invalidate_all_caches():
 set_on_dataset_change_callback(_invalidate_all_caches)
 
 
+def _fuzzy_match_suggestion(typo: str, known_names: list, threshold: float = 0.6) -> str:
+    """Find closest match for a typo using simple similarity ratio.
+    
+    Returns the best match if similarity >= threshold, else None.
+    """
+    if not typo or not known_names:
+        return None
+    typo_lower = typo.lower()
+    best_match = None
+    best_score = 0
+    
+    for name in known_names:
+        name_lower = name.lower()
+        # Simple similarity: common characters / max length
+        common = sum(1 for c in typo_lower if c in name_lower)
+        score = common / max(len(typo_lower), len(name_lower))
+        # Bonus for same starting letter
+        if typo_lower and name_lower and typo_lower[0] == name_lower[0]:
+            score += 0.2
+        # Bonus for substring match
+        if typo_lower in name_lower or name_lower in typo_lower:
+            score += 0.3
+        if score > best_score:
+            best_score = score
+            best_match = name
+    
+    return best_match if best_score >= threshold else None
+
+
 # ── Context builder ──────────────────────────────────────────────────────────
 
-def _detect_question_scope(question: str) -> dict:
-    """Analyze question to determine what context sections are needed."""
+def _detect_question_scope(question: str, records: list = None) -> dict:
+    """Analyze question to determine what context sections are needed.
+    
+    Args:
+        question: The user's question
+        records: Optional dataset records to validate entity names against actual data
+    """
     q = (question or "").lower()
+    
+    # Fix 2: Build lookup sets from actual data (case-insensitive)
+    actual_employees = set()
+    actual_employees_original = {}  # lowercase -> original case
+    actual_projects = set()
+    actual_projects_original = {}  # lowercase -> original case
+    if records:
+        for r in records:
+            emp = r.get("employee", "")
+            proj = r.get("project", "")
+            if emp:
+                emp_lower = emp.lower()
+                actual_employees.add(emp_lower)
+                actual_employees_original[emp_lower] = emp
+                # Also add first name for partial matching
+                first_name = emp.split()[0].lower() if emp else ""
+                if first_name:
+                    actual_employees.add(first_name)
+                    actual_employees_original[first_name] = emp.split()[0]
+            if proj:
+                proj_lower = proj.lower()
+                actual_projects.add(proj_lower)
+                actual_projects_original[proj_lower] = proj
     
     scope = {
         "needs_overall": True,  # Always include
@@ -219,6 +294,9 @@ def _detect_question_scope(question: str) -> dict:
         "specific_employee": None,
         "specific_project": None,
         "specific_month": None,
+        "specific_year": None,
+        "mentioned_projects": [],
+        "missing_entities": [],  # Fix 2: Track entities not found in data
     }
     
     # Project-related keywords (expanded)
@@ -239,13 +317,20 @@ def _detect_question_scope(question: str) -> dict:
     if any(w in q for w in monthly_keywords):
         scope["needs_monthly"] = True
     
-    # Specific month mentioned
-    month_pattern = r"(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)"
+    # Specific month mentioned (with optional year)
+    month_pattern = r"(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\w*[\s,\-]*(\d{4})?"
     month_match = re.search(month_pattern, q)
     if month_match:
         scope["needs_monthly"] = True
         scope["needs_employee_details"] = True
         scope["specific_month"] = month_match.group(1)
+        scope["specific_year"] = month_match.group(2)  # e.g. "2024" or None
+
+    # Year-only mention (no month): e.g. "in 2024", "for 2024", "2024 revenue"
+    if not scope["specific_year"]:
+        year_only = re.search(r"\b(20\d{2})\b", q)
+        if year_only:
+            scope["specific_year"] = year_only.group(1)
     
     # Employee-related keywords (expanded for natural language)
     employee_keywords = [
@@ -265,16 +350,107 @@ def _detect_question_scope(question: str) -> dict:
         "employees", "employee", "project", "projects", "highest", "lowest", "top", "bottom",
         "best", "worst", "most", "least", "generated", "has", "have", "had", "are", "is", "was",
         "show", "compare", "trend", "performance", "health", "summary", "insights", "issues",
-        "risks", "anomalies", "identify", "detect", "predict", "suggest", "analyze"
+        "risks", "anomalies", "identify", "detect", "predict", "suggest", "analyze",
+        # Action words (Fix 1: prevent these from being detected as names)
+        "compute", "calculate", "find", "get", "display", "tell", "about",
+        # Time period words
+        "monthly", "weekly", "daily", "yearly", "annual", "quarterly",
+        "forecast", "projection", "budget", "estimate", "expected", "actual",
     }
-    name_match = re.findall(r"\b([A-Z][a-z]+)\b", question)
-    for name in name_match:
-        if name.lower() not in common_words and name.lower() not in month_pattern:
+    
+    # Fix 2: Data-based entity detection (works with any case)
+    # Short words to skip (prepositions, articles, etc.)
+    skip_words = {"in", "on", "at", "to", "of", "by", "vs", "or", "an", "a", "the", "is", "it"}
+    
+    if records and (actual_employees or actual_projects):
+        # Check each word in question against actual data
+        words = re.findall(r"[a-zA-Z]+(?:'s)?", question)
+        for word in words:
+            # Clean the word: remove possessive 's and convert to lowercase
+            word_clean = word.lower()
+            if word_clean.endswith("'s"):
+                word_clean = word_clean[:-2]
+            
+            # Skip common words, short words, and month names (exact match only)
+            if word_clean in common_words or word_clean in skip_words or re.fullmatch(month_pattern, word_clean):
+                continue
+            
+            # Check if it's an actual employee (exact match only for short words)
+            if len(word_clean) <= 2:
+                is_employee = word_clean in actual_employees
+                is_project = word_clean in actual_projects
+            else:
+                is_employee = word_clean in actual_employees or any(word_clean in e for e in actual_employees)
+                is_project = word_clean in actual_projects or any(word_clean in p for p in actual_projects)
+            
+            if is_project and not is_employee:
+                # Definitely a project
+                scope["needs_projects"] = True
+                scope["specific_project"] = actual_projects_original.get(word_clean, word.title())
+                _log(f"Detected project: '{word_clean}' -> '{scope['specific_project']}'", "debug")
+            elif is_employee and not is_project:
+                # Definitely an employee
+                scope["needs_employee_summary"] = True
+                scope["needs_employee_details"] = True
+                scope["specific_employee"] = actual_employees_original.get(word_clean, word.title())
+            elif is_employee and is_project:
+                # Fix 4: Ambiguous - use context clues to disambiguate
+                project_context = any(kw in q for kw in ["project", "client", "project's", "of project"])
+                employee_context = any(kw in q for kw in ["employee", "person", "employee's", "'s performance", "'s margin", "'s utilization"])
+                
+                if project_context and not employee_context:
+                    scope["needs_projects"] = True
+                    scope["specific_project"] = actual_projects_original.get(word_clean, word.title())
+                elif employee_context and not project_context:
+                    scope["needs_employee_summary"] = True
+                    scope["needs_employee_details"] = True
+                    scope["specific_employee"] = actual_employees_original.get(word_clean, word.title())
+                else:
+                    # Still ambiguous - include both
+                    scope["needs_employee_summary"] = True
+                    scope["needs_employee_details"] = True
+                    scope["specific_employee"] = actual_employees_original.get(word_clean, word.title())
+                    scope["needs_projects"] = True
+                    scope["specific_project"] = actual_projects_original.get(word_clean, word.title())
+            elif len(word_clean) > 2 and word[0].isupper():
+                # Capitalized word not in data - track as missing and try fuzzy match
+                missing_word = word.replace("'s", "")
+                scope["missing_entities"].append(missing_word)
+                # Try fuzzy match for typo correction
+                all_known = list(actual_projects_original.values()) + list(actual_employees_original.values())
+                suggestion = _fuzzy_match_suggestion(missing_word, all_known)
+                if suggestion:
+                    if "suggestions" not in scope:
+                        scope["suggestions"] = []
+                    scope["suggestions"].append(f"'{missing_word}' -> Did you mean '{suggestion}'?")
+    else:
+        # Fallback: Old behavior when no records provided (capitalized words)
+        name_match = re.findall(r"\b([A-Z][a-z]+)\b", question)
+        for name in name_match:
+            if name.lower() not in common_words and not re.match(month_pattern, name.lower()):
+                scope["needs_employee_summary"] = True
+                scope["needs_employee_details"] = True
+                scope["specific_employee"] = name
+                break
+    
+    # Apply shared entity matcher to reinforce specific project/employee detection
+    try:
+        projects_list = list(actual_projects_original.values()) if actual_projects_original else []
+        employees_list = list(actual_employees_original.values()) if actual_employees_original else []
+        matched_projects = match_entities_by_word_boundary([question], projects_list) if question else []
+        matched_employees = match_entities_by_word_boundary([question], employees_list) if question else []
+        if matched_projects and not scope.get("specific_project"):
+            scope["needs_projects"] = True
+            if len(matched_projects) == 1:
+                scope["specific_project"] = matched_projects[0]
+        if matched_employees and not scope.get("specific_employee"):
             scope["needs_employee_summary"] = True
             scope["needs_employee_details"] = True
-            scope["specific_employee"] = name
-            break
-    
+            if len(matched_employees) == 1:
+                scope["specific_employee"] = matched_employees[0]
+    except Exception:
+        pass
+
     # For project utilization questions, ONLY need PROJECTS section (not employees)
     is_project_util_question = ("project" in q) and any(w in q for w in ["utilization", "utilisation", "util"])
     
@@ -313,6 +489,12 @@ def _detect_question_scope(question: str) -> dict:
         scope["needs_projects"] = True
         scope["needs_employee_summary"] = True
         scope["needs_monthly"] = True
+        # Resolve canonical project names for compare — prevents single-project filtering
+        if actual_projects_original:
+            mentioned = match_entities_by_word_boundary([question], list(actual_projects_original.values()))
+            scope["mentioned_projects"] = mentioned
+            if len(mentioned) >= 2:
+                scope["specific_project"] = None  # Show ALL mentioned projects, not just one
     
     # Insight/summary queries (executive level)
     insight_keywords = [
@@ -360,10 +542,18 @@ def _build_dataset_context(records=None, question: str = None):
     if not recs:
         return "No data has been loaded yet."
 
-    # Determine what sections are needed based on question
-    scope = _detect_question_scope(question) if question else None
+    # Determine what sections are needed based on question (Fix 2: pass records for validation)
+    scope = _detect_question_scope(question, recs) if question else None
     include_all = scope is None  # If no question, include everything
-    
+
+    # Year-aware context narrowing: when exactly 1 year is mentioned, restrict context to that year.
+    # Applied locally here only — does NOT touch the records used by Forecast in ask().
+    specific_year = scope.get("specific_year") if scope else None
+    if specific_year:
+        year_matches = re.findall(r"\b(20\d{2})\b", question or "")
+        if len(year_matches) == 1:  # Only filter when unambiguous (not multi-year compare)
+            recs = [r for r in recs if specific_year in (r.get("month") or "")]
+
     overall = build_overall_summary(recs)
     months = get_months_available(recs)
 
@@ -377,6 +567,20 @@ def _build_dataset_context(records=None, question: str = None):
     if months:
         lines.append(f"LAST MONTH (most recent data available): {months[-1]}")
         lines.append(f"NOTE: If user asks about 'last month', return data for {months[-1]} and clarify this is the most recent data available.")
+    
+    # Add typo suggestions if any
+    if scope and scope.get("suggestions"):
+        lines.append("")
+        lines.append("=== POSSIBLE TYPOS DETECTED ===")
+        for suggestion in scope["suggestions"]:
+            lines.append(f"WARNING: {suggestion}")
+        lines.append("If the user meant one of the suggested names, use that data. Otherwise, respond with 'No data found'.")
+    
+    # Add missing entities warning
+    if scope and scope.get("missing_entities"):
+        all_projects = sorted(set(r.get("project") for r in recs if r.get("project")))
+        lines.append(f"NOTE: '{', '.join(scope['missing_entities'])}' not found in data. Available projects: {', '.join(all_projects)}")
+    
     lines.append("")
 
     # Projects - include if needed
@@ -395,9 +599,13 @@ def _build_dataset_context(records=None, question: str = None):
                 proj_billable[proj] = 0.0
                 proj_util_values[proj] = []
             if month not in proj_monthly[proj]:
-                proj_monthly[proj][month] = {"rev": 0.0, "cost": 0.0}
+                proj_monthly[proj][month] = {"rev": 0.0, "cost": 0.0, "util_vals": []}
             proj_monthly[proj][month]["rev"] += float(r.get("revenue") or 0)
             proj_monthly[proj][month]["cost"] += float(r.get("cost") or 0)
+            # Track utilization per month for monthly trends
+            util_pct_month = r.get("utilisation_pct")
+            if util_pct_month is not None and util_pct_month > 0:
+                proj_monthly[proj][month]["util_vals"].append(float(util_pct_month))
             proj_billable[proj] += float(r.get("billable_hours") or 0)
             # Collect utilisation_pct for averaging
             util_pct = r.get("utilisation_pct")
@@ -417,11 +625,51 @@ def _build_dataset_context(records=None, question: str = None):
         sorted_by_profit = sorted(projects.items(), key=lambda x: x[1].get("profit", 0), reverse=True)
         
         lines.append("=== PROJECTS ===")
-        lines.append(f"RANKING HINTS: HighestUtilization={sorted_by_util[0][0]}, LowestUtilization={sorted_by_util[-1][0]}, "
-                     f"HighestRevenue={sorted_by_revenue[0][0]}, LowestRevenue={sorted_by_revenue[-1][0]}, "
-                     f"HighestCost={sorted_by_cost[-1][0]}, LowestCost={sorted_by_cost[0][0]}, "
-                     f"HighestProfit={sorted_by_profit[0][0]}, LowestProfit={sorted_by_profit[-1][0]}")
-        for name, data in sorted(projects.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        lines.append(f"AVAILABLE PROJECTS (use EXACT names): {', '.join(sorted(projects.keys()))}")
+
+        # Inject canonical names for compare queries so LLM uses exact casing
+        mentioned_projs = scope.get("mentioned_projects", []) if scope else []
+        if len(mentioned_projs) >= 2:
+            lines.append(
+                f"COMPARE INSTRUCTION: User is comparing {' vs '.join(mentioned_projs)}. "
+                f"Use EXACTLY these names as column headers: {', '.join(mentioned_projs)}"
+            )
+
+        # Filter to specific project if requested
+        specific_proj = scope.get("specific_project") if scope else None
+        _log(f"Building context: specific_project={specific_proj}, all_projects={list(projects.keys())}", "debug")
+        if specific_proj:
+            # Case-insensitive match to find the actual project name
+            specific_proj_lower = specific_proj.lower()
+            matched_proj = None
+            for p in projects.keys():
+                if p.lower() == specific_proj_lower:
+                    matched_proj = p
+                    break
+            if matched_proj:
+                _log(f"Filtering to project: {matched_proj}", "debug")
+                lines.append(f">>> IMPORTANT: User is asking about PROJECT '{matched_proj}' ONLY. Use ONLY the data below for '{matched_proj}'. <<<")
+                lines.append(f"FILTERED TO PROJECT: {matched_proj}")
+                projects_to_show = {matched_proj: projects[matched_proj]}
+            else:
+                _log(f"Project '{specific_proj}' not found in {list(projects.keys())}", "debug")
+                lines.append(f"WARNING: Requested project '{specific_proj}' not found. Showing all projects.")
+                projects_to_show = projects
+        else:
+            # For compare queries with 2+ projects, restrict to mentioned projects only
+            if len(mentioned_projs) >= 2:
+                projects_to_show = {p: projects[p] for p in mentioned_projs if p in projects}
+                if not projects_to_show:  # fallback if none matched
+                    projects_to_show = projects
+            else:
+                projects_to_show = projects
+
+        if not specific_proj:
+            lines.append(f"RANKING HINTS: HighestUtilization={sorted_by_util[0][0]}, LowestUtilization={sorted_by_util[-1][0]}, "
+                         f"HighestRevenue={sorted_by_revenue[0][0]}, LowestRevenue={sorted_by_revenue[-1][0]}, "
+                         f"HighestCost={sorted_by_cost[-1][0]}, LowestCost={sorted_by_cost[0][0]}, "
+                         f"HighestProfit={sorted_by_profit[0][0]}, LowestProfit={sorted_by_profit[-1][0]}")
+        for name, data in sorted(projects_to_show.items(), key=lambda x: x[1]["revenue"], reverse=True):
             proj_revenue = float(data.get("revenue") or 0)
             proj_cost = float(data.get("cost") or 0)
             proj_margin = round(((proj_revenue - proj_cost) / proj_revenue) * 100, 2) if proj_revenue > 0 else 0
@@ -441,11 +689,17 @@ def _build_dataset_context(records=None, question: str = None):
             cost_series = [monthly_data[m]["cost"] for m in sorted_months]
             profit_series = [monthly_data[m]["rev"] - monthly_data[m]["cost"] for m in sorted_months]
             margin_series = [_calc_margin(monthly_data[m]["rev"], monthly_data[m]["cost"]) for m in sorted_months]
+            # Calculate per-month utilization averages
+            util_series = []
+            for m in sorted_months:
+                uvals = monthly_data[m].get("util_vals", [])
+                util_series.append(round(sum(uvals) / len(uvals), 2) if uvals else 0)
             
             rev_trend = _trend_from_values(revenue_series)
             cost_trend = _trend_from_values(cost_series)
             profit_trend = _trend_from_values(profit_series)
             margin_trend = _trend_from_values(margin_series)
+            util_trend = _trend_from_values(util_series)
             billable_hrs = round(proj_billable.get(name, 0), 2)
             
             # Calculate AvgUtilisation from employee utilisation_pct values
@@ -465,10 +719,72 @@ def _build_dataset_context(records=None, question: str = None):
                 f"Profit=${data['profit']:,.2f}, GrossMargin={proj_margin}%, "
                 f"AvgUtilisation={avg_util}%, Employees={data['employees']}, "
                 f"BillableHours={billable_hrs}, Status={proj_status}, "
-                f"RevenueTrend={rev_trend}, CostTrend={cost_trend}, ProfitTrend={profit_trend}, MarginTrend={margin_trend}, "
-                f"BestRevenueMonth={best_rev_month}, WorstRevenueMonth={worst_rev_month}"
+                f"RevenueTrend={rev_trend}, CostTrend={cost_trend}, ProfitTrend={profit_trend}, MarginTrend={margin_trend}, UtilTrend={util_trend}, "
+                f"BestRevenueMonth={best_rev_month}, WorstRevenueMonth={worst_rev_month}, "
+                f"MonthlyBreakdown(last {min(6, len(sorted_months))} months)=[{', '.join(f'{m}:Rev=${monthly_data[m]["rev"]:,.0f}/Cost=${monthly_data[m]["cost"]:,.0f}/Util={round(sum(monthly_data[m].get("util_vals", [0])) / max(len(monthly_data[m].get("util_vals", [1])), 1), 1)}%' for m in sorted_months[-6:])}]"
             )
         lines.append("")
+
+    # Month-specific data section - ADD when specific month is mentioned
+    # This provides accurate month-specific metrics without breaking trend/comparison queries
+    if scope and scope.get("specific_month"):
+        month_key = scope["specific_month"].lower()
+        # Find full month name for display
+        month_names = {
+            "jan": "January", "feb": "February", "mar": "March", "apr": "April",
+            "may": "May", "jun": "June", "jul": "July", "aug": "August",
+            "sep": "September", "oct": "October", "nov": "November", "dec": "December",
+            "january": "January", "february": "February", "march": "March", "april": "April",
+            "june": "June", "july": "July", "august": "August",
+            "september": "September", "october": "October", "november": "November", "december": "December"
+        }
+        display_month = month_names.get(month_key, month_key.capitalize())
+        
+        # Filter records for this specific month (year-aware)
+        specific_year = scope.get("specific_year") if scope else None
+        month_filtered_recs = [
+            r for r in recs
+            if month_key in (r.get("month") or "").lower()
+            and (not specific_year or specific_year in (r.get("month") or ""))
+        ]
+        
+        if month_filtered_recs:
+            lines.append(f"=== DATA FOR {display_month.upper()} ONLY ===")
+            lines.append(f"NOTE: Use this section when answering questions about {display_month} specifically.")
+            
+            # Build month-specific project data
+            month_projects = build_projects(month_filtered_recs)
+            if month_projects:
+                lines.append("Projects:")
+                for name, data in sorted(month_projects.items(), key=lambda x: x[1]["revenue"], reverse=True):
+                    proj_revenue = float(data.get("revenue") or 0)
+                    proj_cost = float(data.get("cost") or 0)
+                    proj_profit = proj_revenue - proj_cost
+                    proj_margin = round((proj_profit / proj_revenue) * 100, 2) if proj_revenue > 0 else 0
+                    lines.append(
+                        f"- {name}: Revenue=${proj_revenue:,.2f}, Cost=${proj_cost:,.2f}, "
+                        f"Profit=${proj_profit:,.2f}, Margin={proj_margin}%"
+                    )
+            
+            # Build month-specific employee data
+            month_employees = build_employee_summaries(month_filtered_recs)
+            if month_employees:
+                lines.append("Employees:")
+                for emp in sorted(month_employees, key=lambda x: x.get('total_revenue') or 0, reverse=True)[:10]:
+                    lines.append(
+                        f"- {emp['employee_name']}: Revenue=${emp['total_revenue']:,.2f}, "
+                        f"Profit=${emp['total_profit']:,.2f}, Hours={emp['total_hours']}, "
+                        f"Utilization={emp.get('utilization_pct') or 0}%"
+                    )
+            
+            # Month totals
+            month_overall = build_overall_summary(month_filtered_recs)
+            lines.append(
+                f"Month Totals: Revenue=${month_overall['total_revenue']:,.2f}, "
+                f"Cost=${month_overall['total_cost']:,.2f}, Profit=${month_overall['total_profit']:,.2f}, "
+                f"Margin={month_overall['avg_margin_pct']}%"
+            )
+            lines.append("")
 
     # Monthly - include if needed (sorted chronologically)
     if include_all or scope.get("needs_monthly"):
@@ -608,11 +924,14 @@ Q: "Show employees with revenue above $10,000"
 Q: "Revenue per employee"
 {{"summary": "Average revenue per employee.", "visual_type": "metric", "columns": [], "data": [{{"label": "Revenue per Employee", "value": 12500}}]}}
 
-Q: "Compare Project Alpha vs Project Beta"
-{{"summary": "Comparison of Project Alpha and Project Beta.", "visual_type": "table", "columns": ["metric", "Project Alpha", "Project Beta"], "data": [{{"metric": "Revenue", "Project Alpha": 50000, "Project Beta": 45000}}, {{"metric": "Profit", "Project Alpha": 12000, "Project Beta": 10000}}, {{"metric": "Margin", "Project Alpha": 24, "Project Beta": 22}}]}}
+Q: "Compare Project Alpha vs Project Beta" or "compare projects"
+{{"summary": "Comparison of ALPHA vs BETA.", "visual_type": "table", "columns": ["metric", "ALPHA", "BETA"], "data": [{{"metric": "Revenue", "ALPHA": 50000, "BETA": 45000}}, {{"metric": "Cost", "ALPHA": 38000, "BETA": 35000}}, {{"metric": "Profit", "ALPHA": 12000, "BETA": 10000}}, {{"metric": "Margin %", "ALPHA": 24, "BETA": 22}}, {{"metric": "Utilization %", "ALPHA": 85, "BETA": 78}}, {{"metric": "Employees", "ALPHA": 5, "BETA": 4}}]}}
 
 Q: "Top 3 employees in Project Alpha"
 {{"summary": "Top 3 employees in Project Alpha by profit.", "visual_type": "table", "columns": ["employee", "project", "profit"], "data": [{{"employee": "John", "project": "Alpha", "profit": 8000}}, {{"employee": "Jane", "project": "Alpha", "profit": 6000}}, {{"employee": "Bob", "project": "Alpha", "profit": 4000}}]}}
+
+Q: "Barclays project details" or "Project X details"
+{{"summary": "BARCLAYS project details: Revenue=$50,000, Cost=$30,000, Profit=$20,000, Margin=40%, Utilization=85%, Employees=5, Status=Healthy", "visual_type": "metric", "columns": [], "data": [{{"label": "Revenue", "value": 50000}}, {{"label": "Cost", "value": 30000}}, {{"label": "Profit", "value": 20000}}, {{"label": "Margin %", "value": 40}}, {{"label": "Utilization %", "value": 85}}, {{"label": "Employees", "value": 5}}, {{"label": "Status", "value": "Healthy"}}]}}
 
 RULES:
 1. "metric" for totals, counts, averages, summaries - use label/value pairs
@@ -628,12 +947,20 @@ RULES:
 11. "not generating", "zero", "no revenue/profit" = filter for values that are 0 or negative
 12. "below X%", "less than X", "under X" = ONLY include values < X; "above X%", "more than X", "over X" = ONLY include values > X. NEVER include values that don't meet the threshold!
 13. "per employee", "per project", "per hour" = calculate average or divide total by count
-14. "compare A vs B" = show side-by-side comparison table with metrics as rows
+14. "compare A vs B" or "compare projects" = show side-by-side comparison table with metrics as rows. Column headers MUST be the EXACT project name as listed in "AVAILABLE PROJECTS" (e.g., "BARCLAYS" not "Project Barclays"). Include all key metrics: Revenue, Cost, Profit, Margin %, Utilization %, Employees. Use only numeric values — NEVER text like "No data available".
 15. "YTD", "year to date" = sum from January to the last available month
 16. "Q1" = Jan-Mar, "Q2" = Apr-Jun, "Q3" = Jul-Sep, "Q4" = Oct-Dec
 17. For "top N in Project X" = filter by project first, then rank
 18. IMPORTANT: For "project utilization" or "which project has highest/lowest utilization", ONLY use "AvgUtilisation" from PROJECTS section. NEVER use IndividualUtilisation from EMPLOYEES section for project-level questions.
 19. When comparing numbers, 96.6 > 96.0 > 95.0. Always compare the actual numeric values, not just the first digits.
+
+ANTI-HALLUCINATION (CRITICAL):
+20. ONLY use data explicitly provided in the context above. NEVER invent, estimate, or assume values.
+21. If a project/employee name is completely absent from the data (zero records), respond as a WHOLE with: {{"summary": "No data found for [name]. Available: [list]", "visual_type": "text", "columns": [], "data": []}}. NEVER write "No data found" or any error text as a cell value inside a table — use 0 instead.
+22. Project names are CASE-SENSITIVE and must match EXACTLY as shown in PROJECTS section (e.g., "BARCLAYS" not "Barclays", "CRYSTAL" not "Crystal").
+23. If the question mentions a name similar to but not exactly matching a project/employee, clarify: "Did you mean [exact name from data]?"
+24. NEVER mix data from different projects. Each project's metrics are independent.
+25. For monthly breakdowns, ONLY use months explicitly listed in MonthlyBreakdown for that specific project.
 """
 
 
@@ -1272,7 +1599,7 @@ def ask(question: str, time_range: str = None) -> dict:
     data_hash = _compute_dataset_hash(records)
     cached_response = _get_cached_response(question, data_hash)
     if cached_response:
-        print(f"[qa_engine] Total time: {time.time() - _start_time:.2f}s (cached)")
+        _log(f"Total time: {time.time() - _start_time:.2f}s (cached)")
         return cached_response
 
     # Forecast intent: use AI forecaster
@@ -1280,7 +1607,7 @@ def ask(question: str, time_range: str = None) -> dict:
     _fc_start = time.time()
     _forecast_module = "forecast (OOP)" if _USING_NEW_FORECAST else "forecast_ (legacy)"
     fc_answer = try_answer_forecast(question, records)
-    print(f"[qa_engine] Forecast check took {time.time() - _fc_start:.2f}s (module={_forecast_module}, likely_forecast={is_likely_forecast(question)})")
+    _log(f"Forecast check took {time.time() - _fc_start:.2f}s (module={_forecast_module}, likely_forecast={is_likely_forecast(question)})", level="debug")
     if fc_answer is not None:
         rows = _extract_rows(fc_answer)
         if rows:
@@ -1350,7 +1677,18 @@ def ask(question: str, time_range: str = None) -> dict:
     # Build targeted context based on question (smart context selection)
     _ctx_start = time.time()
     context = _get_cached_context(records, question=question)
-    print(f"[qa_engine] Context build took {time.time() - _ctx_start:.2f}s")
+    _log(f"Context build took {time.time() - _ctx_start:.2f}s")
+    
+    # Debug: log context details
+    context_lines = context.split('\n')
+    context_sections = [l for l in context_lines if l.startswith('===')]
+    has_filter = any('FILTERED TO PROJECT' in l or 'IMPORTANT:' in l for l in context_lines)
+    _log(f"Context sections: {context_sections}", "debug")
+    _log(f"Context length: {len(context)} chars, {len(context_lines)} lines", "debug")
+    _log(f"Project filter active: {has_filter}", "debug")
+    if DEBUG:
+        # Log full context in debug mode
+        _log(f"--- FULL CONTEXT START ---\n{context}\n--- FULL CONTEXT END ---", "debug")
     
     prompt = _QA_PROMPT.format(context=context, question=question)
 
@@ -1367,18 +1705,103 @@ def ask(question: str, time_range: str = None) -> dict:
             "sources": {},
         }
 
-    print(f"[qa_engine] Total time: {time.time() - _start_time:.2f}s")
+    _log(f"Total time: {time.time() - _start_time:.2f}s")
+    
+    # Detect echo/hallucination: LLM just repeating the question back
+    raw_lower = (raw_response or "").lower().strip()
+    q_lower = (question or "").lower().strip()
+    
+    # Pre-compute scope once for fallback use (lightweight - just string matching)
+    _fallback_scope = None
+    _fallback_project_data = None
+    
+    def _get_fallback_data():
+        """Lazy-load fallback data only when needed (avoids iterating 1000s of records unless necessary)."""
+        nonlocal _fallback_scope, _fallback_project_data
+        if _fallback_scope is None:
+            _fallback_scope = _detect_question_scope(question, records)
+            if _fallback_scope.get("specific_project"):
+                proj_name = _fallback_scope["specific_project"]
+                # Filter records for this project FIRST, then aggregate (much faster)
+                proj_records = [r for r in records if r.get("project") == proj_name]
+                if proj_records:
+                    # Simple aggregation for single project
+                    _fallback_project_data = {
+                        "name": proj_name,
+                        "revenue": sum(float(r.get("revenue") or 0) for r in proj_records),
+                        "cost": sum(float(r.get("cost") or 0) for r in proj_records),
+                        "profit": sum(float(r.get("profit") or 0) for r in proj_records),
+                        "employees": len(set(r.get("employee") for r in proj_records if r.get("employee"))),
+                    }
+        return _fallback_scope, _fallback_project_data
+    
+    # Check if response is just echoing the question (hallucination indicator)
+    # Only check for echo if response is NOT valid JSON (valid JSON means LLM processed it)
+    is_likely_json = raw_lower.strip().startswith('{') or '{"summary"' in raw_lower
+    if raw_lower and q_lower and not is_likely_json:
+        # Remove common prefixes/suffixes for comparison
+        raw_clean = re.sub(r'^(project\s+|details\s+(of|for)\s+|show\s+|get\s+)', '', raw_lower)
+        q_clean = re.sub(r'^(project\s+|details\s+(of|for)\s+|show\s+|get\s+)', '', q_lower)
+        # If response is very similar to question (echo), it's likely hallucination
+        # Must be high similarity (>80% match) to avoid false positives
+        if raw_clean.replace(' ', '') == q_clean.replace(' ', ''):
+            _log(f"WARNING: LLM echoed question back - likely hallucination", "debug")
+            # Return structured response with actual data (lazy-loaded)
+            scope, proj_data = _get_fallback_data()
+            if proj_data:
+                return {
+                    "summary": f"{proj_data['name']}: Revenue=${proj_data['revenue']:,.2f}, Cost=${proj_data['cost']:,.2f}, Profit=${proj_data['profit']:,.2f}, Employees={proj_data['employees']}",
+                    "visual_type": "metric",
+                    "columns": [],
+                    "data": [
+                        {"label": "Revenue", "value": proj_data['revenue']},
+                        {"label": "Cost", "value": proj_data['cost']},
+                        {"label": "Profit", "value": proj_data['profit']},
+                        {"label": "Employees", "value": proj_data['employees']},
+                    ],
+                    "sources": {"total_records": len(records), "fallback": "echo_detection"},
+                }
+    
     # Parse the JSON from the LLM
     parsed_json = _extract_qa_json(raw_response)
     
     # Validate and fix LLM response structure
     if not parsed_json or not isinstance(parsed_json, dict):
+        _log(f"LLM returned non-JSON response, using fallback", "debug")
         parsed_json = {
             "summary": _clean_answer(raw_response),
             "visual_type": "text",
             "data": [],
             "columns": []
         }
+    
+    # Check for hallucination: summary is too short or generic
+    # Only trigger if summary looks like echoed question (not a valid short answer)
+    summary = parsed_json.get("summary", "")
+    summary_lower = summary.lower().strip()
+    looks_like_echo = summary_lower and (
+        summary_lower in q_lower or 
+        q_lower.rstrip('?').rstrip('.') in summary_lower or
+        summary_lower.endswith('details') or
+        summary_lower.endswith('details.')
+    )
+    if summary and len(summary) < 30 and not parsed_json.get("data") and looks_like_echo:
+        # Very short summary that looks like echoed question - likely hallucination
+        _log(f"WARNING: Short echo-like summary with no data - possible hallucination: '{summary}'", "debug")
+        # Try to provide actual data (reuse lazy-loaded fallback)
+        scope, proj_data = _get_fallback_data()
+        if proj_data:
+            parsed_json = {
+                "summary": f"{proj_data['name']}: Revenue=${proj_data['revenue']:,.2f}, Cost=${proj_data['cost']:,.2f}, Profit=${proj_data['profit']:,.2f}, Employees={proj_data['employees']}",
+                "visual_type": "metric",
+                "columns": [],
+                "data": [
+                    {"label": "Revenue", "value": proj_data['revenue']},
+                    {"label": "Cost", "value": proj_data['cost']},
+                    {"label": "Profit", "value": proj_data['profit']},
+                    {"label": "Employees", "value": proj_data['employees']},
+                ],
+            }
     
     # Ensure required fields exist with correct types
     if "summary" not in parsed_json or not isinstance(parsed_json.get("summary"), str):
@@ -1404,6 +1827,15 @@ def ask(question: str, time_range: str = None) -> dict:
     visual_type = parsed_json.get("visual_type", "text")
     raw_data = parsed_json.get("data", [])
     raw_columns = parsed_json.get("columns", [])
+
+    # Scrub LLM placeholder strings from cell values (catches "No data found for X.", "N/A", etc.)
+    _NO_DATA_RE = re.compile(r"no\s+data\s+(found|available)(?: for [^\"]+)?\.*", re.IGNORECASE)
+    if raw_data and isinstance(raw_data, list):
+        for row in raw_data:
+            if isinstance(row, dict):
+                for k, v in list(row.items()):
+                    if isinstance(v, str) and (_NO_DATA_RE.search(v.strip()) or v.strip().lower() in {"n/a", "na", "not available"}):
+                        row[k] = None
     
     if visual_type == "table" and raw_data and not raw_columns:
         # Extract columns from first data row

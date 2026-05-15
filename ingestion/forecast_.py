@@ -1,15 +1,27 @@
 import math
 import re
 import os
+import logging
 import datetime as dt
 from typing import List, Dict, Optional, Tuple
 
+# Respect both DEBUG and DEBUG_FORECAST env vars
+DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 DEBUG_FORECAST = os.environ.get("DEBUG_FORECAST", "").lower() in ("1", "true", "yes")
+_DEBUG_ENABLED = DEBUG or DEBUG_FORECAST
+
+# Structured logger for forecast_
+_f_logger = logging.getLogger("forecast_")
+if not _f_logger.handlers:
+    _f_handler = logging.StreamHandler()
+    _f_handler.setFormatter(logging.Formatter("[%(asctime)s] [forecast_] %(message)s", datefmt="%H:%M:%S"))
+    _f_logger.addHandler(_f_handler)
+    _f_logger.setLevel(logging.DEBUG if _DEBUG_ENABLED else logging.INFO)
 
 
 def _debug(msg: str):
-    if DEBUG_FORECAST:
-        print(f"[forecast_ DEBUG] {msg}")
+    if _DEBUG_ENABLED:
+        _f_logger.debug(msg)
 
 
 from .dataset import (
@@ -17,6 +29,7 @@ from .dataset import (
     get_months_available,
     _parse_month_date,
     GLOBAL_DATASET,
+    match_entities_by_word_boundary,
 )
 from .ai_mapper import _llm_generate, is_llm_available, _extract_json
 
@@ -30,17 +43,21 @@ _FORECAST_KEYWORDS = [
     # Time-based (singular)
     "next month", "next quarter", "next year", "upcoming",
     "next week", "coming month", "coming quarter", "following month",
+    "following quarter", "following year",
     "upcoming quarter", "upcoming quarters", "coming quarters",
     # Time-based (informal)
     "next few months", "couple of months", "few months ahead",
     "quarters ahead", "months ahead",
-    # Current period (often implies forecast for rest of period)
-    "this quarter", "this qtr", "rest of quarter", "rest of year",
+    # Current period (only rest-of-period implies forecast; "this quarter" alone is historical)
+    "rest of quarter", "rest of year",
     # Future tense
     "will be", "would be", "expected to", "expecting", "expect",
     # Planning & scenarios
     "future", "outlook", "budget for", "plan for", "planning",
-    "target for", "what if", "scenario", "simulation",
+    "target for", "what if", "what happens if", "what would happen",
+    "impact of adding", "scenario", "simulation",
+    # Capacity planning
+    "capacity", "capacity for", "capacity planning",
     # Growth
     "grow to", "reach by", "trend forward",
 ]
@@ -71,13 +88,17 @@ def _is_future_date(question: str) -> bool:
     q = question.lower()
     
     # Check for "next month/quarter/year" keywords (singular)
-    if re.search(r"\b(next\s+(?:month|quarter|year)|upcoming|future)\b", q, re.IGNORECASE):
+    if re.search(r"\b(next\s+(?:month|quarter|year)|upcoming|future|coming\s+(?:month|quarter|up)|following\s+(?:month|quarter))\b", q, re.IGNORECASE):
         return True
-    
+
     # Check for "next N months/quarters" patterns
     if re.search(r"\bnext\s+\d+\s+(?:months?|quarters?)\b", q, re.IGNORECASE):
         return True
-    
+
+    # Check for "coming N months/quarters" patterns (e.g. "coming 6 months")
+    if re.search(r"\bcoming\s+\d+\s+(?:months?|quarters?)\b", q, re.IGNORECASE):
+        return True
+
     # Check for "N months/quarters ahead" patterns (including "few")
     if re.search(r"\b(?:one|two|three|four|five|six|few|\d+)\s+(?:months?|quarters?)\s+ahead\b", q, re.IGNORECASE):
         return True
@@ -131,6 +152,10 @@ def _is_past_date(question: str) -> bool:
     current_month = today.month
     
     q = question.lower()
+    
+    # Check for relative past keywords
+    if re.search(r"\b(last\s+(?:month|quarter|year)|previous\s+(?:month|quarter|year)|past\s+(?:month|quarter))\b", q, re.IGNORECASE):
+        return True
     
     # Check for year-only patterns: "in 2024", "for 2024", "2024 revenue"
     year_only_match = re.search(r"\b(?:in|for|during)?\s*(20\d{2})\b", q)
@@ -205,21 +230,22 @@ def is_likely_forecast(question: str) -> bool:
         _debug("is_likely_forecast: Found past date only, returning False")
         return False
 
-    # 2. Check for non-forecast keywords
-    for kw in _NON_FORECAST_KEYWORDS:
-        if kw in q:
-            _debug(f"is_likely_forecast: Found non-forecast keyword '{kw}', returning False")
-            return False
-
-    # 3. Check for strong forecast indicators
+    # 2. Check for strong forecast indicators FIRST
+    # This handles "Compare current revenue with forecast for next month"
     if any(kw in q for kw in _FORECAST_KEYWORDS):
         _debug("is_likely_forecast: Found forecast keyword, returning True")
         return True
 
-    # 4. Check for future dates (dynamically compared to today)
-    if _is_future_date(question):
+    # 3. Check for future dates
+    if has_future:
         _debug("is_likely_forecast: Found future date, returning True")
         return True
+
+    # 4. Check for non-forecast keywords (only if no forecast indicators)
+    for kw in _NON_FORECAST_KEYWORDS:
+        if kw in q:
+            _debug(f"is_likely_forecast: Found non-forecast keyword '{kw}', returning False")
+            return False
 
     _debug(f"is_likely_forecast: No forecast indicators found, returning False")
     return False
@@ -1458,12 +1484,27 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         _debug("No months available, returning insufficient data message")
         return "Insufficient historical data to estimate a forecast."
     last_label = months[-1]
-    base = _parse_month_date(last_label) or dt.date.today().replace(day=1)
+    last_data_date = _parse_month_date(last_label) or dt.date.today().replace(day=1)
+    
+    # Fix: For forecast queries, base should be relative to current date
+    # Only use last_data_date if query has explicit past/specific dates
+    q_lower = question.lower()
+    has_explicit_date = bool(re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}\b", q_lower)) or \
+                        bool(re.search(r"\bq[1-4]\s+\d{4}\b", q_lower))
+    
+    if has_explicit_date:
+        base = last_data_date  # Use last data month for explicit date queries
+        _debug(f"Explicit date in query, using last data month as base: {base}")
+    else:
+        base = dt.date.today().replace(day=1)  # Default: current month as base
+        _debug(f"Using current date as base: {base}")
 
     # Collect known entities for LLM context
     known_projects = _distinct_values(recs, "project")
     known_emps = _distinct_values(recs, "employee")
     _debug(f"Known projects: {known_projects[:5]}..., Known employees: {known_emps[:5]}...")
+
+    # Use shared matcher from dataset for consistent entity resolution across modules
 
     # --- LLM-based question parsing (only if keyword check passed) ---
     llm_parsed = _llm_parse_question(question, known_projects, known_emps)
@@ -1506,6 +1547,27 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         elif llm_horizon_type == "explicit_quarter":
             pass  # explicit_quarter already set
 
+        # Prefer explicit month names in the question over a generic months_n from LLM
+        # Example: "Forecast revenue ... September" should target September, not next month
+        if not explicit_months:
+            regex_months = _find_target_months(question, base)
+            if regex_months:
+                explicit_months = regex_months
+                months_n = None
+                quarters_n = None
+
+        # Prefer explicit quarter mention like "q3" or "q 3" when LLM didn't provide it
+        if explicit_quarter is None:
+            m_q = re.search(r"(?i)\bq\s*([1-4])\b", question)
+            if m_q:
+                qn = int(m_q.group(1))
+                curr_q = ((base.month - 1) // 3) + 1
+                year = base.year if qn >= curr_q else base.year + 1
+                start_month = dt.date(year, (qn - 1) * 3 + 1, 1)
+                explicit_quarter = (qn, year, start_month, f"Q{qn} {year}")
+                months_n = None
+                quarters_n = None
+
         # Default horizon if none specified
         if not months_n and not quarters_n and not explicit_months and not explicit_quarter:
             # Check for year-only patterns like "forecast for 2027" before defaulting
@@ -1513,46 +1575,85 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
             if year_months:
                 explicit_months = year_months
             else:
+                # Final fallback: default to next month
                 months_n = 1  # default to next month
 
-        # Metrics
-        metrics = llm_metrics if llm_metrics else ["revenue", "profit"]
+        # Metrics — prefer LLM metrics; otherwise do a light keyword scan before defaulting
+        if llm_metrics:
+            metrics = llm_metrics
+        else:
+            ql = (question or "").lower()
+            scan_pairs = [
+                ("revenue", "revenue"),
+                ("profit", "profit"),
+                ("cost", "cost"),
+                ("total hours", "total_hours"),
+                ("hours", "total_hours"),
+                ("utilization", "utilization"),
+                ("utilisation", "utilization"),
+                ("headcount", "headcount"),
+                ("vacation days", "vacation_days"),
+                ("vacation", "vacation_days"),
+                ("leave days", "leave_days"),
+                ("leaves", "leave_days"),
+                ("holidays", "holiday_days"),
+                ("holiday", "holiday_days"),
+                ("working days", "working_days"),
+                ("workdays", "working_days"),
+            ]
+            found: List[str] = []
+            for kw, m in scan_pairs:
+                if kw in ql and m not in found:
+                    found.append(m)
+            metrics = found if found else ["revenue", "profit"]
 
         # Scope and targets
         scope = llm_scope if llm_scope in ("overall", "project", "employee") else "overall"
         targets: List[str] = []
 
+        # Fix: If LLM provides targets but scope is "overall", infer scope from target type
+        if llm_targets and scope == "overall":
+            # Check if targets match known projects or employees
+            kp_lower = {p.lower() for p in known_projects}
+            ke_lower = {e.lower() for e in known_emps}
+            for t in llm_targets:
+                t_lower = t.lower()
+                if any(t_lower in p or p in t_lower for p in kp_lower):
+                    scope = "project"
+                    _debug(f"Inferred scope='project' from target '{t}'")
+                    break
+                elif any(t_lower in e or e in t_lower for e in ke_lower):
+                    scope = "employee"
+                    _debug(f"Inferred scope='employee' from target '{t}'")
+                    break
+
         # Validate and match targets
         if scope == "project" and llm_targets:
-            kp_norm = {_norm_key(p): p for p in known_projects}
-            matched: List[str] = []
-            for t in llm_targets:
-                nn = _norm_key(t)
-                if nn in kp_norm:
-                    matched.append(kp_norm[nn])
-                else:
-                    for kn, orig in kp_norm.items():
-                        if nn and (nn in kn or kn in nn):
-                            matched.append(orig)
-            matched = sorted(set(matched))
+            matched: List[str] = match_entities_by_word_boundary(llm_targets, known_projects)
             if not matched:
-                return f"Project not found\n- No matching project for '{', '.join(llm_targets)}'"
-            targets = matched
-        elif scope == "employee" and llm_targets:
-            ke_norm = {_norm_key(e): e for e in known_emps}
-            matched_e: List[str] = []
-            for t in llm_targets:
-                nn = _norm_key(t)
-                if nn in ke_norm:
-                    matched_e.append(ke_norm[nn])
+                # Cross-entity fallback: if targets match employees, switch scope
+                matched_e: List[str] = match_entities_by_word_boundary(llm_targets, known_emps)
+                if matched_e:
+                    _debug(f"LLM scope 'project' had no project matches; switching to employee targets: {matched_e}")
+                    scope = "employee"
+                    targets = matched_e
                 else:
-                    for kn, orig in ke_norm.items():
-                        if nn and (nn in kn or kn in nn):
-                            matched_e.append(orig)
-            matched_e = sorted(set(matched_e))
+                    return f"Project not found\n- No matching project for '{', '.join(llm_targets)}'"
+            else:
+                targets = matched
+        elif scope == "employee" and llm_targets:
+            matched_e: List[str] = match_entities_by_word_boundary(llm_targets, known_emps)
             if not matched_e:
-                return f"Employee not found\n- No matching employee for '{', '.join(llm_targets)}'"
-            targets = matched_e
+                # Cross-entity fallback: if targets match projects, switch scope
+                matched_p: List[str] = match_entities_by_word_boundary(llm_targets, known_projects)
+                if matched_p:
+                    _debug(f"LLM scope 'employee' had no employee matches; switching to project targets: {matched_p}")
+                    scope = "project"
+                    targets = matched_p
+                else:
+                    return f"Employee not found\n- No matching employee for '{', '.join(llm_targets)}'"
+            else:
+                targets = matched_e
 
     else:
         # --- Regex-based fallback (when LLM unavailable or says not a forecast) ---
@@ -1587,17 +1688,7 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         # Extra: if a concrete 'project X' was asked, try to map to known projects; if no match, stop early
         req_projects = _extract_requested_projects(question)
         if req_projects:
-            kp_norm = {_norm_key(p): p for p in known_projects}
-            matched: List[str] = []
-            for rp in req_projects:
-                nn = _norm_key(rp)
-                if nn in kp_norm:
-                    matched.append(kp_norm[nn])
-                else:
-                    for kn, orig in kp_norm.items():
-                        if nn and (nn in kn or kn in nn):
-                            matched.append(orig)
-            matched = sorted(set(matched))
+            matched: List[str] = match_entities_by_word_boundary(req_projects, known_projects)
             if not matched:
                 return f"Project not found\n- No matching project for '{', '.join(req_projects)}'"
             scope = "project"
@@ -1606,17 +1697,7 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         # Extra: explicit employee guard
         req_employees = _extract_requested_employees(question)
         if req_employees:
-            ke_norm = {_norm_key(e): e for e in known_emps}
-            matched_e: List[str] = []
-            for re_emp in req_employees:
-                nn = _norm_key(re_emp)
-                if nn in ke_norm:
-                    matched_e.append(ke_norm[nn])
-                else:
-                    for kn, orig in ke_norm.items():
-                        if nn and (nn in kn or kn in nn):
-                            matched_e.append(orig)
-            matched_e = sorted(set(matched_e))
+            matched_e: List[str] = match_entities_by_word_boundary(req_employees, known_emps)
             if not matched_e:
                 return f"Employee not found\n- No matching employee for '{', '.join(req_employees)}'"
             scope = "employee"

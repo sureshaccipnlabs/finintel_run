@@ -6,7 +6,7 @@ import datetime as dt
 import re
 import threading
 import math
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 _LOCK = threading.Lock()
 GLOBAL_DATASET: List[dict] = []
@@ -744,3 +744,35 @@ def transform_to_api_format(time_range: Optional[str] = None) -> dict:
         "top_performers": build_top_performers(filtered),
         "risks": build_risks(filtered),
     }
+
+
+# ── Shared text/entity utilities ──────────────────────────────────────────────
+def match_entities_by_word_boundary(target_texts: List[str], known_entities: List[str]) -> List[str]:
+    """Match entity names in the provided texts using word-boundary regex.
+
+    - Longest-first ordering to prefer specific entities (e.g., 'John Doe' over 'John').
+    - Overlap avoidance so one span doesn't capture multiple shorter entities.
+    - Returns distinct original-cased entity names present in texts.
+    """
+    text = (" " + " ".join((t or "") for t in target_texts).lower() + " ")
+    matched: List[str] = []
+    spans: List[Tuple[int, int]] = []
+
+    def _overlaps(a: int, b: int) -> bool:
+        for s, e in spans:
+            if a < e and b > s:
+                return True
+        return False
+
+    for ent in sorted((e for e in known_entities if e), key=len, reverse=True):
+        el = ent.lower().strip()
+        if not el:
+            continue
+        for m in re.finditer(r"\b" + re.escape(el) + r"\b", text):
+            s, e = m.span()
+            if not _overlaps(s, e):
+                matched.append(ent)
+                spans.append((s, e))
+                break
+
+    return sorted(set(matched))
