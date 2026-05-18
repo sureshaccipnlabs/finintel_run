@@ -826,8 +826,16 @@ def apply_cost_rates_to_global_dataset(
 
 def apply_latest_known_cost_rates_to_global_dataset(cost_rate_history: list[dict]) -> dict:
     """
-    Apply fallback cost rates for records still missing cost_rate using the latest
-    available cost sheet month that is <= the record month.
+    Apply fallback cost rates for records still missing cost_rate using the
+    nearest available cost sheet by calendar distance.
+
+    Rules:
+    - Distance is |cost_sheet_month_index - record_month_index| in whole months.
+    - The cost sheet with the smallest distance is used.
+    - When two cost sheets are equidistant (one before, one after), the earlier
+      one is preferred.
+    - Works in both directions: a record earlier than all cost sheets uses the
+      oldest cost sheet; a record later than all cost sheets uses the newest.
     """
     if not cost_rate_history:
         return {
@@ -875,15 +883,14 @@ def apply_latest_known_cost_rates_to_global_dataset(cost_rate_history: list[dict
         except Exception:
             continue
 
-        valid_candidates = [
-            h
-            for h in sorted_history
-            if (int(h.get("year")), int(h.get("month"))) <= (rec_year, rec_month)
-        ]
-        if not valid_candidates:
-            continue
-
-        chosen = valid_candidates[-1]
+        rec_idx = rec_year * 12 + rec_month
+        chosen = min(
+            sorted_history,
+            key=lambda h: (
+                abs(int(h["year"]) * 12 + int(h["month"]) - rec_idx),
+                int(h["year"]) * 12 + int(h["month"]),   # tie-break: prefer earlier
+            ),
+        )
         employee_rates = chosen.get("employee_rates") or {}
         employee_project_rates = chosen.get("employee_project_rates") or {}
         employees_with_project_rates = {emp for emp, _ in employee_project_rates.keys()}
