@@ -609,9 +609,10 @@ def _build_dataset_context(records=None, question: str = None):
     _specific_emp_scope  = scope.get("specific_employee") if scope else None
     _matched_proj_for_emp: str | None = None
     if _specific_proj_scope:
-        for _p in {r.get("project") for r in recs if r.get("project")}:
+        for _p in sorted({r.get("project") for r in recs if r.get("project")}):
             if _p.lower() == _specific_proj_scope.lower():
-                _matched_proj_for_emp = _p
+                # Prefer the uppercase/canonical form found in data
+                _matched_proj_for_emp = _p.upper() if _p.upper() in {r.get("project") for r in recs} else _p
                 break
 
     # emp_recs controls what EMPLOYEES summary sees:
@@ -1042,19 +1043,20 @@ RULES:
 16. "Q1" = Jan-Mar, "Q2" = Apr-Jun, "Q3" = Jul-Sep, "Q4" = Oct-Dec
 17. For "top N in Project X" = filter by project first, then rank
 18. IMPORTANT: For "project utilization" or "which project has highest/lowest utilization", ONLY use "AvgUtilisation" from PROJECTS section. NEVER use IndividualUtilisation from EMPLOYEES section for project-level questions.
-19. When comparing numbers, 96.6 > 96.0 > 95.0. Always compare the actual numeric values, not just the first digits.
+19. "which project/employee has highest/lowest X" OR "which contributes most/least to X" = return ONLY the single answer as visual_type="metric" with one label/value pair naming the winner and its value. Use RANKING HINTS directly. Do NOT return a full table of all entities — the user asked for one answer.
+20. When comparing numbers, 96.6 > 96.0 > 95.0. Always compare the actual numeric values, not just the first digits.
 
 ANTI-HALLUCINATION (CRITICAL):
-20. ONLY use data explicitly provided in the context above. NEVER invent, estimate, or assume values.
-21. If a project/employee name is completely absent from the data (zero records), respond as a WHOLE with: {{"summary": "No data found.", "visual_type": "text", "columns": [], "data": []}}. NEVER write "No data found" or any error text as a cell value inside a table — use 0 instead.
-22. Project names are CASE-SENSITIVE and must match EXACTLY as shown in PROJECTS section (e.g., "BARCLAYS" not "Barclays", "CRYSTAL" not "Crystal").
-23. If the question mentions a name similar to but not exactly matching a project/employee, clarify: "Did you mean [exact name from data]?"
-24. NEVER mix data from different projects. Each project's metrics are independent.
-25. For monthly breakdowns, ONLY use months explicitly listed in MonthlyBreakdown for that specific project.
-26. Employee margin: "Margin(overall)" in EMPLOYEES = blended across ALL their projects. For "X's margin in Project Y", use Cost and Revenue from EMPLOYEE DETAILS rows for that project: margin = (Revenue-Cost)/Revenue*100. NEVER use per-project margin for general threshold/ranking questions.
-27. For designation-based questions ("senior developers", "architects", "consultants"): filter employees by their Designation field. If Designation is empty for an employee, do NOT include them in designation-filtered results.
-28. For "Q1"/"Q2"/"Q3"/"Q4" without an explicit year: use the most recent year present in the data. Never sum Q-data across multiple years unless the question explicitly requests multi-year comparison.
-29. For "this year", "current year", or "YTD" questions: ONLY use months from the current calendar year as filtered in the context. Do not include months from prior years.
+21. ONLY use data explicitly provided in the context above. NEVER invent, estimate, or assume values.
+22. If a project/employee name is completely absent from the data (zero records), respond as a WHOLE with: {{"summary": "No data found.", "visual_type": "text", "columns": [], "data": []}}. NEVER write "No data found" or any error text as a cell value inside a table — use 0 instead.
+23. Project names are CASE-SENSITIVE and must match EXACTLY as shown in PROJECTS section (e.g., "BARCLAYS" not "Barclays", "CRYSTAL" not "Crystal").
+24. If the question mentions a name similar to but not exactly matching a project/employee, clarify: "Did you mean [exact name from data]?"
+25. NEVER mix data from different projects. Each project's metrics are independent.
+26. For monthly breakdowns, ONLY use months explicitly listed in MonthlyBreakdown for that specific project.
+27. Employee margin: "Margin(overall)" in EMPLOYEES = blended across ALL their projects. For "X's margin in Project Y", use Cost and Revenue from EMPLOYEE DETAILS rows for that project: margin = (Revenue-Cost)/Revenue*100. NEVER use per-project margin for general threshold/ranking questions.
+28. For designation-based questions ("senior developers", "architects", "consultants"): filter employees by their Designation field. If Designation is empty for an employee, do NOT include them in designation-filtered results.
+29. For "Q1"/"Q2"/"Q3"/"Q4" without an explicit year: use the most recent year present in the data. Never sum Q-data across multiple years unless the question explicitly requests multi-year comparison.
+30. For "this year", "current year", or "YTD" questions: ONLY use months from the current calendar year as filtered in the context. Do not include months from prior years.
 """
 
 
