@@ -459,6 +459,13 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
     ranked = sorted(employees.items(), key=lambda item: item[1]["profit"], reverse=True)
     high_contributors = {name for name, _ in ranked[:contribution_slice]}
     low_contributors = {name for name, _ in ranked[-contribution_slice:]} if contribution_slice else set()
+    # Tie-breaking: an employee whose profit equals any high contributor's profit
+    # should not be labelled Low — they are at least Average.
+    if high_contributors:
+        min_high_profit = min(employees[n]["profit"] for n in high_contributors)
+        low_contributors = {n for n in low_contributors if employees[n]["profit"] < min_high_profit}
+    # Safety: no employee can be in both buckets.
+    low_contributors -= high_contributors
 
     output = []
     for employee_name, data in employees.items():

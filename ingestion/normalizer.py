@@ -74,6 +74,7 @@ def normalize_record(rec: dict) -> dict:
         "profit": rec.get("profit"),
         "margin_pct": rec.get("margin_pct"),
         "utilisation_pct": rec.get("utilisation_pct"),
+        "designation": rec.get("designation") or None,
         "validation_flags": rec.get("validation_flags", []),
         "loss_reasons": rec.get("loss_reasons", []),
         "is_profitable": rec.get("is_profitable"),
