@@ -373,6 +373,11 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
         "give", "me", "show", "list", "what", "how", "the", "for", "and", "with", "summary",
         "detail", "details", "total", "revenue", "profit", "cost", "margin", "hours",
         "attendance", "utilization", "which", "who", "where", "when", "why", "does", "did",
+        # Contraction stems: "What's" → "Whats", "Who's" → "Whos", etc.
+        "whats", "whos", "wheres", "hows", "thats", "theres", "heres", "lets",
+        # Other common question/sentence starters
+        "please", "can", "could", "would", "should", "do", "tell", "give", "need",
+        "want", "find", "fetch", "pull", "return", "provide", "any", "some", "no",
         "overall", "aggregate", "blended", "combined", "all", "average", "avg",
         "employees", "employee", "project", "projects", "highest", "lowest", "top", "bottom",
         "best", "worst", "most", "least", "generated", "has", "have", "had", "are", "is", "was",
@@ -610,14 +615,14 @@ def _build_dataset_context(records=None, question: str = None):
                 break
 
     # emp_recs controls what EMPLOYEES summary sees:
-    #   • project-only question  → project-scoped (shows only that project's employees/metrics)
-    #   • employee+project combo → full recs (employee must always be found; EMPLOYEE DETAILS
-    #     handles project scoping at the row level via _matched_proj_for_emp)
-    #   • employee-only or broad → full recs
-    _both_set = bool(_matched_proj_for_emp and _specific_emp_scope)
+    #   • project specified (alone OR with employee) → project-scoped
+    #     If the employee works on that project they'll be found with correct margin;
+    #     if they don't, "no data" is the correct answer — not blended totals.
+    #   • employee-only or broad question → full recs
+    _proj_lower = _matched_proj_for_emp.lower() if _matched_proj_for_emp else None
     emp_recs = (
-        [r for r in recs if r.get("project") == _matched_proj_for_emp]
-        if (_matched_proj_for_emp and not _both_set) else recs
+        [r for r in recs if (r.get("project") or "").lower() == _proj_lower]
+        if _proj_lower else recs
     )
 
     overall = build_overall_summary(recs)
@@ -644,8 +649,7 @@ def _build_dataset_context(records=None, question: str = None):
     
     # Add missing entities warning
     if scope and scope.get("missing_entities"):
-        all_projects = sorted(set(r.get("project") for r in recs if r.get("project")))
-        lines.append(f"NOTE: '{', '.join(scope['missing_entities'])}' not found in data. Available projects: {', '.join(all_projects)}")
+        lines.append("NOTE: No data found.")
     
     lines.append("")
 
@@ -895,37 +899,51 @@ def _build_dataset_context(records=None, question: str = None):
                          f"HighestProfit={sorted_by_profit[0]['employee_name']}, LowestProfit={sorted_by_profit[-1]['employee_name']}")
         else:
             lines.append("=== EMPLOYEES ===")
-        # Label margin scope so LLM knows whether it's blended or project-specific
-        _margin_scope_label = f"{_matched_proj_for_emp} only" if (_matched_proj_for_emp and not _both_set) else "overall"
-        for emp in employee_summaries:
+        # Label margin scope so LLM knows whether it's project-specific or blended
+        _margin_scope_label = f"{_matched_proj_for_emp} only" if _matched_proj_for_emp else "overall"
+
+        # Cap broad listings; no cap when a specific employee is requested
+        _MAX_EMP_LIST = 20
+        _is_specific = bool(scope and scope.get("specific_employee"))
+        _display_emps = employee_summaries
+        if not _is_specific and len(employee_summaries) > _MAX_EMP_LIST:
+            # Sort by revenue desc so top contributors appear first
+            _display_emps = sorted(
+                employee_summaries, key=lambda x: x.get("total_revenue") or 0, reverse=True
+            )[:_MAX_EMP_LIST]
+
+        for emp in _display_emps:
             desig = emp.get('designation') or ''
             desig_str = f", Designation={desig}" if desig else ""
             lines.append(
                 f"- {emp['employee_name']}{desig_str}: Revenue=${emp['total_revenue']:,.2f}, "
-                f"Profit=${emp['total_profit']:,.2f}, Margin={emp.get('gross_margin_pct') or emp.get('margin_pct') or 0}%({_margin_scope_label}), "
+                f"Cost=${emp['total_cost']:,.2f}, Profit=${emp['total_profit']:,.2f}, "
+                f"Margin={emp.get('gross_margin_pct') or emp.get('margin_pct') or 0}%({_margin_scope_label}), "
                 f"Hours={emp['total_hours']}, IndividualUtilisation={emp['utilization_pct'] or 0}%, "
                 f"Attendance={emp.get('attendance_pct', 100)}%, VacationDays={emp.get('vacation_days', 0)}"
             )
-        if not employee_summaries:
+        if not _display_emps:
             lines.append("- No matching employee found")
+        _hidden = len(employee_summaries) - len(_display_emps)
+        if _hidden > 0:
+            lines.append(f"NOTE: Showing top {_MAX_EMP_LIST} of {len(employee_summaries)} employees by revenue. Ask about a specific employee for full details.")
         lines.append("")
 
-    # Employee Details - include if needed (limit to relevant records)
-    if include_all or scope.get("needs_employee_details"):
+    # Employee Details — only for specific-employee drilldowns.
+    # For broad "list employees" queries the EMPLOYEES summary above is sufficient
+    # and avoids raw-record noise in the context.
+    _specific_emp_for_details = scope.get("specific_employee") if scope else None
+    if _specific_emp_for_details and (include_all or scope.get("needs_employee_details")):
         lines.append("=== EMPLOYEE DETAILS ===")
-        filtered_recs = emp_recs  # already project-scoped when only project asked
-        if scope and scope.get("specific_employee"):
-            emp_name = scope["specific_employee"].lower()
-            filtered_recs = [r for r in filtered_recs if emp_name in (r.get("employee") or "").lower()]
-        # Apply project filter at row level (handles _both_set case where emp_recs = full recs)
-        if _matched_proj_for_emp:
-            filtered_recs = [r for r in filtered_recs if r.get("project") == _matched_proj_for_emp]
+        filtered_recs = emp_recs  # already project-scoped when a project is specified
+        emp_name = _specific_emp_for_details.lower()
+        filtered_recs = [r for r in filtered_recs if emp_name in (r.get("employee") or "").lower()]
         if scope and scope.get("specific_month"):
             month_key = scope["specific_month"].lower()
             filtered_recs = [r for r in filtered_recs if month_key in (r.get("month") or "").lower()]
-        
-        # Limit to 30 records max to keep context manageable
-        for r in filtered_recs[:30]:
+
+        # No row cap — a single employee has at most ~24 month×project records
+        for r in filtered_recs:
             rev = r.get('revenue') or 0
             cst = r.get('cost') or 0
             pft = r.get('profit') or 0
@@ -936,8 +954,6 @@ def _build_dataset_context(records=None, question: str = None):
                 f"Revenue=${rev:,.2f}, Cost=${cst:,.2f}, Profit=${pft:,.2f}, Margin={mgn}%, "
                 f"Utilisation={r.get('utilisation_pct', 0)}%"
             )
-        if len(filtered_recs) > 30:
-            lines.append(f"... and {len(filtered_recs) - 30} more records")
         lines.append("")
 
     # Risks - include if needed
@@ -1030,7 +1046,7 @@ RULES:
 
 ANTI-HALLUCINATION (CRITICAL):
 20. ONLY use data explicitly provided in the context above. NEVER invent, estimate, or assume values.
-21. If a project/employee name is completely absent from the data (zero records), respond as a WHOLE with: {{"summary": "No data found for [name]. Available: [list]", "visual_type": "text", "columns": [], "data": []}}. NEVER write "No data found" or any error text as a cell value inside a table — use 0 instead.
+21. If a project/employee name is completely absent from the data (zero records), respond as a WHOLE with: {{"summary": "No data found.", "visual_type": "text", "columns": [], "data": []}}. NEVER write "No data found" or any error text as a cell value inside a table — use 0 instead.
 22. Project names are CASE-SENSITIVE and must match EXACTLY as shown in PROJECTS section (e.g., "BARCLAYS" not "Barclays", "CRYSTAL" not "Crystal").
 23. If the question mentions a name similar to but not exactly matching a project/employee, clarify: "Did you mean [exact name from data]?"
 24. NEVER mix data from different projects. Each project's metrics are independent.
@@ -1756,13 +1772,7 @@ def ask(question: str, time_range: str = None) -> dict:
     _scope_check = _detect_question_scope(question, records)
     _missing = _scope_check.get("missing_entities", [])
     if _missing:
-        available_emps = sorted({r.get("employee") for r in records if r.get("employee")})
-        available_projs = sorted({r.get("project") for r in records if r.get("project")})
-        _msg = (
-            f"The following were not found in the data: {', '.join(_missing)}. "
-            f"Available employees: {', '.join(available_emps) or 'none'}. "
-            f"Available projects: {', '.join(available_projs) or 'none'}."
-        )
+        _msg = "No data found."
         _elapsed = time.time() - _start_time
         _log(f"Total time: {_elapsed:.2f}s (validation_error)")
         return {

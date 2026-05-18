@@ -48,8 +48,8 @@ _FORECAST_KEYWORDS = [
     # Time-based (informal)
     "next few months", "couple of months", "few months ahead",
     "quarters ahead", "months ahead",
-    # Current period with future-oriented framing
-    "this quarter",
+    # Current period with explicit future-oriented framing (bare "this quarter" is historical)
+    "this quarter outlook", "this quarter forecast", "this quarter projection",
     "rest of quarter", "rest of year",
     # Future tense (compound phrases only — bare 'expect'/'expecting' are too ambiguous)
     "will be", "would be", "expected to",
