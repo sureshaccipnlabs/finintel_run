@@ -185,15 +185,15 @@ def filter_by_range(records: List[dict], time_range: Optional[str] = None) -> Li
     if months_requested <= 0:
         return records
 
-    month_dates = sorted({_parse_month_date(r.get("month", "")) for r in records if _parse_month_date(r.get("month", ""))})
-    if not month_dates:
-        return records
-
-    allowed_months = set(month_dates[-months_requested:])
+    today = dt.date.today()
+    cut_month = today.month - months_requested
+    cut_year = today.year + (cut_month - 1) // 12
+    cut_month = ((cut_month - 1) % 12) + 1
+    cutoff = dt.date(cut_year, cut_month, 1)
 
     return [
         r for r in records
-        if _parse_month_date(r.get("month", "")) in allowed_months
+        if (d := _parse_month_date(r.get("month", ""))) is not None and d >= cutoff
     ]
 
 
