@@ -11,6 +11,7 @@ import hashlib
 import time
 import os
 import logging
+from datetime import date as _date
 
 from .dataset import (
     GLOBAL_DATASET, build_projects, build_monthly, build_overall_summary,
@@ -54,6 +55,19 @@ else:
     print("[qa_engine] Using LEGACY forecast_ module (configured)")
 
 
+# ── Threshold comparison utility ─────────────────────────────────────────────
+
+def _apply_filter(value, op: str, threshold) -> bool:
+    """Return True if value satisfies the comparison (op, threshold). Used in tests."""
+    if value is None:
+        return False
+    try:
+        v, t = float(value), float(threshold)
+    except (TypeError, ValueError):
+        return False
+    return {"<": v < t, "<=": v <= t, ">": v > t, ">=": v >= t, "==": v == t}.get(op, False)
+
+
 # ── QA-specific JSON extraction ───────────────────────────────────────────────
 
 def _clean_qa_json(raw: str) -> str:
@@ -84,13 +98,19 @@ def _extract_qa_json(text: str):
         return json.loads(_clean_qa_json(text))
     except json.JSONDecodeError:
         pass
-    # Try extracting from markdown code block
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if m:
+    # Try extracting from ALL markdown code blocks — prefer the richest one
+    candidates = []
+    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL):
         try:
-            return json.loads(_clean_qa_json(m.group(1)))
+            obj = json.loads(_clean_qa_json(m.group(1)))
+            candidates.append(obj)
         except json.JSONDecodeError:
             pass
+    if candidates:
+        # Prefer block that has visual_type + data; otherwise pick by key count
+        def _score(o):
+            return (bool(o.get("visual_type")) + bool(o.get("data"))) * 100 + len(o)
+        return max(candidates, key=_score)
     # Greedy: find outermost { ... }
     depth, start = 0, None
     for i, ch in enumerate(text):
@@ -318,7 +338,8 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
         scope["needs_monthly"] = True
     
     # Specific month mentioned (with optional year)
-    month_pattern = r"(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\w*[\s,\-]*(\d{4})?"
+    # \b word-boundary anchors prevent matching 'mar' inside 'margin', 'apr' inside 'april', etc.
+    month_pattern = r"\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b[\s,\-]*(\d{4})?"
     month_match = re.search(month_pattern, q)
     if month_match:
         scope["needs_monthly"] = True
@@ -332,21 +353,27 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
         if year_only:
             scope["specific_year"] = year_only.group(1)
     
-    # Employee-related keywords (expanded for natural language)
+    # Employee-related keywords (expanded for natural language + designation roles)
     employee_keywords = [
         "employee", "employees", "person", "people", "who", "top", "bottom", 
         "best", "worst", "performer", "performers", "resource", "resources",
         "team", "staff", "idle", "sitting", "working", "contributor", "contributors",
-        "underutilized", "overloaded", "free", "busy", "risky", "productive"
+        "underutilized", "overloaded", "free", "busy", "risky", "productive",
+        # Designation / role-based keywords
+        "senior", "junior", "lead", "developer", "developers", "architect", "architects",
+        "consultant", "consultants", "manager", "managers", "analyst", "analysts",
+        "engineer", "engineers", "designer", "director", "executive", "head",
+        "designation", "role", "title", "seniority"
     ]
     if any(w in q for w in employee_keywords):
         scope["needs_employee_summary"] = True
     
     # Specific employee name mentioned (capitalized word that's not a common word)
     common_words = {
-        "give", "me", "show", "list", "what", "how", "the", "for", "and", "with", "summary", 
-        "detail", "details", "total", "revenue", "profit", "cost", "margin", "hours", 
+        "give", "me", "show", "list", "what", "how", "the", "for", "and", "with", "summary",
+        "detail", "details", "total", "revenue", "profit", "cost", "margin", "hours",
         "attendance", "utilization", "which", "who", "where", "when", "why", "does", "did",
+        "overall", "aggregate", "blended", "combined", "all", "average", "avg",
         "employees", "employee", "project", "projects", "highest", "lowest", "top", "bottom",
         "best", "worst", "most", "least", "generated", "has", "have", "had", "are", "is", "was",
         "show", "compare", "trend", "performance", "health", "summary", "insights", "issues",
@@ -443,11 +470,15 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
             scope["needs_projects"] = True
             if len(matched_projects) == 1:
                 scope["specific_project"] = matched_projects[0]
-        if matched_employees and not scope.get("specific_employee"):
+        if matched_employees:
             scope["needs_employee_summary"] = True
             scope["needs_employee_details"] = True
-            if len(matched_employees) == 1:
+            if len(matched_employees) == 1 and not scope.get("specific_employee"):
                 scope["specific_employee"] = matched_employees[0]
+            elif len(matched_employees) >= 2:
+                # Multiple employees detected — clear single-employee filter so all are shown
+                scope["specific_employee"] = None
+                scope["mentioned_employees"] = matched_employees
     except Exception:
         pass
 
@@ -495,6 +526,15 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
             scope["mentioned_projects"] = mentioned
             if len(mentioned) >= 2:
                 scope["specific_project"] = None  # Show ALL mentioned projects, not just one
+
+    # Also detect multi-project references without explicit compare keyword
+    # e.g. "BARCLAYS and CRYSTAL performance" — no 'compare', but two project names
+    if actual_projects_original and not scope.get("mentioned_projects"):
+        all_proj_matched = match_entities_by_word_boundary([question], list(actual_projects_original.values()))
+        if len(all_proj_matched) >= 2:
+            scope["mentioned_projects"] = all_proj_matched
+            scope["specific_project"] = None
+            scope["needs_projects"] = True
     
     # Insight/summary queries (executive level)
     insight_keywords = [
@@ -549,10 +589,36 @@ def _build_dataset_context(records=None, question: str = None):
     # Year-aware context narrowing: when exactly 1 year is mentioned, restrict context to that year.
     # Applied locally here only — does NOT touch the records used by Forecast in ask().
     specific_year = scope.get("specific_year") if scope else None
+    # Detect "this year" / "current year" / "YTD" phrases when no explicit 4-digit year found
+    _THIS_YEAR_RE = re.compile(r"\b(this year|current year|this fiscal year|ytd|year to date)\b", re.IGNORECASE)
+    if not specific_year and _THIS_YEAR_RE.search(question or ""):
+        specific_year = str(_date.today().year)
     if specific_year:
         year_matches = re.findall(r"\b(20\d{2})\b", question or "")
-        if len(year_matches) == 1:  # Only filter when unambiguous (not multi-year compare)
+        if len(year_matches) <= 1:  # Filter when 0 or 1 explicit year (not multi-year compare)
             recs = [r for r in recs if specific_year in (r.get("month") or "")]
+
+    # Resolve the canonical project name for employee-scoped filtering.
+    # Must be computed early (before PROJECTS block) so EMPLOYEE DETAILS can be scoped.
+    _specific_proj_scope = scope.get("specific_project") if scope else None
+    _specific_emp_scope  = scope.get("specific_employee") if scope else None
+    _matched_proj_for_emp: str | None = None
+    if _specific_proj_scope:
+        for _p in {r.get("project") for r in recs if r.get("project")}:
+            if _p.lower() == _specific_proj_scope.lower():
+                _matched_proj_for_emp = _p
+                break
+
+    # emp_recs controls what EMPLOYEES summary sees:
+    #   • project-only question  → project-scoped (shows only that project's employees/metrics)
+    #   • employee+project combo → full recs (employee must always be found; EMPLOYEE DETAILS
+    #     handles project scoping at the row level via _matched_proj_for_emp)
+    #   • employee-only or broad → full recs
+    _both_set = bool(_matched_proj_for_emp and _specific_emp_scope)
+    emp_recs = (
+        [r for r in recs if r.get("project") == _matched_proj_for_emp]
+        if (_matched_proj_for_emp and not _both_set) else recs
+    )
 
     overall = build_overall_summary(recs)
     months = get_months_available(recs)
@@ -812,7 +878,7 @@ def _build_dataset_context(records=None, question: str = None):
 
     # Employee Summaries - include if needed
     if include_all or scope.get("needs_employee_summary"):
-        employee_summaries = build_employee_summaries(recs)
+        employee_summaries = build_employee_summaries(emp_recs)
         # Filter to specific employee if mentioned
         if scope and scope.get("specific_employee"):
             emp_name = scope["specific_employee"].lower()
@@ -829,10 +895,14 @@ def _build_dataset_context(records=None, question: str = None):
                          f"HighestProfit={sorted_by_profit[0]['employee_name']}, LowestProfit={sorted_by_profit[-1]['employee_name']}")
         else:
             lines.append("=== EMPLOYEES ===")
+        # Label margin scope so LLM knows whether it's blended or project-specific
+        _margin_scope_label = f"{_matched_proj_for_emp} only" if (_matched_proj_for_emp and not _both_set) else "overall"
         for emp in employee_summaries:
+            desig = emp.get('designation') or ''
+            desig_str = f", Designation={desig}" if desig else ""
             lines.append(
-                f"- {emp['employee_name']}: Revenue=${emp['total_revenue']:,.2f}, "
-                f"Profit=${emp['total_profit']:,.2f}, Margin={emp.get('gross_margin_pct') or emp.get('margin_pct') or 0}%, "
+                f"- {emp['employee_name']}{desig_str}: Revenue=${emp['total_revenue']:,.2f}, "
+                f"Profit=${emp['total_profit']:,.2f}, Margin={emp.get('gross_margin_pct') or emp.get('margin_pct') or 0}%({_margin_scope_label}), "
                 f"Hours={emp['total_hours']}, IndividualUtilisation={emp['utilization_pct'] or 0}%, "
                 f"Attendance={emp.get('attendance_pct', 100)}%, VacationDays={emp.get('vacation_days', 0)}"
             )
@@ -843,11 +913,13 @@ def _build_dataset_context(records=None, question: str = None):
     # Employee Details - include if needed (limit to relevant records)
     if include_all or scope.get("needs_employee_details"):
         lines.append("=== EMPLOYEE DETAILS ===")
-        # Filter records if specific month/employee mentioned
-        filtered_recs = recs
+        filtered_recs = emp_recs  # already project-scoped when only project asked
         if scope and scope.get("specific_employee"):
             emp_name = scope["specific_employee"].lower()
-            filtered_recs = [r for r in recs if emp_name in (r.get("employee") or "").lower()]
+            filtered_recs = [r for r in filtered_recs if emp_name in (r.get("employee") or "").lower()]
+        # Apply project filter at row level (handles _both_set case where emp_recs = full recs)
+        if _matched_proj_for_emp:
+            filtered_recs = [r for r in filtered_recs if r.get("project") == _matched_proj_for_emp]
         if scope and scope.get("specific_month"):
             month_key = scope["specific_month"].lower()
             filtered_recs = [r for r in filtered_recs if month_key in (r.get("month") or "").lower()]
@@ -855,11 +927,13 @@ def _build_dataset_context(records=None, question: str = None):
         # Limit to 30 records max to keep context manageable
         for r in filtered_recs[:30]:
             rev = r.get('revenue') or 0
+            cst = r.get('cost') or 0
             pft = r.get('profit') or 0
+            mgn = r.get('margin_pct') or (round((pft / rev) * 100, 2) if rev > 0 else 0)
             lines.append(
                 f"- {r.get('employee', '?')} | {r.get('project', '?')} | {r.get('month', '?')} | "
                 f"Hours={r.get('actual_hours', 0)}, Vacation={r.get('vacation_days', 0)}, "
-                f"Revenue=${rev:,.2f}, Profit=${pft:,.2f}, "
+                f"Revenue=${rev:,.2f}, Cost=${cst:,.2f}, Profit=${pft:,.2f}, Margin={mgn}%, "
                 f"Utilisation={r.get('utilisation_pct', 0)}%"
             )
         if len(filtered_recs) > 30:
@@ -961,6 +1035,10 @@ ANTI-HALLUCINATION (CRITICAL):
 23. If the question mentions a name similar to but not exactly matching a project/employee, clarify: "Did you mean [exact name from data]?"
 24. NEVER mix data from different projects. Each project's metrics are independent.
 25. For monthly breakdowns, ONLY use months explicitly listed in MonthlyBreakdown for that specific project.
+26. Employee margin: "Margin(overall)" in EMPLOYEES = blended across ALL their projects. For "X's margin in Project Y", use Cost and Revenue from EMPLOYEE DETAILS rows for that project: margin = (Revenue-Cost)/Revenue*100. NEVER use per-project margin for general threshold/ranking questions.
+27. For designation-based questions ("senior developers", "architects", "consultants"): filter employees by their Designation field. If Designation is empty for an employee, do NOT include them in designation-filtered results.
+28. For "Q1"/"Q2"/"Q3"/"Q4" without an explicit year: use the most recent year present in the data. Never sum Q-data across multiple years unless the question explicitly requests multi-year comparison.
+29. For "this year", "current year", or "YTD" questions: ONLY use months from the current calendar year as filtered in the context. Do not include months from prior years.
 """
 
 
@@ -1672,6 +1750,34 @@ def ask(question: str, time_range: str = None) -> dict:
             "columns": [],
             "data": [],
             "sources": {},
+        }
+
+    # Early-return if scope detects entities not in the dataset (prevents hallucination)
+    _scope_check = _detect_question_scope(question, records)
+    _missing = _scope_check.get("missing_entities", [])
+    if _missing:
+        available_emps = sorted({r.get("employee") for r in records if r.get("employee")})
+        available_projs = sorted({r.get("project") for r in records if r.get("project")})
+        _msg = (
+            f"The following were not found in the data: {', '.join(_missing)}. "
+            f"Available employees: {', '.join(available_emps) or 'none'}. "
+            f"Available projects: {', '.join(available_projs) or 'none'}."
+        )
+        _elapsed = time.time() - _start_time
+        _log(f"Total time: {_elapsed:.2f}s (validation_error)")
+        return {
+            "summary": _msg,
+            "visual_type": "text",
+            "columns": [],
+            "data": [],
+            "sources": {
+                "total_records": len(records),
+                "months": get_months_available(records),
+                "time_range": time_range or "ALL",
+                "forecast": False,
+                "validation_error": True,
+                "missing_entities": _missing,
+            },
         }
 
     # Build targeted context based on question (smart context selection)

@@ -409,6 +409,7 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
                 "monthly": {},
                 "projects": {},
                 "designation": "",
+                "_seen_time_months": set(),  # dedup personal time attrs across multi-project same-month records
             }
 
         emp = employees[employee_name]
@@ -417,13 +418,19 @@ def build_employee_summaries(records: List[dict]) -> List[dict]:
         emp["cost"] += cost
         emp["profit"] += profit
         emp["approved_hours"] += approved_hours
-        emp["vacation_days"] += vacation_days
-        emp["leave_days"] += leave_days
-        emp["working_days"] += working_days
         if not emp["designation"] and r.get("designation"):
             emp["designation"] = r["designation"]
 
         month = r.get("month") or "Unknown"
+
+        # vacation_days / leave_days / working_days are personal calendar attrs (not per-project).
+        # An employee in 2 project sheets for the same month would otherwise be double-counted.
+        if month not in emp["_seen_time_months"]:
+            emp["_seen_time_months"].add(month)
+            emp["vacation_days"] += vacation_days
+            emp["leave_days"] += leave_days
+            emp["working_days"] += working_days
+
         if month not in emp["monthly"]:
             emp["monthly"][month] = {"revenue": 0.0, "cost": 0.0}
         emp["monthly"][month]["revenue"] += revenue

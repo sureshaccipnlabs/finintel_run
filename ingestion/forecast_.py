@@ -48,12 +48,14 @@ _FORECAST_KEYWORDS = [
     # Time-based (informal)
     "next few months", "couple of months", "few months ahead",
     "quarters ahead", "months ahead",
-    # Current period (only rest-of-period implies forecast; "this quarter" alone is historical)
+    # Current period with future-oriented framing
+    "this quarter",
     "rest of quarter", "rest of year",
-    # Future tense
-    "will be", "would be", "expected to", "expecting", "expect",
-    # Planning & scenarios
-    "future", "outlook", "budget for", "plan for", "planning",
+    # Future tense (compound phrases only — bare 'expect'/'expecting' are too ambiguous)
+    "will be", "would be", "expected to",
+    "expect for", "outlook for",              # compound: "expect for July", "outlook for Q3"
+    # Planning & scenarios (compound phrases only — 'planning'/'future'/'outlook' alone are historical)
+    "budget for", "plan for",
     "target for", "what if", "what happens if", "what would happen",
     "impact of adding", "scenario", "simulation",
     # Capacity planning
