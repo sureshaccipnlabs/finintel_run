@@ -678,12 +678,13 @@ def _parse_with_patterns(rows, inactive_names=None):
     merged = {}
     for h_idx in fortnight_headers:
         header = rows[h_idx]
-        col_map = _map_columns(header, ["name", "project", "leaves", "working_days", "max_hours", "status"])
+        col_map = _map_columns(header, ["name", "project", "leaves", "working_days", "max_hours", "designation", "status"])
         fort_data = _extract_employees(rows, h_idx, col_map, inactive_names=inactive_names)
         for name, data in fort_data.items():
             if name not in merged:
                 merged[name] = {k: 0 for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "leave_days", "holiday_days", "working_days"]}
                 merged[name]["project"] = data["project"]
+                merged[name]["designation"] = data.get("designation", "")
             for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "leave_days", "holiday_days", "working_days"]:
                 merged[name][k] += data.get(k, 0)
 
@@ -715,6 +716,8 @@ def _parse_with_patterns(rows, inactive_names=None):
                         merged[name]["vacation_days"] = sm["vacation_days"]
                     if sm.get("leave_days"):
                         merged[name]["leave_days"] = sm["leave_days"]
+                    if sm.get("designation") and not merged[name].get("designation"):
+                        merged[name]["designation"] = sm["designation"]
                 else:
                     merged[name].setdefault("billing_rate", 0)
                     merged[name].setdefault("cost_rate", 0)
