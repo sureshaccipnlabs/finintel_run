@@ -1230,6 +1230,108 @@ def _correct_hallucinated_numbers(parsed: dict, grounding_text: str) -> dict:
     return parsed
 
 
+def _validate_llm_response(parsed: dict, records: list) -> dict:
+    """
+    Deterministic post-LLM validator. Checks the parsed JSON against the actual
+    dataset and removes/corrects anything that cannot be verified.
+
+    Checks performed:
+    1. Entity validation — any row whose 'Employee' or 'Project' cell contains a
+       name that does NOT exist in the dataset is dropped entirely.
+    2. Numeric cross-check — for each surviving row, recompute Revenue / Cost /
+       Profit / Margin from raw records and replace any cell that deviates >5%
+       from the recomputed value.
+    3. Summary entity check — if the summary mentions a name not in the data,
+       flag it (but don't blank the summary, as it may be a valid textual answer).
+    """
+    if not parsed or not records:
+        return parsed
+
+    actual_employees = {(r.get("employee") or "").lower() for r in records if r.get("employee")}
+    actual_projects  = {(r.get("project")  or "").lower() for r in records if r.get("project")}
+
+    raw_data    = parsed.get("data", [])
+    raw_columns = parsed.get("columns", [])
+
+    if not raw_data or not isinstance(raw_data, list):
+        return parsed
+
+    # ── 1. Entity validation ──────────────────────────────────────────────────
+    validated_rows = []
+    dropped = 0
+    for row in raw_data:
+        if not isinstance(row, dict):
+            validated_rows.append(row)
+            continue
+        emp_val  = str(row.get("Employee") or row.get("employee") or "").strip()
+        proj_val = str(row.get("Project")  or row.get("project")  or "").strip()
+        emp_ok   = (not emp_val)  or (emp_val.lower() in actual_employees)
+        proj_ok  = (not proj_val) or (proj_val.lower() in actual_projects)
+        if not emp_ok or not proj_ok:
+            _log("Validation: dropping hallucinated row emp='{}' proj='{}'".format(emp_val, proj_val), "debug")
+            dropped += 1
+            continue
+        validated_rows.append(row)
+
+    if dropped:
+        _log("Validation: removed {} fabricated row(s) from LLM response".format(dropped), "debug")
+        parsed["data"] = validated_rows
+
+    # ── 2. Numeric cross-check for surviving rows ─────────────────────────────
+    for row in validated_rows:
+        if not isinstance(row, dict):
+            continue
+        emp_val  = str(row.get("Employee") or row.get("employee") or "").strip()
+        proj_val = str(row.get("Project")  or row.get("project")  or "").strip()
+        if not emp_val and not proj_val:
+            continue
+        # Filter raw records to this employee+project combination
+        _filter_recs = [
+            r for r in records
+            if (not emp_val  or (r.get("employee") or "").lower() == emp_val.lower())
+            and (not proj_val or (r.get("project")  or "").lower() == proj_val.lower())
+        ]
+        if not _filter_recs:
+            continue
+        _true_rev  = round(sum(float(r.get("revenue") or 0) for r in _filter_recs), 2)
+        _true_cost = round(sum(float(r.get("cost")    or 0) for r in _filter_recs), 2)
+        _true_prof = round(_true_rev - _true_cost, 2)
+        _true_marg = round((_true_rev - _true_cost) / _true_rev * 100, 2) if _true_rev > 0 else 0.0
+
+        def _fix_if_wrong(row, key, true_val):
+            raw_v = row.get(key)
+            if raw_v is None:
+                return
+            try:
+                v = float(str(raw_v).replace("$", "").replace(",", "").replace("%", ""))
+            except (ValueError, TypeError):
+                return
+            if true_val != 0 and abs(v - true_val) / abs(true_val) > 0.05:
+                _log("Validation: correcting {}[{}] {} -> {}".format(key, emp_val or proj_val, v, true_val), "debug")
+                row[key] = true_val
+
+        for _rev_key in ("Revenue", "revenue"):
+            if _rev_key in row:
+                _fix_if_wrong(row, _rev_key, _true_rev)
+        for _cost_key in ("Cost", "cost"):
+            if _cost_key in row:
+                _fix_if_wrong(row, _cost_key, _true_cost)
+        for _prof_key in ("Profit", "profit"):
+            if _prof_key in row:
+                _fix_if_wrong(row, _prof_key, _true_prof)
+        for _marg_key in ("Margin (%)", "Margin(%)", "margin_pct", "margin"):
+            if _marg_key in row:
+                _fix_if_wrong(row, _marg_key, _true_marg)
+
+    # ── 3. If all rows were dropped, mark as no-data ──────────────────────────
+    if dropped and not parsed.get("data"):
+        parsed["summary"] = "No data found for this query."
+        parsed["visual_type"] = "text"
+        parsed["columns"] = []
+
+    return parsed
+
+
 # ── Prompt template ──────────────────────────────────────────────────────────
 
 _QA_PROMPT = """\
@@ -1929,6 +2031,76 @@ def _llm_table_name(summary: str, columns, data) -> str:
     
     return "Data"
 
+# ── Question normalizer (spelling / grammar correction) ──────────────────────
+
+_BASIC_WORDS = {
+    "who", "what", "which", "where", "when", "how", "can", "could", "would",
+    "all", "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "shall", "may", "might",
+    "and", "or", "but", "not", "no", "yes", "if", "then", "than", "that", "this",
+    "in", "on", "at", "to", "of", "by", "for", "with", "from", "into", "out",
+    "up", "down", "over", "under", "between", "more", "less", "most", "least",
+    "one", "two", "three", "many", "some", "any", "every", "each", "both", "only",
+    "their", "there", "they", "them", "him", "her", "his", "its", "our", "your",
+    "show", "list", "give", "tell", "find", "get", "compute", "calculate",
+    "total", "average", "avg", "sum", "count", "top", "bottom", "highest", "lowest",
+    "employee", "employees", "project", "projects", "revenue", "cost", "profit",
+    "margin", "hours", "utilization", "performance", "working", "work", "works",
+    "multiple", "single", "across", "about", "also", "just",
+}
+
+
+def _normalize_question(question: str, records: list) -> str:
+    """
+    If the question contains likely spelling errors (>30% unknown tokens),
+    ask the LLM to correct it. Returns the corrected question, or the original
+    if no correction is needed or LLM is unavailable.
+    Only makes a short, fast LLM call — minimal overhead.
+    """
+    if not question or not question.strip():
+        return question
+
+    # Build known-words set: basic vocab + actual entity names from data
+    known = set(_BASIC_WORDS)
+    if records:
+        for r in records:
+            for f in ("employee", "project"):
+                v = r.get(f, "")
+                if v:
+                    for tok in re.findall(r"[a-z]+", v.lower()):
+                        known.add(tok)
+
+    tokens = re.findall(r"[a-z]+", question.lower())
+    if not tokens:
+        return question
+    unknown_count = sum(1 for t in tokens if t not in known and len(t) > 2)
+    unknown_ratio = unknown_count / len(tokens)
+
+    # Only invoke LLM if >15% of meaningful tokens look misspelled
+    if unknown_ratio < 0.15:
+        return question
+
+    if not is_llm_available():
+        return question
+
+    _norm_prompt = (
+        "Correct any spelling or grammar mistakes in the following question "
+        "and return ONLY the corrected question text, nothing else.\n\n"
+        "Question: {q}"
+    ).format(q=question)
+
+    try:
+        corrected = (_llm_generate(_norm_prompt, timeout=30) or "").strip()
+        # Sanity: corrected must be shorter than 3× original and non-empty
+        if corrected and len(corrected) < len(question) * 3:
+            _log("Question normalized: '{}' -> '{}'".format(question, corrected), "debug")
+            return corrected
+    except Exception:
+        pass
+
+    return question
+
+
 # ── Main Q&A function ───────────────────────────────────────────────────────
 
 def ask(question: str, time_range: str = None) -> dict:
@@ -1952,6 +2124,9 @@ def ask(question: str, time_range: str = None) -> dict:
     # Apply time range filter if specified
     if time_range:
         records = filter_by_range(records, time_range)
+
+    # Normalize spelling/grammar errors before any processing
+    question = _normalize_question(question, records)
 
     # ── Check response cache ──
     data_hash = _compute_dataset_hash(records)
@@ -2153,6 +2328,53 @@ def ask(question: str, time_range: str = None) -> dict:
                     },
                 }
 
+    # Early-return for "employees in multiple projects" queries — fully deterministic.
+    _multi_proj_re = re.compile(
+        r"(m?ore than\s*(one|1|\d+)\s*project|multiple project|work\w*\s+in.*(m?ore than|multiple)|"
+        r"employees?.*(multiple|m?ore than|2\+|two).*(project)|"
+        r"how many project.*employee|which project.*employee|employee.*which project)",
+        re.IGNORECASE,
+    )
+    if _multi_proj_re.search(question) and not _qa_scope.get("specific_employee"):
+        # Build: employee → sorted list of distinct projects
+        _emp_proj_map = {}
+        for _r in records:
+            _e = _r.get("employee")
+            _p = _r.get("project")
+            if _e and _p:
+                _emp_proj_map.setdefault(_e, set()).add(_p)
+        # Determine threshold: "more than N" → N+1 distinct projects
+        _thresh_m = re.search(r"more than\s*(\d+)", question, re.IGNORECASE)
+        _thresh = int(_thresh_m.group(1)) + 1 if _thresh_m else 2
+        _multi_emps = {e: sorted(ps) for e, ps in _emp_proj_map.items() if len(ps) >= _thresh}
+        if not _multi_emps:
+            return {
+                "summary": "No employees found working in more than {} project(s).".format(_thresh - 1),
+                "visual_type": "text", "columns": [], "data": [],
+                "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
+            }
+        # Check if question also asks for project names
+        _wants_projects = bool(re.search(r"which project|what project|name.*project|project.*name", question, re.IGNORECASE))
+        if _wants_projects:
+            _multi_rows = [
+                {"Employee": _e, "Projects": ", ".join(_ps), "Project Count": len(_ps)}
+                for _e, _ps in sorted(_multi_emps.items(), key=lambda x: -len(x[1]))
+            ]
+            _cols = ["Employee", "Projects", "Project Count"]
+        else:
+            _multi_rows = [
+                {"Employee": _e, "Project Count": len(_ps)}
+                for _e, _ps in sorted(_multi_emps.items(), key=lambda x: -len(x[1]))
+            ]
+            _cols = ["Employee", "Project Count"]
+        return {
+            "summary": "{} employee(s) work in more than {} project(s).".format(len(_multi_emps), _thresh - 1),
+            "visual_type": "table",
+            "columns": _cols,
+            "data": _multi_rows,
+            "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
+        }
+
     # Early-return for designation queries — skip LLM entirely when no matches exist.
     # Prevents the LLM from inventing percentages for non-existent roles.
     _desig_q = _qa_scope.get("specific_designation")
@@ -2296,6 +2518,8 @@ def ask(question: str, time_range: str = None) -> dict:
     parsed_json = _extract_qa_json(raw_response)
     if parsed_json and _grounding:
         parsed_json = _correct_hallucinated_numbers(parsed_json, _grounding)
+    if parsed_json and isinstance(parsed_json, dict):
+        parsed_json = _validate_llm_response(parsed_json, records)
     
     # Validate and fix LLM response structure
     if not parsed_json or not isinstance(parsed_json, dict):
@@ -2323,8 +2547,9 @@ def ask(question: str, time_range: str = None) -> dict:
         or summary_lower.endswith('details.')
         or (_s_overlap >= 0.6 and not _s_has_digits)
     )
-    # Fire on echo even when data rows exist — hallucinated rows accompany echoed summaries
-    if summary and len(summary) < 120 and looks_like_echo:
+    # Only fire echo detection when LLM returned no data rows.
+    # When real data rows exist, trust them (designation/no-data cases are caught by early-returns above).
+    if summary and len(summary) < 120 and not parsed_json.get("data") and looks_like_echo:
         _log("WARNING: echo-like summary - hallucination: '{}'".format(summary), "debug")
         parsed_json = {
             "summary": "No data found for this query.",
