@@ -289,6 +289,27 @@ def build_monthly(records: List[dict]) -> dict:
     return monthly
 
 
+def build_monthly_by_project(records: List[dict], project: str) -> dict:
+    """Group records for a single project by month, summing financial and hour fields."""
+    proj_lower = project.lower()
+    monthly: dict = {}
+    for r in records:
+        if (r.get("project") or "").lower() != proj_lower:
+            continue
+        m = r.get("month") or "Unknown"
+        if m not in monthly:
+            monthly[m] = {"revenue": 0.0, "cost": 0.0, "profit": 0.0, "hours": 0.0}
+        monthly[m]["revenue"] += _to_num(r.get("revenue"))
+        monthly[m]["cost"] += _to_num(r.get("cost"))
+        monthly[m]["hours"] += _to_num(r.get("actual_hours"))
+    for v in monthly.values():
+        v["revenue"] = round(v["revenue"], 2)
+        v["cost"] = round(v["cost"], 2)
+        v["profit"] = round(v["revenue"] - v["cost"], 2)
+        v["hours"] = round(v["hours"], 2)
+    return monthly
+
+
 def build_overall_summary(records: List[dict]) -> dict:
     total_rev = 0.0
     total_cost = 0.0
@@ -763,6 +784,106 @@ def transform_to_api_format(time_range: Optional[str] = None) -> dict:
         "overall_summary": build_overall_summary(filtered),
         "top_performers": build_top_performers(filtered),
         "risks": build_risks(filtered),
+    }
+
+
+def build_full_analytics(records: List[dict]) -> dict:
+    """Pre-compute six analytical slices from records in a single pass.
+
+    Returned keys
+    ─────────────
+    emp_month  — (employee, month)   → revenue, cost, profit, hours, leave_days, margin_pct
+    proj_month — (project,  month)   → revenue, cost, profit, hours, margin_pct
+    emp_proj   — (employee, project) → revenue, cost, profit, hours, margin_pct
+    proj_only  — project             → revenue, cost, profit, hours, employee_count, margin_pct
+    month_only — month               → revenue, cost, profit, hours, employee_count, margin_pct
+    emp_only   — employee            → revenue, cost, profit, hours, month_count, margin_pct
+    """
+    emp_month:  dict = {}
+    proj_month: dict = {}
+    emp_proj:   dict = {}
+    proj_only:  dict = {}
+    month_only: dict = {}
+    emp_only:   dict = {}
+
+    for r in records:
+        emp  = r.get("employee") or "Unknown"
+        proj = r.get("project")  or "Unknown"
+        mon  = r.get("month")    or "Unknown"
+        rev   = _to_num(r.get("revenue"))
+        cost  = _to_num(r.get("cost"))
+        hrs   = _to_num(r.get("actual_hours"))
+        leave = _to_num(r.get("vacation_days"))
+
+        k = (emp, mon)
+        if k not in emp_month:
+            emp_month[k] = {"revenue": 0.0, "cost": 0.0, "profit": 0.0,
+                            "hours": 0.0, "leave_days": 0.0, "margin_pct": 0.0}
+        d = emp_month[k]
+        d["revenue"] += rev; d["cost"] += cost; d["hours"] += hrs; d["leave_days"] += leave
+
+        k = (proj, mon)
+        if k not in proj_month:
+            proj_month[k] = {"revenue": 0.0, "cost": 0.0, "profit": 0.0,
+                             "hours": 0.0, "margin_pct": 0.0}
+        d = proj_month[k]
+        d["revenue"] += rev; d["cost"] += cost; d["hours"] += hrs
+
+        k = (emp, proj)
+        if k not in emp_proj:
+            emp_proj[k] = {"revenue": 0.0, "cost": 0.0, "profit": 0.0,
+                           "hours": 0.0, "margin_pct": 0.0}
+        d = emp_proj[k]
+        d["revenue"] += rev; d["cost"] += cost; d["hours"] += hrs
+
+        if proj not in proj_only:
+            proj_only[proj] = {"revenue": 0.0, "cost": 0.0, "profit": 0.0,
+                               "hours": 0.0, "employee_count": 0,
+                               "margin_pct": 0.0, "_emp_set": set()}
+        d = proj_only[proj]
+        d["revenue"] += rev; d["cost"] += cost; d["hours"] += hrs; d["_emp_set"].add(emp)
+
+        if mon not in month_only:
+            month_only[mon] = {"revenue": 0.0, "cost": 0.0, "profit": 0.0,
+                               "hours": 0.0, "employee_count": 0,
+                               "margin_pct": 0.0, "_emp_set": set()}
+        d = month_only[mon]
+        d["revenue"] += rev; d["cost"] += cost; d["hours"] += hrs; d["_emp_set"].add(emp)
+
+        if emp not in emp_only:
+            emp_only[emp] = {"revenue": 0.0, "cost": 0.0, "profit": 0.0,
+                             "hours": 0.0, "month_count": 0,
+                             "margin_pct": 0.0, "_mon_set": set()}
+        d = emp_only[emp]
+        d["revenue"] += rev; d["cost"] += cost; d["hours"] += hrs; d["_mon_set"].add(mon)
+
+    def _fin(d: dict):
+        d["revenue"]    = round(d["revenue"], 2)
+        d["cost"]       = round(d["cost"], 2)
+        d["profit"]     = round(d["revenue"] - d["cost"], 2)
+        d["hours"]      = round(d["hours"], 2)
+        d["margin_pct"] = round(d["profit"] / d["revenue"] * 100, 2) if d["revenue"] > 0 else 0.0
+
+    for v in emp_month.values():
+        _fin(v); v["leave_days"] = round(v["leave_days"], 1)
+    for v in proj_month.values():
+        _fin(v)
+    for v in emp_proj.values():
+        _fin(v)
+    for v in proj_only.values():
+        _fin(v); v["employee_count"] = len(v.pop("_emp_set"))
+    for v in month_only.values():
+        _fin(v); v["employee_count"] = len(v.pop("_emp_set"))
+    for v in emp_only.values():
+        _fin(v); v["month_count"] = len(v.pop("_mon_set"))
+
+    return {
+        "emp_month":  emp_month,
+        "proj_month": proj_month,
+        "emp_proj":   emp_proj,
+        "proj_only":  proj_only,
+        "month_only": month_only,
+        "emp_only":   emp_only,
     }
 
 

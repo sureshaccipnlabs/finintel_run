@@ -18,7 +18,8 @@ from .dataset import (
     GLOBAL_DATASET, build_projects, build_monthly, build_overall_summary,
     build_top_performers, build_risks, get_months_available, filter_by_range,
     build_employee_summaries, set_on_dataset_change_callback, _trend_from_values,
-    _calc_margin, match_entities_by_word_boundary
+    _calc_margin, match_entities_by_word_boundary, _parse_month_date,
+    build_monthly_by_project, build_full_analytics,
 )
 from .ai_mapper import _llm_generate, is_llm_available
 
@@ -269,6 +270,49 @@ def _fuzzy_match_suggestion(typo: str, known_names: list, threshold: float = 0.6
             best_match = name
     
     return best_match if best_score >= threshold else None
+
+
+# ── Month / employee fuzzy resolvers ─────────────────────────────────────────
+
+def match_month(query_month: str, stored_months: list) -> list:
+    """Return stored month labels that match the query string.
+
+    Tries exact match first, then substring / prefix match (first 3 chars).
+    Example: "april" matches "April 2026"; "apr" also matches.
+    """
+    q = query_month.strip().lower()
+    exact = [m for m in stored_months if q == m.lower()]
+    if exact:
+        return exact
+    return [m for m in stored_months if q in m.lower() or m.lower().startswith(q[:3])]
+
+
+def match_employee(query_name: str, stored_names: list) -> list:
+    """Return stored employee names that match the query string.
+
+    Matches full name, any individual token (e.g. first name), or name prefix.
+    """
+    q = query_name.strip().lower()
+    return [
+        n for n in stored_names
+        if q == n.lower()
+        or q in [p.lower() for p in n.split()]
+        or n.lower().startswith(q)
+    ]
+
+
+def _find_month_in_question(question: str, records: list) -> Optional[str]:
+    """Return the first stored month label mentioned in the question, or None."""
+    stored = get_months_available(records)
+    if not stored:
+        return None
+    for word in re.findall(r"[a-zA-Z0-9]+", question):
+        if len(word) < 3:
+            continue
+        hits = match_month(word, stored)
+        if hits:
+            return hits[0]
+    return None
 
 
 # ── Context builder ──────────────────────────────────────────────────────────
@@ -638,402 +682,150 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
 
 
 def _build_dataset_context(records=None, question: str = None):
-    """Build a compact text summary of the dataset for the LLM prompt."""
+    """Build a focused, analytics-slice-based context for the LLM (max 20 lines).
+
+    Never iterates GLOBAL_DATASET directly — all figures come from
+    build_full_analytics() pre-computed slices.
+    """
     recs = records if records is not None else GLOBAL_DATASET
     if not recs:
         return "No data has been loaded yet."
 
-    # Determine what sections are needed based on question (Fix 2: pass records for validation)
-    scope = _detect_question_scope(question, recs) if question else None
-    include_all = scope is None  # If no question, include everything
+    scope     = _detect_question_scope(question, recs) if question else {}
+    analytics = build_full_analytics(recs)
+    months    = get_months_available(recs)
 
-    # Year-aware context narrowing: when exactly 1 year is mentioned, restrict context to that year.
-    # Applied locally here only — does NOT touch the records used by Forecast in ask().
-    specific_year = scope.get("specific_year") if scope else None
-    # Detect "this year" / "current year" / "YTD" phrases when no explicit 4-digit year found
-    _THIS_YEAR_RE = re.compile(r"\b(this year|current year|this fiscal year|ytd|year to date)\b", re.IGNORECASE)
-    if not specific_year and _THIS_YEAR_RE.search(question or ""):
-        specific_year = str(_date.today().year)
-    if specific_year:
-        year_matches = re.findall(r"\b(20\d{2})\b", question or "")
-        if len(year_matches) <= 1:  # Filter when 0 or 1 explicit year (not multi-year compare)
-            recs = [r for r in recs if specific_year in (r.get("month") or "")]
+    proj_only  = analytics["proj_only"]
+    emp_only   = analytics["emp_only"]
+    emp_month  = analytics["emp_month"]
+    proj_month = analytics["proj_month"]
+    month_only = analytics["month_only"]
 
-    # Resolve the canonical project name for employee-scoped filtering.
-    # Must be computed early (before PROJECTS block) so EMPLOYEE DETAILS can be scoped.
-    _specific_proj_scope = scope.get("specific_project") if scope else None
-    _specific_emp_scope  = scope.get("specific_employee") if scope else None
-    _matched_proj_for_emp: Optional[str] = None
-    if _specific_proj_scope:
-        for _p in sorted({r.get("project") for r in recs if r.get("project")}):
-            if _p.lower() == _specific_proj_scope.lower():
-                # Prefer the uppercase/canonical form found in data
-                _matched_proj_for_emp = _p.upper() if _p.upper() in {r.get("project") for r in recs} else _p
-                break
+    specific_proj = scope.get("specific_project") if scope else None
+    specific_emp  = scope.get("specific_employee") if scope else None
+    q_month       = _find_month_in_question(question or "", recs)
 
-    # emp_recs controls what EMPLOYEES summary sees:
-    #   • project specified (alone OR with employee) → project-scoped
-    #     If the employee works on that project they'll be found with correct margin;
-    #     if they don't, "no data" is the correct answer — not blended totals.
-    #   • employee-only or broad question → full recs
-    _proj_lower = _matched_proj_for_emp.lower() if _matched_proj_for_emp else None
-    emp_recs = (
-        [r for r in recs if (r.get("project") or "").lower() == _proj_lower]
-        if _proj_lower else recs
+    lines: list = []
+
+    # ── 1) Overall (always, 2 lines) ─────────────────────────────────────────
+    total_rev  = round(sum(v["revenue"] for v in proj_only.values()), 2)
+    total_cost = round(sum(v["cost"]    for v in proj_only.values()), 2)
+    total_pft  = round(total_rev - total_cost, 2)
+    total_mgn  = round(total_pft / total_rev * 100, 2) if total_rev > 0 else 0.0
+    lines.append(
+        f"OVERALL: Rev=${total_rev:,.2f} Cost=${total_cost:,.2f} "
+        f"Profit=${total_pft:,.2f} Margin={total_mgn}% "
+        f"Projects={len(proj_only)} Employees={len(emp_only)}"
     )
-
-    overall = build_overall_summary(recs)
-    months = get_months_available(recs)
-
-    lines = []
-
-    # Overall - always include (compact)
-    lines.append("=== OVERALL SUMMARY ===")
-    lines.append(f"Total Revenue: ${overall['total_revenue']:,.2f}, Cost: ${overall['total_cost']:,.2f}, Profit: ${overall['total_profit']:,.2f}")
-    lines.append(f"Hours: {overall.get('total_hours', 0)}, Margin: {overall['avg_margin_pct']}%, Employees: {overall['total_employees']}")
-    lines.append(f"Months: {', '.join(months)}")
     if months:
-        lines.append(f"LAST MONTH (most recent data available): {months[-1]}")
-        lines.append(f"NOTE: If user asks about 'last month', return data for {months[-1]} and clarify this is the most recent data available.")
-    
-    # Add typo suggestions if any
+        lines.append(f"MONTHS: {', '.join(months)} | LAST: {months[-1]}")
+
+    # ── Typo / missing-entity warnings ───────────────────────────────────────
     if scope and scope.get("suggestions"):
-        lines.append("")
-        lines.append("=== POSSIBLE TYPOS DETECTED ===")
-        for suggestion in scope["suggestions"]:
-            lines.append(f"WARNING: {suggestion}")
-        lines.append("If the user meant one of the suggested names, use that data. Otherwise, respond with 'No data found'.")
-    
-    # Add missing entities warning
+        for sg in scope["suggestions"]:
+            lines.append(f"WARNING: {sg}")
     if scope and scope.get("missing_entities"):
-        lines.append("NOTE: No data found.")
-    
-    lines.append("")
+        lines.append("NOTE: Requested entity not found in data.")
 
-    # Projects - include if needed
-    if include_all or scope.get("needs_projects"):
-        projects = build_projects(recs)
-        
-        # Build per-project monthly series for trends and avg utilisation
-        proj_monthly = {}
-        proj_billable = {}
-        proj_util_values = {}  # Collect utilisation_pct per project for averaging
-        for r in recs:
-            proj = r.get("project") or "Unknown"
-            month = r.get("month") or "Unknown"
-            if proj not in proj_monthly:
-                proj_monthly[proj] = {}
-                proj_billable[proj] = 0.0
-                proj_util_values[proj] = []
-            if month not in proj_monthly[proj]:
-                proj_monthly[proj][month] = {"rev": 0.0, "cost": 0.0, "util_vals": []}
-            proj_monthly[proj][month]["rev"] += float(r.get("revenue") or 0)
-            proj_monthly[proj][month]["cost"] += float(r.get("cost") or 0)
-            # Track utilization per month for monthly trends
-            util_pct_month = r.get("utilisation_pct")
-            if util_pct_month is not None and util_pct_month > 0:
-                proj_monthly[proj][month]["util_vals"].append(float(util_pct_month))
-            proj_billable[proj] += float(r.get("billable_hours") or 0)
-            # Collect utilisation_pct for averaging
-            util_pct = r.get("utilisation_pct")
-            if util_pct is not None and util_pct > 0:
-                proj_util_values[proj].append(float(util_pct))
-        
-        # Pre-calculate utilization for sorting
-        proj_utils = {}
-        for name in projects.keys():
-            util_values = proj_util_values.get(name, [])
-            proj_utils[name] = round(sum(util_values) / len(util_values), 2) if util_values else 0
-        
-        # Sort by various metrics for ranking hints
-        sorted_by_util = sorted(proj_utils.items(), key=lambda x: x[1], reverse=True)
-        sorted_by_cost = sorted(projects.items(), key=lambda x: x[1].get("cost", 0))
-        sorted_by_revenue = sorted(projects.items(), key=lambda x: x[1].get("revenue", 0), reverse=True)
-        sorted_by_profit = sorted(projects.items(), key=lambda x: x[1].get("profit", 0), reverse=True)
-        
-        lines.append("=== PROJECTS ===")
-        lines.append(f"AVAILABLE PROJECTS (use EXACT names): {', '.join(sorted(projects.keys()))}")
+    # ── 2) Month-specific slice (when question mentions a month) ──────────────
+    if q_month and q_month in month_only:
+        mv = month_only[q_month]
+        lines.append(
+            f"{q_month}: Rev=${mv['revenue']:,.2f} Cost=${mv['cost']:,.2f} "
+            f"Profit=${mv['profit']:,.2f} Margin={mv['margin_pct']}% "
+            f"Employees={mv['employee_count']}"
+        )
+        em_in_month = sorted(
+            [(e, v) for (e, m), v in emp_month.items() if m == q_month],
+            key=lambda x: x[1]["revenue"], reverse=True,
+        )
+        for emp, ev in em_in_month[:5]:
+            lines.append(
+                f"  {emp} [{q_month}]: Rev=${ev['revenue']:,.2f} "
+                f"Profit=${ev['profit']:,.2f} Margin={ev['margin_pct']}%"
+            )
 
-        # Inject canonical names for compare queries so LLM uses exact casing
+    # ── 3) Project section ────────────────────────────────────────────────────
+    sorted_projs = sorted(proj_only.items(), key=lambda x: x[1]["revenue"], reverse=True)
+    if specific_proj:
+        canon = next((p for p in proj_only if p.lower() == specific_proj.lower()), specific_proj)
+        v = proj_only.get(canon, {})
+        lines.append(
+            f"PROJECT {canon}: Rev=${v.get('revenue',0):,.2f} Cost=${v.get('cost',0):,.2f} "
+            f"Profit=${v.get('profit',0):,.2f} Margin={v.get('margin_pct',0)}% "
+            f"Employees={v.get('employee_count',0)}"
+        )
+        pm_rows = sorted(
+            [(m, pv) for (p, m), pv in proj_month.items() if p.lower() == canon.lower()],
+            key=lambda x: _parse_month_date(x[0]) or _date.min,
+        )
+        for mon, pv in pm_rows[-4:]:
+            lines.append(
+                f"  {canon} [{mon}]: Rev=${pv['revenue']:,.2f} "
+                f"Profit=${pv['profit']:,.2f} Margin={pv['margin_pct']}%"
+            )
+    else:
         mentioned_projs = scope.get("mentioned_projects", []) if scope else []
-        if len(mentioned_projs) >= 2:
+        hi_rev = sorted_projs[0][0]  if sorted_projs else "?"
+        lo_rev = sorted_projs[-1][0] if sorted_projs else "?"
+        hi_pft = max(proj_only, key=lambda p: proj_only[p]["profit"], default="?")
+        lo_pft = min(proj_only, key=lambda p: proj_only[p]["profit"], default="?")
+        lines.append(
+            f"PROJECTS: HighRev={hi_rev} LowRev={lo_rev} "
+            f"HighProfit={hi_pft} LowProfit={lo_pft} "
+            f"Available={', '.join(sorted(proj_only))}"
+        )
+        show_projs = (
+            [(p, proj_only[p]) for p in mentioned_projs if p in proj_only]
+            or sorted_projs[:6]
+        )
+        for p, v in show_projs:
             lines.append(
-                f"COMPARE INSTRUCTION: User is comparing {' vs '.join(mentioned_projs)}. "
-                f"Use EXACTLY these names as column headers: {', '.join(mentioned_projs)}"
+                f"  {p}: Rev=${v['revenue']:,.2f} Cost=${v['cost']:,.2f} "
+                f"Profit=${v['profit']:,.2f} Margin={v['margin_pct']}% "
+                f"Employees={v['employee_count']}"
             )
 
-        # Filter to specific project if requested
-        specific_proj = scope.get("specific_project") if scope else None
-        _log(f"Building context: specific_project={specific_proj}, all_projects={list(projects.keys())}", "debug")
-        if specific_proj:
-            # Case-insensitive match to find the actual project name
-            specific_proj_lower = specific_proj.lower()
-            matched_proj = None
-            for p in projects.keys():
-                if p.lower() == specific_proj_lower:
-                    matched_proj = p
-                    break
-            if matched_proj:
-                _log(f"Filtering to project: {matched_proj}", "debug")
-                lines.append(f">>> IMPORTANT: User is asking about PROJECT '{matched_proj}' ONLY. Use ONLY the data below for '{matched_proj}'. <<<")
-                lines.append(f"FILTERED TO PROJECT: {matched_proj}")
-                projects_to_show = {matched_proj: projects[matched_proj]}
-            else:
-                _log(f"Project '{specific_proj}' not found in {list(projects.keys())}", "debug")
-                lines.append(f"WARNING: Requested project '{specific_proj}' not found. Showing all projects.")
-                projects_to_show = projects
-        else:
-            # For compare queries with 2+ projects, restrict to mentioned projects only
-            if len(mentioned_projs) >= 2:
-                projects_to_show = {p: projects[p] for p in mentioned_projs if p in projects}
-                if not projects_to_show:  # fallback if none matched
-                    projects_to_show = projects
-            else:
-                projects_to_show = projects
-
-        if not specific_proj:
-            lines.append(f"RANKING HINTS: HighestUtilization={sorted_by_util[0][0]}, LowestUtilization={sorted_by_util[-1][0]}, "
-                         f"HighestRevenue={sorted_by_revenue[0][0]}, LowestRevenue={sorted_by_revenue[-1][0]}, "
-                         f"HighestCost={sorted_by_cost[-1][0]}, LowestCost={sorted_by_cost[0][0]}, "
-                         f"HighestProfit={sorted_by_profit[0][0]}, LowestProfit={sorted_by_profit[-1][0]}")
-        for name, data in sorted(projects_to_show.items(), key=lambda x: x[1]["revenue"], reverse=True):
-            proj_revenue = float(data.get("revenue") or 0)
-            proj_cost = float(data.get("cost") or 0)
-            proj_margin = round(((proj_revenue - proj_cost) / proj_revenue) * 100, 2) if proj_revenue > 0 else 0
-            
-            # Determine project status based on margin (same logic as /projects API)
-            if proj_margin > 40:
-                proj_status = "Healthy"
-            elif proj_margin >= 30:
-                proj_status = "Optimal"
-            else:
-                proj_status = "At Risk"
-            
-            # Calculate trends from monthly series
-            monthly_data = proj_monthly.get(name, {})
-            sorted_months = sorted(monthly_data.keys(), key=lambda m: get_months_available([{"month": m}]))
-            revenue_series = [monthly_data[m]["rev"] for m in sorted_months]
-            cost_series = [monthly_data[m]["cost"] for m in sorted_months]
-            profit_series = [monthly_data[m]["rev"] - monthly_data[m]["cost"] for m in sorted_months]
-            margin_series = [_calc_margin(monthly_data[m]["rev"], monthly_data[m]["cost"]) for m in sorted_months]
-            # Calculate per-month utilization averages
-            util_series = []
-            for m in sorted_months:
-                uvals = monthly_data[m].get("util_vals", [])
-                util_series.append(round(sum(uvals) / len(uvals), 2) if uvals else 0)
-            
-            rev_trend = _trend_from_values(revenue_series)
-            cost_trend = _trend_from_values(cost_series)
-            profit_trend = _trend_from_values(profit_series)
-            margin_trend = _trend_from_values(margin_series)
-            util_trend = _trend_from_values(util_series)
-            billable_hrs = round(proj_billable.get(name, 0), 2)
-            
-            # Calculate AvgUtilisation from employee utilisation_pct values
-            util_values = proj_util_values.get(name, [])
-            avg_util = round(sum(util_values) / len(util_values), 2) if util_values else 0
-            
-            # Calculate best/worst month for this project
-            proj_months = proj_monthly.get(name, {})
-            if proj_months:
-                best_rev_month = max(proj_months.items(), key=lambda x: x[1]["rev"])[0]
-                worst_rev_month = min(proj_months.items(), key=lambda x: x[1]["rev"])[0]
-            else:
-                best_rev_month = worst_rev_month = "N/A"
-            
+    # ── 4) Employee section ───────────────────────────────────────────────────
+    sorted_emps = sorted(emp_only.items(), key=lambda x: x[1]["revenue"], reverse=True)
+    if specific_emp:
+        matched = match_employee(specific_emp, list(emp_only.keys()))
+        target  = matched[0] if matched else specific_emp
+        ev = emp_only.get(target, {})
+        lines.append(
+            f"EMPLOYEE {target}: Rev=${ev.get('revenue',0):,.2f} Cost=${ev.get('cost',0):,.2f} "
+            f"Profit=${ev.get('profit',0):,.2f} Margin={ev.get('margin_pct',0)}% "
+            f"Hours={ev.get('hours',0):.0f} Months={ev.get('month_count',0)}"
+        )
+        em_rows = sorted(
+            [(m, v) for (e, m), v in emp_month.items() if e.lower() == target.lower()],
+            key=lambda x: _parse_month_date(x[0]) or _date.min,
+        )
+        for mon, mv in em_rows[-6:]:
             lines.append(
-                f"- {name}: Revenue=${data['revenue']:,.2f}, Cost=${data.get('cost', 0):,.2f}, "
-                f"Profit=${data['profit']:,.2f}, GrossMargin={proj_margin}%, "
-                f"AvgUtilisation={avg_util}%, Employees={data['employees']}, "
-                f"BillableHours={billable_hrs}, Status={proj_status}, "
-                f"RevenueTrend={rev_trend}, CostTrend={cost_trend}, ProfitTrend={profit_trend}, MarginTrend={margin_trend}, UtilTrend={util_trend}, "
-                f"BestRevenueMonth={best_rev_month}, WorstRevenueMonth={worst_rev_month}, "
-                "MonthlyBreakdown(last {} months)=[{}]".format(
-                    min(6, len(sorted_months)),
-                    ", ".join(
-                        "{}:Rev=${:,.0f}/Cost=${:,.0f}/Util={}%".format(
-                            m,
-                            monthly_data[m]["rev"],
-                            monthly_data[m]["cost"],
-                            round(sum(monthly_data[m].get("util_vals", [0])) / max(len(monthly_data[m].get("util_vals", [1])), 1), 1),
-                        )
-                        for m in sorted_months[-6:]
-                    ),
-                )
+                f"  {target} [{mon}]: Rev=${mv['revenue']:,.2f} "
+                f"Profit=${mv['profit']:,.2f} Hours={mv['hours']:.0f}"
             )
-        lines.append("")
-
-    # Month-specific data section - ADD when specific month is mentioned
-    # This provides accurate month-specific metrics without breaking trend/comparison queries
-    if scope and scope.get("specific_month"):
-        month_key = scope["specific_month"].lower()
-        # Find full month name for display
-        month_names = {
-            "jan": "January", "feb": "February", "mar": "March", "apr": "April",
-            "may": "May", "jun": "June", "jul": "July", "aug": "August",
-            "sep": "September", "oct": "October", "nov": "November", "dec": "December",
-            "january": "January", "february": "February", "march": "March", "april": "April",
-            "june": "June", "july": "July", "august": "August",
-            "september": "September", "october": "October", "november": "November", "december": "December"
-        }
-        display_month = month_names.get(month_key, month_key.capitalize())
-        
-        # Filter records for this specific month (year-aware)
-        specific_year = scope.get("specific_year") if scope else None
-        month_filtered_recs = [
-            r for r in recs
-            if month_key in (r.get("month") or "").lower()
-            and (not specific_year or specific_year in (r.get("month") or ""))
-        ]
-        
-        if month_filtered_recs:
-            lines.append(f"=== DATA FOR {display_month.upper()} ONLY ===")
-            lines.append(f"NOTE: Use this section when answering questions about {display_month} specifically.")
-            
-            # Build month-specific project data
-            month_projects = build_projects(month_filtered_recs)
-            if month_projects:
-                lines.append("Projects:")
-                for name, data in sorted(month_projects.items(), key=lambda x: x[1]["revenue"], reverse=True):
-                    proj_revenue = float(data.get("revenue") or 0)
-                    proj_cost = float(data.get("cost") or 0)
-                    proj_profit = proj_revenue - proj_cost
-                    proj_margin = round((proj_profit / proj_revenue) * 100, 2) if proj_revenue > 0 else 0
-                    lines.append(
-                        f"- {name}: Revenue=${proj_revenue:,.2f}, Cost=${proj_cost:,.2f}, "
-                        f"Profit=${proj_profit:,.2f}, Margin={proj_margin}%"
-                    )
-            
-            # Build month-specific employee data
-            month_employees = build_employee_summaries(month_filtered_recs)
-            if month_employees:
-                lines.append("Employees:")
-                for emp in sorted(month_employees, key=lambda x: x.get('total_revenue') or 0, reverse=True)[:10]:
-                    lines.append(
-                        f"- {emp['employee_name']}: Revenue=${emp['total_revenue']:,.2f}, "
-                        f"Profit=${emp['total_profit']:,.2f}, Hours={emp['total_hours']}, "
-                        f"Utilization={emp.get('utilization_pct') or 0}%"
-                    )
-            
-            # Month totals
-            month_overall = build_overall_summary(month_filtered_recs)
+    else:
+        hi_rev_e = sorted_emps[0][0]  if sorted_emps else "?"
+        lo_rev_e = sorted_emps[-1][0] if sorted_emps else "?"
+        hi_pft_e = max(emp_only, key=lambda e: emp_only[e]["profit"],     default="?")
+        lo_pft_e = min(emp_only, key=lambda e: emp_only[e]["profit"],     default="?")
+        hi_mgn_e = max(emp_only, key=lambda e: emp_only[e]["margin_pct"], default="?")
+        lo_mgn_e = min(emp_only, key=lambda e: emp_only[e]["margin_pct"], default="?")
+        lines.append(
+            f"EMPLOYEES: HighRev={hi_rev_e} LowRev={lo_rev_e} "
+            f"HighProfit={hi_pft_e} LowProfit={lo_pft_e} "
+            f"HighMargin={hi_mgn_e} LowMargin={lo_mgn_e}"
+        )
+        for emp, ev in sorted_emps[:8]:
             lines.append(
-                f"Month Totals: Revenue=${month_overall['total_revenue']:,.2f}, "
-                f"Cost=${month_overall['total_cost']:,.2f}, Profit=${month_overall['total_profit']:,.2f}, "
-                f"Margin={month_overall['avg_margin_pct']}%"
+                f"  {emp}: Rev=${ev['revenue']:,.2f} Cost=${ev['cost']:,.2f} "
+                f"Profit=${ev['profit']:,.2f} Margin={ev['margin_pct']}%"
             )
-            lines.append("")
 
-    # Monthly - include if needed (sorted chronologically)
-    if include_all or scope.get("needs_monthly"):
-        monthly = build_monthly(recs)
-        lines.append("=== MONTHLY ===")
-        # Sort months chronologically using the same order as get_months_available
-        sorted_months = [m for m in months if m in monthly]
-        
-        # Add ranking hints for months
-        if sorted_months:
-            sorted_by_revenue = sorted(sorted_months, key=lambda m: monthly[m].get('total_revenue', 0), reverse=True)
-            sorted_by_profit = sorted(sorted_months, key=lambda m: monthly[m].get('total_profit', 0), reverse=True)
-            lines.append(f"RANKING HINTS: HighestRevenue={sorted_by_revenue[0]}, LowestRevenue={sorted_by_revenue[-1]}, "
-                         f"HighestProfit={sorted_by_profit[0]}, LowestProfit={sorted_by_profit[-1]}")
-        
-        for m in sorted_months:
-            data = monthly[m]
-            is_last = (m == months[-1]) if months else False
-            marker = " [LAST MONTH]" if is_last else ""
-            lines.append(
-                f"- {m}{marker}: Revenue=${data['total_revenue']:,.2f}, Profit=${data['total_profit']:,.2f}, "
-                f"Margin={data['avg_margin_pct']}%, Employees={data['employees']}"
-            )
-        lines.append("")
-
-    # Employee Summaries - include if needed
-    if include_all or scope.get("needs_employee_summary"):
-        employee_summaries = build_employee_summaries(emp_recs)
-        # Filter to specific employee if mentioned
-        if scope and scope.get("specific_employee"):
-            emp_name = scope["specific_employee"].lower()
-            employee_summaries = [e for e in employee_summaries if emp_name in e["employee_name"].lower()]
-        
-        # Add ranking hints for employees
-        if employee_summaries:
-            sorted_by_util = sorted(employee_summaries, key=lambda x: x.get('utilization_pct') or 0, reverse=True)
-            sorted_by_revenue = sorted(employee_summaries, key=lambda x: x.get('total_revenue') or 0, reverse=True)
-            sorted_by_profit = sorted(employee_summaries, key=lambda x: x.get('total_profit') or 0, reverse=True)
-            lines.append("=== EMPLOYEES ===")
-            lines.append(f"RANKING HINTS: HighestUtilization={sorted_by_util[0]['employee_name']}, LowestUtilization={sorted_by_util[-1]['employee_name']}, "
-                         f"HighestRevenue={sorted_by_revenue[0]['employee_name']}, LowestRevenue={sorted_by_revenue[-1]['employee_name']}, "
-                         f"HighestProfit={sorted_by_profit[0]['employee_name']}, LowestProfit={sorted_by_profit[-1]['employee_name']}")
-        else:
-            lines.append("=== EMPLOYEES ===")
-        # Label margin scope so LLM knows whether it's project-specific or blended
-        _margin_scope_label = f"{_matched_proj_for_emp} only" if _matched_proj_for_emp else "overall"
-
-        # Cap broad listings; no cap when a specific employee is requested
-        _MAX_EMP_LIST = 20
-        _is_specific = bool(scope and scope.get("specific_employee"))
-        _display_emps = employee_summaries
-        if not _is_specific and len(employee_summaries) > _MAX_EMP_LIST:
-            # Sort by revenue desc so top contributors appear first
-            _display_emps = sorted(
-                employee_summaries, key=lambda x: x.get("total_revenue") or 0, reverse=True
-            )[:_MAX_EMP_LIST]
-
-        for emp in _display_emps:
-            desig = emp.get('designation') or ''
-            desig_str = f", Designation={desig}" if desig else ""
-            lines.append(
-                f"- {emp['employee_name']}{desig_str}: Revenue=${emp['total_revenue']:,.2f}, "
-                f"Cost=${emp['total_cost']:,.2f}, Profit=${emp['total_profit']:,.2f}, "
-                f"Margin={emp.get('gross_margin_pct') or emp.get('margin_pct') or 0}%({_margin_scope_label}), "
-                f"Hours={emp['total_hours']}, IndividualUtilisation={emp['utilization_pct'] or 0}%, "
-                f"Attendance={emp.get('attendance_pct', 100)}%, VacationDays={emp.get('vacation_days', 0)}"
-            )
-        if not _display_emps:
-            lines.append("- No matching employee found")
-        _hidden = len(employee_summaries) - len(_display_emps)
-        if _hidden > 0:
-            lines.append(f"NOTE: Showing top {_MAX_EMP_LIST} of {len(employee_summaries)} employees by revenue. Ask about a specific employee for full details.")
-        lines.append("")
-
-    # Employee Details — only for specific-employee drilldowns.
-    # For broad "list employees" queries the EMPLOYEES summary above is sufficient
-    # and avoids raw-record noise in the context.
-    _specific_emp_for_details = scope.get("specific_employee") if scope else None
-    if _specific_emp_for_details and (include_all or scope.get("needs_employee_details")):
-        lines.append("=== EMPLOYEE DETAILS ===")
-        filtered_recs = emp_recs  # already project-scoped when a project is specified
-        emp_name = _specific_emp_for_details.lower()
-        filtered_recs = [r for r in filtered_recs if emp_name in (r.get("employee") or "").lower()]
-        if scope and scope.get("specific_month"):
-            month_key = scope["specific_month"].lower()
-            filtered_recs = [r for r in filtered_recs if month_key in (r.get("month") or "").lower()]
-
-        # No row cap — a single employee has at most ~24 month×project records
-        for r in filtered_recs:
-            rev = r.get('revenue') or 0
-            cst = r.get('cost') or 0
-            pft = r.get('profit') or 0
-            mgn = r.get('margin_pct') or (round((pft / rev) * 100, 2) if rev > 0 else 0)
-            lines.append(
-                f"- {r.get('employee', '?')} | {r.get('project', '?')} | {r.get('month', '?')} | "
-                f"Hours={r.get('actual_hours', 0)}, Vacation={r.get('vacation_days', 0)}, "
-                f"Revenue=${rev:,.2f}, Cost=${cst:,.2f}, Profit=${pft:,.2f}, Margin={mgn}%, "
-                f"Utilisation={r.get('utilisation_pct', 0)}%"
-            )
-        lines.append("")
-
-    # Risks - include if needed
-    if include_all or scope.get("needs_risks"):
-        risks = build_risks(recs)
-        if risks:
-            lines.append("=== RISKS ===")
-            for r in risks:
-                lines.append(f"- {r['employee']} | Project: {r.get('project', 'Unknown')} | Month: {r.get('month', '')} | Issue: {r['issue']}")
-            lines.append("")
-
-    return "\n".join(lines)
+    # Hard cap at 20 lines to keep the LLM prompt focused
+    return "\n".join(lines[:20])
 
 
 # ── Grounding facts (pre-computed exact values injected into prompt) ──────────
@@ -1341,6 +1133,32 @@ def _validate_llm_response(parsed: dict, records: list) -> dict:
         parsed["columns"] = []
 
     return parsed
+
+
+# ── Project monthly context builder ──────────────────────────────────────────
+
+def _build_project_monthly_context(project: str, records: list) -> str:
+    """Return a formatted monthly breakdown table for a single project."""
+    monthly = build_monthly_by_project(records, project)
+    if not monthly:
+        return f"No data found for project '{project}'."
+
+    sorted_months = sorted(
+        monthly.keys(),
+        key=lambda m: _parse_month_date(m) or _date.min,
+    )
+
+    lines = [f"=== {project.upper()} MONTHLY BREAKDOWN ==="]
+    lines.append(f"{'Month':<20} {'Revenue':>13} {'Cost':>13} {'Profit':>13} {'Margin%':>8} {'Hours':>8}")
+    lines.append("-" * 80)
+    for m in sorted_months:
+        d = monthly[m]
+        rev, cost, profit, hours = d["revenue"], d["cost"], d["profit"], d["hours"]
+        margin = round((profit / rev) * 100, 1) if rev > 0 else 0.0
+        lines.append(
+            f"{m:<20} ${rev:>12,.2f} ${cost:>12,.2f} ${profit:>12,.2f} {margin:>7.1f}% {hours:>8.1f}"
+        )
+    return "\n".join(lines)
 
 
 # ── Prompt template ──────────────────────────────────────────────────────────
@@ -1874,6 +1692,60 @@ def _format_data_keys(data: list, columns: list) -> list:
     return formatted_data
 
 
+def _forecast_to_narrative(rows: list, header: str) -> str:
+    """Convert forecast rows into a natural language paragraph.
+
+    Produces one sentence per (entity × month), e.g.:
+      "In June 2026, John is forecasted to generate Revenue of $5,290.67,
+       Cost $5,137.44, Profit $397.87, Utilization 93.8%, Hours 165."
+    """
+    if not rows:
+        return header or "No forecast data available."
+
+    def _fmt_money(v):
+        try:
+            return f"${float(v):,.2f}"
+        except (TypeError, ValueError):
+            return str(v) if v is not None else None
+
+    def _fmt_pct(v):
+        try:
+            return f"{float(v):.1f}%"
+        except (TypeError, ValueError):
+            return str(v) if v is not None else None
+
+    def _fmt_plain(v):
+        return str(v) if v is not None else None
+
+    sentences = []
+    for r in rows:
+        month   = r.get("month") or r.get("quarter") or ""
+        entity  = r.get("employee") or r.get("project") or ""
+        prefix  = f"In {month}" if month else ""
+        subject = entity or "the team"
+
+        parts = []
+        if r.get("revenue")         is not None: parts.append(f"Revenue {_fmt_money(r['revenue'])}")
+        if r.get("cost")            is not None: parts.append(f"Cost {_fmt_money(r['cost'])}")
+        if r.get("profit")          is not None: parts.append(f"Profit {_fmt_money(r['profit'])}")
+        if r.get("margin_pct")      is not None: parts.append(f"Margin {_fmt_pct(r['margin_pct'])}")
+        if r.get("utilization_pct") is not None: parts.append(f"Utilization {_fmt_pct(r['utilization_pct'])}")
+        if r.get("hours")           is not None: parts.append(f"Hours {_fmt_plain(r['hours'])}")
+        if r.get("leave_days")      is not None: parts.append(f"Leaves {_fmt_plain(r['leave_days'])}")
+        if r.get("working_days")    is not None: parts.append(f"Working Days {_fmt_plain(r['working_days'])}")
+
+        if parts:
+            detail = ", ".join(parts)
+            if prefix and entity:
+                sentences.append(f"{prefix}, {subject} is forecasted — {detail}.")
+            elif entity:
+                sentences.append(f"{subject}: {detail}.")
+            else:
+                sentences.append(f"{detail}.")
+
+    return " ".join(sentences) if sentences else (header or "Forecast data available.")
+
+
 def _forecast_table_name(header: str) -> str:
     """Convert forecast headers to clean table names like 'Q3 2026 Forecast' or 'May-Jul 2026 Forecast'."""
     if not header:
@@ -2041,6 +1913,374 @@ def _llm_table_name(summary: str, columns, data) -> str:
             return s.title() if len(s) < 30 else s[:60]
     
     return "Data"
+
+# ── Intent detection + rule-based answer engine ──────────────────────────────
+
+_INTENT_RANKING          = "INTENT_RANKING"
+_INTENT_LOSS_QUERY       = "INTENT_LOSS_QUERY"
+_INTENT_EMPLOYEE_LOOKUP  = "INTENT_EMPLOYEE_LOOKUP"
+_INTENT_PROJECT_LOOKUP   = "INTENT_PROJECT_LOOKUP"
+_INTENT_PERIOD_FILTER    = "INTENT_PERIOD_FILTER"
+_INTENT_SUMMARY          = "INTENT_SUMMARY"
+_INTENT_COMPARISON       = "INTENT_COMPARISON"
+
+
+def _detect_question_intent(question: str, scope: dict) -> Optional[str]:
+    """Classify the question into one of seven intent buckets."""
+    q = question.lower()
+    has_emp  = bool(scope.get("specific_employee"))
+    has_proj = bool(scope.get("specific_project"))
+
+    if re.search(r"\b(loss.making|making loss|negative profit|losing money|in loss)\b", q):
+        return _INTENT_LOSS_QUERY
+    if re.search(r"\b(compar|vs\.?|versus|difference between|side.by.side)\b", q):
+        return _INTENT_COMPARISON
+    if re.search(r"\b(highest|lowest|top|bottom|best|worst|rank)\b", q) and \
+       re.search(r"\b(employee|employees|who|person|staff)\b", q):
+        return _INTENT_RANKING
+    if re.search(r"\b(summary|overview|overall total|grand total)\b", q) and not has_emp and not has_proj:
+        return _INTENT_SUMMARY
+    if has_proj and not has_emp:
+        return _INTENT_PROJECT_LOOKUP
+    if has_emp and not has_proj:
+        return _INTENT_EMPLOYEE_LOOKUP
+    if scope.get("specific_month") and not has_emp and not has_proj:
+        return _INTENT_PERIOD_FILTER
+    return None
+
+
+def _rule_based_answer(question: str, records: list) -> Optional[dict]:
+    """Deterministic answer engine backed by analytics slices — no LLM involved.
+
+    Called as: (a) direct fallback when _validate_answer returns False, or
+               (b) explicit intent match in ask().
+    Returns a full response dict or None when the question cannot be answered
+    deterministically from the slices.
+    """
+    if not records:
+        return None
+
+    analytics     = build_full_analytics(records)
+    scope         = _detect_question_scope(question, records)
+    stored_months = get_months_available(records)
+    intent        = _detect_question_intent(question, scope)
+
+    emp_month  = analytics["emp_month"]
+    proj_month = analytics["proj_month"]
+    proj_only  = analytics["proj_only"]
+    month_only = analytics["month_only"]
+    emp_only   = analytics["emp_only"]
+
+    q = question.lower()
+
+    # ── Resolve questioned month ─────────────────────────────────────────────
+    q_month: Optional[str] = _find_month_in_question(question, records)
+
+    # ── Resolve questioned employee / project ────────────────────────────────
+    q_emp  = scope.get("specific_employee")
+    q_proj = scope.get("specific_project")
+
+    # ── Metric resolver ──────────────────────────────────────────────────────
+    def _metric(q: str):
+        if re.search(r"\bprofit\b",  q): return "profit",     "Profit"
+        if re.search(r"\bcost\b",    q): return "cost",       "Cost"
+        if re.search(r"\bmargin\b",  q): return "margin_pct", "Margin %"
+        if re.search(r"\bhours?\b",  q): return "hours",      "Hours"
+        return "revenue", "Revenue"
+
+    # ── INTENT_RANKING ────────────────────────────────────────────────────────
+    if intent == _INTENT_RANKING:
+        field, label = _metric(q)
+        asc = bool(re.search(r"\b(lowest|worst|bottom|minimum)\b", q))
+
+        if q_month:
+            rows = [
+                {"Employee": emp, "Month": mon, **v}
+                for (emp, mon), v in emp_month.items()
+                if mon == q_month
+            ]
+            slice_used = "emp_month"
+        else:
+            rows = [{"Employee": emp, **v} for emp, v in emp_only.items()]
+            slice_used = "emp_only"
+
+        if not rows:
+            return None
+        rows.sort(key=lambda r: r.get(field, 0), reverse=not asc)
+
+        best = rows[0]
+        direction = "Lowest" if asc else "Highest"
+        m_str = f" in {q_month}" if q_month else ""
+        summary = (f"{direction} employee by {label}{m_str}: "
+                   f"{best['Employee']} (${best.get(field, 0):,.2f}).")
+        cols = ["Employee"] + (["Month"] if q_month else []) + \
+               ["Revenue", "Cost", "Profit", "Margin %", "Hours"]
+        data = [
+            {
+                "Employee": r["Employee"],
+                **({} if not q_month else {"Month": r.get("Month", "")}),
+                "Revenue":  r.get("revenue",    0),
+                "Cost":     r.get("cost",        0),
+                "Profit":   r.get("profit",      0),
+                "Margin %": r.get("margin_pct",  0),
+                "Hours":    r.get("hours",        0),
+            }
+            for r in rows
+        ]
+        return {
+            "summary": summary, "visual_type": "table",
+            "columns": cols, "data": data,
+            "sources": {"slice": slice_used, "rows": data[:5],
+                        "total_records": len(records)},
+        }
+
+    # ── INTENT_LOSS_QUERY ─────────────────────────────────────────────────────
+    if intent == _INTENT_LOSS_QUERY:
+        if q_month:
+            loss = [
+                {"Employee": emp, "Month": mon, **v}
+                for (emp, mon), v in emp_month.items()
+                if mon == q_month and v["profit"] < 0
+            ]
+            slice_used = "emp_month"
+        else:
+            loss = [
+                {"Employee": emp, **v}
+                for emp, v in emp_only.items()
+                if v["profit"] < 0
+            ]
+            slice_used = "emp_only"
+
+        m_str = f" in {q_month}" if q_month else ""
+        if not loss:
+            return {
+                "summary": f"No loss-making employees found{m_str}.",
+                "visual_type": "text", "columns": [], "data": [],
+                "sources": {"total_records": len(records)},
+            }
+        loss.sort(key=lambda r: r["profit"])
+        cols = ["Employee"] + (["Month"] if q_month else []) + \
+               ["Revenue", "Cost", "Profit", "Margin %"]
+        data = [
+            {
+                "Employee": r["Employee"],
+                **({} if not q_month else {"Month": r.get("Month", "")}),
+                "Revenue":  r.get("revenue",    0),
+                "Cost":     r.get("cost",        0),
+                "Profit":   r.get("profit",      0),
+                "Margin %": r.get("margin_pct",  0),
+            }
+            for r in loss
+        ]
+        return {
+            "summary": f"{len(loss)} loss-making employee(s) found{m_str}.",
+            "visual_type": "table", "columns": cols, "data": data,
+            "sources": {"slice": slice_used, "total_records": len(records)},
+        }
+
+    # ── INTENT_EMPLOYEE_LOOKUP ────────────────────────────────────────────────
+    if intent == _INTENT_EMPLOYEE_LOOKUP and q_emp:
+        matched  = match_employee(q_emp, list(emp_only.keys()))
+        emp_name = matched[0] if matched else q_emp
+
+        if q_month:
+            key = (emp_name, q_month)
+            if key not in emp_month:
+                return None
+            v = emp_month[key]
+            return {
+                "summary": (
+                    f"{emp_name} in {q_month}: Revenue=${v['revenue']:,.2f}, "
+                    f"Cost=${v['cost']:,.2f}, Profit=${v['profit']:,.2f}, "
+                    f"Margin={v['margin_pct']}%."
+                ),
+                "visual_type": "text", "columns": [], "data": [],
+                "sources": {"slice": "emp_month", "key": [emp_name, q_month],
+                            "data": v, "total_records": len(records)},
+            }
+
+        rows = sorted(
+            [{"Month": mon, **v}
+             for (e, mon), v in emp_month.items()
+             if e.lower() == emp_name.lower()],
+            key=lambda r: _parse_month_date(r["Month"]) or _date.min,
+        )
+        if not rows:
+            return None
+        ov = emp_only.get(emp_name, {})
+        cols = ["Month", "Revenue", "Cost", "Profit", "Margin %", "Hours"]
+        data = [{"Month": r["Month"], "Revenue": r.get("revenue", 0),
+                 "Cost": r.get("cost", 0), "Profit": r.get("profit", 0),
+                 "Margin %": r.get("margin_pct", 0), "Hours": r.get("hours", 0)}
+                for r in rows]
+        return {
+            "summary": (
+                f"{emp_name}: Total Revenue=${ov.get('revenue',0):,.2f}, "
+                f"Profit=${ov.get('profit',0):,.2f}, "
+                f"Margin={ov.get('margin_pct',0)}% across {len(rows)} month(s)."
+            ),
+            "visual_type": "table", "columns": cols, "data": data,
+            "sources": {"slice": "emp_month", "total_records": len(records)},
+        }
+
+    # ── INTENT_PROJECT_LOOKUP ─────────────────────────────────────────────────
+    if intent == _INTENT_PROJECT_LOOKUP and q_proj:
+        canon = next((p for p in proj_only if p.lower() == q_proj.lower()), q_proj)
+
+        if q_month:
+            key = (canon, q_month)
+            if key not in proj_month:
+                return None
+            v = proj_month[key]
+            return {
+                "summary": (
+                    f"{canon} in {q_month}: Revenue=${v['revenue']:,.2f}, "
+                    f"Profit=${v['profit']:,.2f}, Margin={v['margin_pct']}%."
+                ),
+                "visual_type": "text", "columns": [], "data": [],
+                "sources": {"slice": "proj_month", "key": [canon, q_month],
+                            "data": v, "total_records": len(records)},
+            }
+
+        rows = sorted(
+            [{"Month": mon, **v}
+             for (p, mon), v in proj_month.items()
+             if p.lower() == canon.lower()],
+            key=lambda r: _parse_month_date(r["Month"]) or _date.min,
+        )
+        if not rows:
+            return None
+        rev_s = sorted(rows, key=lambda r: r.get("revenue", 0))
+        hi_m, lo_m = rev_s[-1]["Month"], rev_s[0]["Month"]
+        ov = proj_only.get(canon, {})
+        cols = ["Month", "Revenue", "Cost", "Profit", "Margin %", "Hours"]
+        data = [{"Month": r["Month"], "Revenue": r.get("revenue", 0),
+                 "Cost": r.get("cost", 0), "Profit": r.get("profit", 0),
+                 "Margin %": r.get("margin_pct", 0), "Hours": r.get("hours", 0)}
+                for r in rows]
+        return {
+            "summary": (
+                f"{canon}: highest revenue month={hi_m}, lowest={lo_m}. "
+                f"Total Revenue=${ov.get('revenue',0):,.2f}, "
+                f"Margin={ov.get('margin_pct',0)}%."
+            ),
+            "visual_type": "table", "columns": cols, "data": data,
+            "sources": {"slice": "proj_month", "total_records": len(records)},
+        }
+
+    # ── INTENT_PERIOD_FILTER ──────────────────────────────────────────────────
+    if intent == _INTENT_PERIOD_FILTER and q_month:
+        mv = month_only.get(q_month)
+        if not mv:
+            return None
+        top5 = sorted(
+            [{"Employee": e, "Month": m, **v}
+             for (e, m), v in emp_month.items() if m == q_month],
+            key=lambda r: r.get("revenue", 0), reverse=True
+        )[:5]
+        cols = ["Employee", "Revenue", "Cost", "Profit", "Margin %"]
+        data = [{"Employee": r["Employee"], "Revenue": r.get("revenue", 0),
+                 "Cost": r.get("cost", 0), "Profit": r.get("profit", 0),
+                 "Margin %": r.get("margin_pct", 0)} for r in top5]
+        return {
+            "summary": (
+                f"{q_month}: Total Revenue=${mv['revenue']:,.2f}, "
+                f"Profit=${mv['profit']:,.2f}, Margin={mv['margin_pct']}%, "
+                f"Employees={mv['employee_count']}. Top 5 by revenue shown."
+            ),
+            "visual_type": "table", "columns": cols, "data": data,
+            "sources": {"slice": "month_only", "month": q_month,
+                        "data": mv, "total_records": len(records)},
+        }
+
+    # ── INTENT_SUMMARY ────────────────────────────────────────────────────────
+    if intent == _INTENT_SUMMARY:
+        total_rev  = round(sum(v["revenue"] for v in proj_only.values()), 2)
+        total_cost = round(sum(v["cost"]    for v in proj_only.values()), 2)
+        total_pft  = round(total_rev - total_cost, 2)
+        total_mgn  = round(total_pft / total_rev * 100, 2) if total_rev > 0 else 0.0
+        rows = sorted(
+            [{"Project": p, **v} for p, v in proj_only.items()],
+            key=lambda r: r.get("revenue", 0), reverse=True,
+        )
+        cols = ["Project", "Revenue", "Cost", "Profit", "Margin %", "Employees"]
+        data = [{"Project": r["Project"], "Revenue": r.get("revenue", 0),
+                 "Cost": r.get("cost", 0), "Profit": r.get("profit", 0),
+                 "Margin %": r.get("margin_pct", 0),
+                 "Employees": r.get("employee_count", 0)}
+                for r in rows]
+        return {
+            "summary": (
+                f"Overall: Revenue=${total_rev:,.2f}, Cost=${total_cost:,.2f}, "
+                f"Profit=${total_pft:,.2f}, Margin={total_mgn}%, "
+                f"Projects={len(proj_only)}, Employees={len(emp_only)}."
+            ),
+            "visual_type": "table", "columns": cols, "data": data,
+            "sources": {"slice": "proj_only", "total_records": len(records)},
+        }
+
+    # ── INTENT_COMPARISON ─────────────────────────────────────────────────────
+    if intent == _INTENT_COMPARISON:
+        mentioned_projs = scope.get("mentioned_projects", [])
+        mentioned_months = list(dict.fromkeys(
+            match_month(w, stored_months)[0]
+            for w in re.findall(r"[a-zA-Z0-9]+", question)
+            if len(w) >= 3 and match_month(w, stored_months)
+        ))
+
+        if len(mentioned_projs) >= 2:
+            p1, p2 = mentioned_projs[0], mentioned_projs[1]
+            v1 = next((v for pk, v in proj_only.items() if pk.lower() == p1.lower()), {})
+            v2 = next((v for pk, v in proj_only.items() if pk.lower() == p2.lower()), {})
+            cols = ["Metric", p1, p2]
+            data = [
+                {"Metric": "Revenue",  p1: v1.get("revenue",    0), p2: v2.get("revenue",    0)},
+                {"Metric": "Cost",     p1: v1.get("cost",        0), p2: v2.get("cost",        0)},
+                {"Metric": "Profit",   p1: v1.get("profit",      0), p2: v2.get("profit",      0)},
+                {"Metric": "Margin %", p1: v1.get("margin_pct",  0), p2: v2.get("margin_pct",  0)},
+                {"Metric": "Employees",p1: v1.get("employee_count", 0), p2: v2.get("employee_count", 0)},
+            ]
+            return {
+                "summary": (
+                    f"Comparison: {p1} (Rev=${v1.get('revenue',0):,.2f}, "
+                    f"Margin={v1.get('margin_pct',0)}%) vs "
+                    f"{p2} (Rev=${v2.get('revenue',0):,.2f}, "
+                    f"Margin={v2.get('margin_pct',0)}%)."
+                ),
+                "visual_type": "table", "columns": cols, "data": data,
+                "sources": {"slice": "proj_only", "total_records": len(records)},
+            }
+
+        if len(mentioned_months) >= 2:
+            m1, m2 = mentioned_months[0], mentioned_months[1]
+            cols = ["Metric", m1, m2]
+            data = [
+                {"Metric": "Revenue",  m1: month_only.get(m1, {}).get("revenue",    0), m2: month_only.get(m2, {}).get("revenue",    0)},
+                {"Metric": "Cost",     m1: month_only.get(m1, {}).get("cost",        0), m2: month_only.get(m2, {}).get("cost",        0)},
+                {"Metric": "Profit",   m1: month_only.get(m1, {}).get("profit",      0), m2: month_only.get(m2, {}).get("profit",      0)},
+                {"Metric": "Margin %", m1: month_only.get(m1, {}).get("margin_pct",  0), m2: month_only.get(m2, {}).get("margin_pct",  0)},
+            ]
+            return {
+                "summary": f"Comparison: {m1} vs {m2} by key metrics.",
+                "visual_type": "table", "columns": cols, "data": data,
+                "sources": {"slice": "month_only", "total_records": len(records)},
+            }
+
+    return None
+
+
+# ── Answer validation ─────────────────────────────────────────────────────────
+
+def _validate_answer(answer: str, sources: list) -> bool:
+    """Return True if every 3+-digit number in the answer is present in sources.
+
+    Numbers not found in sources are considered hallucinated.
+    """
+    answer_nums = set(re.findall(r"\b\d{3,}\b", answer))
+    source_nums = set(re.findall(r"\b\d{3,}\b", str(sources)))
+    hallucinated = answer_nums - source_nums
+    return len(hallucinated) == 0
+
 
 # ── Question normalizer (spelling / grammar correction) ──────────────────────
 
@@ -2559,21 +2799,13 @@ def ask(question: str, time_range: str = None) -> dict:
             for c in preferred_cols:
                 if any(c in r for r in rows):
                     present.append(c)
-            data = [{k: r.get(k) for k in present} for r in rows]
             header = fc_answer.splitlines()[0].strip()
-            table_name = _forecast_table_name(header)
-            
-            # Pivot table if it has repeating entity+month combinations
-            data, present = _pivot_table_if_needed(data, present)
-            
-            # Format column names and data keys
-            formatted_cols = _format_columns(present)
-            formatted_data = _format_data_keys(data, present)
+            narrative = _forecast_to_narrative(rows, header)
             return {
-                "summary": table_name,
-                "visual_type": "table",
-                "columns": formatted_cols,
-                "data": formatted_data,
+                "summary": narrative,
+                "visual_type": "text",
+                "columns": [],
+                "data": [],
                 "sources": {
                     "total_records": len(records),
                     "months": get_months_available(records),
@@ -3073,6 +3305,66 @@ def ask(question: str, time_range: str = None) -> dict:
                 "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
             }
 
+    # ── Early-return: "which month had highest/lowest revenue for project X" ──
+    # Detects questions that combine a project name with time-comparison words
+    # ("month", "highest", "lowest", "best", "worst", "which month") and computes
+    # the answer deterministically from per-month aggregates — no LLM needed.
+    _pm_project = _qa_scope.get("specific_project")
+    _pm_has_month = bool(re.search(r"\b(month|monthly|which month)\b", question, re.IGNORECASE))
+    _pm_has_compare = bool(re.search(
+        r"\b(highest|lowest|best|worst|peak|minimum|maximum|min|max|top month|bottom month)\b",
+        question, re.IGNORECASE,
+    ))
+    if _pm_project and _pm_has_month and _pm_has_compare:
+        _pm_recs = [r for r in records if (r.get("project") or "").lower() == _pm_project.lower()]
+        if _pm_recs:
+            _pm_monthly = build_monthly_by_project(records, _pm_project)
+            if _pm_monthly:
+                _pm_sorted = sorted(
+                    _pm_monthly.keys(),
+                    key=lambda m: _parse_month_date(m) or _date.min,
+                )
+                _pm_by_rev = sorted(_pm_sorted, key=lambda m: _pm_monthly[m]["revenue"])
+                _pm_lowest_m = _pm_by_rev[0]
+                _pm_highest_m = _pm_by_rev[-1]
+                _pm_lowest_rev = _pm_monthly[_pm_lowest_m]["revenue"]
+                _pm_highest_rev = _pm_monthly[_pm_highest_m]["revenue"]
+                _proj_canonical = _pm_recs[0].get("project") or _pm_project
+                _pm_low_note = (
+                    " (missing billing rates — $0 revenue recorded)"
+                    if _pm_lowest_rev == 0 else ""
+                )
+                _pm_summary = (
+                    f"{_proj_canonical}: highest revenue month is {_pm_highest_m} "
+                    f"at ${_pm_highest_rev:,.2f}; "
+                    f"lowest is {_pm_lowest_m} at ${_pm_lowest_rev:,.2f}{_pm_low_note}."
+                )
+                _pm_table_rows = []
+                for _m in _pm_sorted:
+                    _d = _pm_monthly[_m]
+                    _rev, _cost, _profit = _d["revenue"], _d["cost"], _d["profit"]
+                    _margin = round((_profit / _rev) * 100, 1) if _rev > 0 else 0.0
+                    _pm_table_rows.append({
+                        "Month": _m,
+                        "Revenue": _rev,
+                        "Cost": _cost,
+                        "Profit": _profit,
+                        "Margin (%)": _margin,
+                        "Hours": _d["hours"],
+                    })
+                return {
+                    "summary": _pm_summary,
+                    "visual_type": "table",
+                    "columns": ["Month", "Revenue", "Cost", "Profit", "Margin (%)", "Hours"],
+                    "data": _pm_table_rows,
+                    "sources": {
+                        "total_records": len(records),
+                        "months": get_months_available(records),
+                        "time_range": time_range or "ALL",
+                        "forecast": False,
+                    },
+                }
+
     # ── Deterministic general query engine ───────────────────────────────────
     # Handles "what is the X of Y", "which project/employee has highest/lowest X",
     # "total/overall X", "list all employees/projects" — zero LLM involvement.
@@ -3172,6 +3464,21 @@ def ask(question: str, time_range: str = None) -> dict:
         parsed_json = _correct_hallucinated_numbers(parsed_json, _grounding)
     if parsed_json and isinstance(parsed_json, dict):
         parsed_json = _validate_llm_response(parsed_json, records)
+
+    # ── Anti-hallucination guard: numeric validation against source records ──
+    _llm_summary = (parsed_json or {}).get("summary", "") if isinstance(parsed_json, dict) else ""
+    if _llm_summary and not _validate_answer(_llm_summary, records):
+        _log("LLM answer failed numeric validation — falling back to rule-based answer", "debug")
+        _rb = _rule_based_answer(question, records)
+        if _rb is not None:
+            _rb.setdefault("sources", {}).update({
+                "total_records": len(records),
+                "time_range": time_range or "ALL",
+                "forecast": False,
+                "validation": "rule_based_fallback",
+            })
+            _cache_response(question, data_hash, _rb)
+            return _rb
     
     # Validate and fix LLM response structure
     if not parsed_json or not isinstance(parsed_json, dict):
