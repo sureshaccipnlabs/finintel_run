@@ -406,6 +406,20 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
         # Time period words
         "monthly", "weekly", "daily", "yearly", "annual", "quarterly",
         "forecast", "projection", "budget", "estimate", "expected", "actual",
+        # Common adjectives/descriptors that may appear capitalized in questions
+        "high", "low", "medium", "good", "bad", "poor", "strong", "weak",
+        "positive", "negative", "active", "inactive", "current", "previous",
+        "new", "old", "recent", "latest", "last", "first", "second", "third",
+        "maximum", "minimum", "max", "min", "single", "multiple", "each",
+        "only", "also", "other", "another", "same", "different", "similar",
+        "total", "net", "gross", "base", "full", "partial", "specific",
+        "top", "bottom", "above", "below", "under", "over", "between",
+        # Business/financial adjectives
+        "billable", "non", "unbillable", "offshore", "onshore", "senior",
+        "junior", "lead", "associate", "principal", "key", "critical",
+        # Common gerunds / performance descriptors used in questions
+        "performing", "contributing", "generating", "earning", "billing",
+        "underperforming", "overperforming", "utilizing", "working", "running",
     }
     
     # Fix 2: Data-based entity detection (works with any case)
