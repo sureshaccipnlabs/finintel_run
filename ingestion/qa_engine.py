@@ -12,6 +12,7 @@ import time
 import os
 import logging
 from datetime import date as _date
+from typing import Optional
 
 from .dataset import (
     GLOBAL_DATASET, build_projects, build_monthly, build_overall_summary,
@@ -367,6 +368,23 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
     ]
     if any(w in q for w in employee_keywords):
         scope["needs_employee_summary"] = True
+
+    # Detect designation phrase from question (e.g. "senior developers", "architects")
+    _designation_keywords = [
+        "senior developer", "junior developer", "lead developer", "senior engineer",
+        "junior engineer", "lead engineer", "architect", "consultant", "manager",
+        "analyst", "engineer", "developer", "designer", "director", "executive",
+        "senior", "junior", "lead",
+    ]
+    for _dk in _designation_keywords:
+        if _dk in q:
+            if records:
+                _actual_desig = {(r.get("designation") or "").lower() for r in records if r.get("designation")}
+                _matched_desig = next((d for d in _actual_desig if _dk in d or d in _dk), None)
+                scope["specific_designation"] = _matched_desig or _dk
+            else:
+                scope["specific_designation"] = _dk
+            break
     
     # Specific employee name mentioned (capitalized word that's not a common word)
     common_words = {
@@ -395,9 +413,13 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
     skip_words = {"in", "on", "at", "to", "of", "by", "vs", "or", "an", "a", "the", "is", "it"}
     
     if records and (actual_employees or actual_projects):
-        # Check each word in question against actual data
-        words = re.findall(r"[a-zA-Z]+(?:'s)?", question)
+        # Check each word in question against actual data.
+        # Use [a-zA-Z0-9]+ so "Steve1244" is ONE token, not split into "Steve"+"1244".
+        words = re.findall(r"[a-zA-Z0-9]+(?:'s)?", question)
         for word in words:
+            # Skip pure-numeric tokens (e.g. years, IDs)
+            if re.fullmatch(r"[0-9]+", word):
+                continue
             # Clean the word: remove possessive 's and convert to lowercase
             word_clean = word.lower()
             if word_clean.endswith("'s"):
@@ -418,8 +440,11 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
             if is_project and not is_employee:
                 # Definitely a project
                 scope["needs_projects"] = True
-                scope["specific_project"] = actual_projects_original.get(word_clean, word.title())
-                _log(f"Detected project: '{word_clean}' -> '{scope['specific_project']}'", "debug")
+                _proj_canonical = actual_projects_original.get(word_clean, word.title())
+                scope["specific_project"] = _proj_canonical
+                if _proj_canonical not in scope.setdefault("mentioned_projects", []):
+                    scope["mentioned_projects"].append(_proj_canonical)
+                _log(f"Detected project: '{word_clean}' -> '{_proj_canonical}'", "debug")
             elif is_employee and not is_project:
                 # Definitely an employee
                 scope["needs_employee_summary"] = True
@@ -445,6 +470,10 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
                     scope["needs_projects"] = True
                     scope["specific_project"] = actual_projects_original.get(word_clean, word.title())
             elif len(word_clean) > 2 and word[0].isupper():
+                # Skip words that are part of the detected designation phrase
+                _detected_desig = scope.get("specific_designation", "")
+                if _detected_desig and word_clean in _detected_desig.lower().split():
+                    continue
                 # Capitalized word not in data - track as missing and try fuzzy match
                 missing_word = word.replace("'s", "")
                 scope["missing_entities"].append(missing_word)
@@ -454,10 +483,12 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
                 if suggestion:
                     if "suggestions" not in scope:
                         scope["suggestions"] = []
-                    scope["suggestions"].append(f"'{missing_word}' -> Did you mean '{suggestion}'?")
+                    scope["suggestions"].append(f"Did you mean '{suggestion}'?")
     else:
         # Fallback: Old behavior when no records provided (capitalized words)
-        name_match = re.findall(r"\b([A-Z][a-z]+)\b", question)
+        # Require the capitalized token to be surrounded by non-alphanumeric chars
+        # so "Steve" inside "Steve1244" is NOT matched as a standalone name.
+        name_match = re.findall(r"(?<![a-zA-Z0-9])([A-Z][a-z]+)(?![a-zA-Z0-9])", question)
         for name in name_match:
             if name.lower() not in common_words and not re.match(month_pattern, name.lower()):
                 scope["needs_employee_summary"] = True
@@ -607,7 +638,7 @@ def _build_dataset_context(records=None, question: str = None):
     # Must be computed early (before PROJECTS block) so EMPLOYEE DETAILS can be scoped.
     _specific_proj_scope = scope.get("specific_project") if scope else None
     _specific_emp_scope  = scope.get("specific_employee") if scope else None
-    _matched_proj_for_emp: str | None = None
+    _matched_proj_for_emp: Optional[str] = None
     if _specific_proj_scope:
         for _p in sorted({r.get("project") for r in recs if r.get("project")}):
             if _p.lower() == _specific_proj_scope.lower():
@@ -792,7 +823,18 @@ def _build_dataset_context(records=None, question: str = None):
                 f"BillableHours={billable_hrs}, Status={proj_status}, "
                 f"RevenueTrend={rev_trend}, CostTrend={cost_trend}, ProfitTrend={profit_trend}, MarginTrend={margin_trend}, UtilTrend={util_trend}, "
                 f"BestRevenueMonth={best_rev_month}, WorstRevenueMonth={worst_rev_month}, "
-                f"MonthlyBreakdown(last {min(6, len(sorted_months))} months)=[{', '.join(f'{m}:Rev=${monthly_data[m]["rev"]:,.0f}/Cost=${monthly_data[m]["cost"]:,.0f}/Util={round(sum(monthly_data[m].get("util_vals", [0])) / max(len(monthly_data[m].get("util_vals", [1])), 1), 1)}%' for m in sorted_months[-6:])}]"
+                "MonthlyBreakdown(last {} months)=[{}]".format(
+                    min(6, len(sorted_months)),
+                    ", ".join(
+                        "{}:Rev=${:,.0f}/Cost=${:,.0f}/Util={}%".format(
+                            m,
+                            monthly_data[m]["rev"],
+                            monthly_data[m]["cost"],
+                            round(sum(monthly_data[m].get("util_vals", [0])) / max(len(monthly_data[m].get("util_vals", [1])), 1), 1),
+                        )
+                        for m in sorted_months[-6:]
+                    ),
+                )
             )
         lines.append("")
 
@@ -969,6 +1011,211 @@ def _build_dataset_context(records=None, question: str = None):
     return "\n".join(lines)
 
 
+# ── Grounding facts (pre-computed exact values injected into prompt) ──────────
+
+def _compute_grounding_facts(records: list, scope: dict) -> str:
+    """
+    Pre-compute exact figures for the specific employee / project in the question
+    and return a compact text block that is prepended to the LLM context.
+    The model reads correct numbers first and does not re-derive them from summaries.
+    """
+    if not records or not scope:
+        return ""
+
+    lines: list[str] = []
+
+    specific_emp  = scope.get("specific_employee")
+    specific_proj = scope.get("specific_project")
+
+    # ── Case: both employee AND project(s) specified ──────────────────────────
+    # Collect all mentioned projects (may be >1 e.g. "Astral/Barclays/both").
+    # For each, compute the intersection.  If empty, say so explicitly.
+    mentioned = scope.get("mentioned_projects") or ([specific_proj] if specific_proj else [])
+    if specific_emp and mentioned:
+        emp_all_projects = sorted({
+            r.get("project") for r in records
+            if (r.get("employee") or "").lower() == specific_emp.lower()
+            and r.get("project")
+        })
+        lines.append("=== GROUNDING FACTS (pre-computed — use these EXACT numbers) ===")
+        for proj_q in mentioned:
+            inter_recs = [
+                r for r in records
+                if (r.get("employee") or "").lower() == specific_emp.lower()
+                and (r.get("project")  or "").lower() == proj_q.lower()
+            ]
+            if not inter_recs:
+                lines.append(
+                    f"NO DATA: {specific_emp} has ZERO records in project '{proj_q}'. "
+                    f"{specific_emp} only exists in: {', '.join(emp_all_projects) or 'unknown'}. "
+                    f"Do NOT invent any margin, revenue, cost, or hours for this combination."
+                )
+            else:
+                rev    = round(sum(float(r.get("revenue") or 0) for r in inter_recs), 2)
+                cost   = round(sum(float(r.get("cost")    or 0) for r in inter_recs), 2)
+                prof   = round(rev - cost, 2)
+                hrs    = round(sum(float(r.get("actual_hours") or 0) for r in inter_recs), 2)
+                margin = round((prof / rev * 100), 2) if rev > 0 else 0.0
+                proj_name = inter_recs[0].get("project") or proj_q
+                lines.append(f"Employee: {specific_emp}  Project: {proj_name}")
+                lines.append(f"  Revenue: {rev}")
+                lines.append(f"  Cost: {cost}")
+                lines.append(f"  Profit: {prof}")
+                lines.append(f"  Hours: {hrs}")
+                lines.append(f"  Margin%: {margin}")
+        lines.append("")
+        return "\n".join(lines)
+
+    # ── Case: employee only ───────────────────────────────────────────────────
+    if specific_emp:
+        emp_recs = [r for r in records if (r.get("employee") or "").lower() == specific_emp.lower()]
+        if emp_recs:
+            rev    = round(sum(float(r.get("revenue") or 0) for r in emp_recs), 2)
+            cost   = round(sum(float(r.get("cost")    or 0) for r in emp_recs), 2)
+            prof   = round(rev - cost, 2)
+            hrs    = round(sum(float(r.get("actual_hours") or 0) for r in emp_recs), 2)
+            margin = round((prof / rev * 100), 2) if rev > 0 else 0.0
+            seen_months: set = set()
+            wd = 0
+            for r in emp_recs:
+                m = r.get("month") or "?"
+                if m not in seen_months:
+                    seen_months.add(m)
+                    wd += int(r.get("working_days") or 0)
+            projects = sorted({r.get("project") or "" for r in emp_recs if r.get("project")})
+            lines.append("=== GROUNDING FACTS (pre-computed — use these EXACT numbers) ===")
+            lines.append(f"Employee: {specific_emp}")
+            lines.append(f"  Revenue: {rev}")
+            lines.append(f"  Cost: {cost}")
+            lines.append(f"  Profit: {prof}")
+            lines.append(f"  Hours: {hrs}")
+            lines.append(f"  Margin%: {margin}")
+            lines.append(f"  WorkingDays: {wd}")
+            lines.append(f"  Projects: {', '.join(projects)}")
+            month_data: dict = {}
+            for r in emp_recs:
+                m = r.get("month") or "?"
+                if m not in month_data:
+                    month_data[m] = {"revenue": 0.0, "cost": 0.0, "hours": 0.0}
+                month_data[m]["revenue"] += float(r.get("revenue") or 0)
+                month_data[m]["cost"]    += float(r.get("cost")    or 0)
+                month_data[m]["hours"]   += float(r.get("actual_hours") or 0)
+            for m in sorted(month_data):
+                md = month_data[m]
+                lines.append(f"  [{m}] revenue={round(md['revenue'],2)} cost={round(md['cost'],2)} hours={round(md['hours'],2)}")
+            lines.append("")
+
+    # ── Case: project only ────────────────────────────────────────────────────
+    if specific_proj:
+        proj_recs = [r for r in records if (r.get("project") or "").lower() == specific_proj.lower()]
+        if proj_recs:
+            rev    = round(sum(float(r.get("revenue") or 0) for r in proj_recs), 2)
+            cost   = round(sum(float(r.get("cost")    or 0) for r in proj_recs), 2)
+            prof   = round(rev - cost, 2)
+            hrs    = round(sum(float(r.get("actual_hours") or 0) for r in proj_recs), 2)
+            margin = round((prof / rev * 100), 2) if rev > 0 else 0.0
+            emps   = len({r.get("employee") for r in proj_recs if r.get("employee")})
+            proj_name = proj_recs[0].get("project") or specific_proj
+            if not lines:
+                lines.append("=== GROUNDING FACTS (pre-computed — use these EXACT numbers) ===")
+            lines.append(f"Project: {proj_name}")
+            lines.append(f"  Revenue: {rev}")
+            lines.append(f"  Cost: {cost}")
+            lines.append(f"  Profit: {prof}")
+            lines.append(f"  Hours: {hrs}")
+            lines.append(f"  Margin%: {margin}")
+            lines.append(f"  Employees: {emps}")
+            lines.append("")
+
+    specific_desig = scope.get("specific_designation")
+    if not specific_emp and not specific_proj and specific_desig:
+        desig_recs = [r for r in records if specific_desig.lower() in (r.get("designation") or "").lower()]
+        desig_emps = sorted({r.get("employee") for r in desig_recs if r.get("employee")})
+        if desig_emps:
+            lines.append("=== GROUNDING FACTS (pre-computed — use these EXACT numbers) ===")
+            lines.append("Designation filter: '{}'  Matched employees: {}".format(specific_desig, ", ".join(desig_emps)))
+            emp_margins = []
+            for _e in desig_emps:
+                _er   = [r for r in desig_recs if (r.get("employee") or "") == _e]
+                _rev  = sum(float(r.get("revenue") or 0) for r in _er)
+                _cost = sum(float(r.get("cost")    or 0) for r in _er)
+                _m    = round((_rev - _cost) / _rev * 100, 2) if _rev > 0 else 0.0
+                emp_margins.append(_m)
+                lines.append("  {}: Revenue={}  Cost={}  Margin%={}".format(_e, round(_rev, 2), round(_cost, 2), _m))
+            avg_margin = round(sum(emp_margins) / len(emp_margins), 2) if emp_margins else 0.0
+            lines.append("  AverageMargin%: {}".format(avg_margin))
+            lines.append("")
+        elif not lines:
+            lines.append("=== GROUNDING FACTS (pre-computed — use these EXACT numbers) ===")
+            lines.append("Designation filter: '{}'  Matched employees: none — no employees with this designation in the dataset.".format(specific_desig))
+            lines.append("")
+    elif not specific_emp and not specific_proj:
+        rev    = round(sum(float(r.get("revenue") or 0) for r in records), 2)
+        cost   = round(sum(float(r.get("cost")    or 0) for r in records), 2)
+        prof   = round(rev - cost, 2)
+        hrs    = round(sum(float(r.get("actual_hours") or 0) for r in records), 2)
+        margin = round((prof / rev * 100), 2) if rev > 0 else 0.0
+        emps   = len({r.get("employee") for r in records if r.get("employee")})
+        lines.append("=== GROUNDING FACTS (pre-computed — use these EXACT numbers) ===")
+        lines.append("Overall  Revenue: {}  Cost: {}  Profit: {}  Hours: {}  Margin%: {}  Employees: {}".format(rev, cost, prof, hrs, margin, emps))
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _correct_hallucinated_numbers(parsed: dict, grounding_text: str) -> dict:
+    """
+    Post-generation guard: for any number in the LLM JSON response that deviates
+    more than 5% from the pre-computed grounding value, replace it with the correct
+    value so the UI always shows accurate figures.
+    """
+    if not grounding_text or not parsed:
+        return parsed
+
+    ground: dict[str, float] = {}
+    for line in grounding_text.splitlines():
+        line = line.strip()
+        for part in re.split(r"\s{2,}", line):
+            m = re.match(r"([A-Za-z%]+):\s*([\d.]+)", part.strip())
+            if m:
+                ground[m.group(1).lower()] = float(m.group(2))
+        m2 = re.match(r"\[(.+?)\]\s+(.*)", line)
+        if m2:
+            for kv in m2.group(2).split():
+                kv_m = re.match(r"(\w+)=([\d.]+)", kv)
+                if kv_m:
+                    ground[kv_m.group(1).lower()] = float(kv_m.group(2))
+
+    if not ground:
+        return parsed
+
+    _ALIASES = {
+        "totalrevenue": "revenue", "rev": "revenue",
+        "totalcost": "cost",       "cst": "cost",
+        "totalprofit": "profit",   "pft": "profit",
+        "actualhours": "hours",    "hrs": "hours",
+        "marginpct": "margin%",    "margin": "margin%",
+    }
+
+    def _fix_row(row: dict) -> dict:
+        out = {}
+        for k, v in row.items():
+            key = _ALIASES.get(k.lower().replace(" ", "").replace("_", ""), k.lower())
+            if key in ground and isinstance(v, (int, float)):
+                expected = ground[key]
+                if expected != 0 and abs(v - expected) / abs(expected) > 0.05:
+                    _log(f"Correcting hallucinated {k}: {v} -> {expected}", "debug")
+                    v = expected
+            out[k] = v
+        return out
+
+    data = parsed.get("data", [])
+    if isinstance(data, list):
+        parsed["data"] = [_fix_row(row) if isinstance(row, dict) else row for row in data]
+
+    return parsed
+
+
 # ── Prompt template ──────────────────────────────────────────────────────────
 
 _QA_PROMPT = """\
@@ -1047,7 +1294,7 @@ RULES:
 20. When comparing numbers, 96.6 > 96.0 > 95.0. Always compare the actual numeric values, not just the first digits.
 
 ANTI-HALLUCINATION (CRITICAL):
-21. ONLY use data explicitly provided in the context above. NEVER invent, estimate, or assume values.
+21. The GROUNDING FACTS section at the top of the context contains PRE-COMPUTED EXACT values. Always use those exact numbers for the entities they describe. NEVER recompute or estimate them. For all other data, ONLY use what is explicitly in the context.
 22. If a project/employee name is completely absent from the data (zero records), respond as a WHOLE with: {{"summary": "No data found.", "visual_type": "text", "columns": [], "data": []}}. NEVER write "No data found" or any error text as a cell value inside a table — use 0 instead.
 23. Project names are CASE-SENSITIVE and must match EXACTLY as shown in PROJECTS section (e.g., "BARCLAYS" not "Barclays", "CRYSTAL" not "Crystal").
 24. If the question mentions a name similar to but not exactly matching a project/employee, clarify: "Did you mean [exact name from data]?"
@@ -1057,6 +1304,7 @@ ANTI-HALLUCINATION (CRITICAL):
 28. For designation-based questions ("senior developers", "architects", "consultants"): filter employees by their Designation field. If Designation is empty for an employee, do NOT include them in designation-filtered results.
 29. For "Q1"/"Q2"/"Q3"/"Q4" without an explicit year: use the most recent year present in the data. Never sum Q-data across multiple years unless the question explicitly requests multi-year comparison.
 30. For "this year", "current year", or "YTD" questions: ONLY use months from the current calendar year as filtered in the context. Do not include months from prior years.
+31. NEVER echo or repeat the question as the answer. If you cannot compute a specific numeric answer from the context, respond with: {{"summary": "No data found for this query.", "visual_type": "text", "columns": [], "data": []}}. Do NOT rephrase the question as a heading or statement.
 """
 
 
@@ -1774,7 +2022,11 @@ def ask(question: str, time_range: str = None) -> dict:
     _scope_check = _detect_question_scope(question, records)
     _missing = _scope_check.get("missing_entities", [])
     if _missing:
-        _msg = "No data found."
+        _suggestions = _scope_check.get("suggestions", [])
+        if _suggestions:
+            _msg = f"'{', '.join(_missing)}' not found. {' '.join(_suggestions)}"
+        else:
+            _msg = f"'{', '.join(_missing)}' not found."
         _elapsed = time.time() - _start_time
         _log(f"Total time: {_elapsed:.2f}s (validation_error)")
         return {
@@ -1794,7 +2046,158 @@ def ask(question: str, time_range: str = None) -> dict:
 
     # Build targeted context based on question (smart context selection)
     _ctx_start = time.time()
+    _qa_scope = _detect_question_scope(question, records)
+
+    # Early-return: employee + project both specified but intersection is empty.
+    # Skip the LLM entirely — it has nothing to work with and will hallucinate.
+    _emp_q       = _qa_scope.get("specific_employee")
+    _mentioned_q = _qa_scope.get("mentioned_projects") or ([_qa_scope.get("specific_project")] if _qa_scope.get("specific_project") else [])
+    if _emp_q and _mentioned_q:
+        _emp_projects = sorted({
+            r.get("project") for r in records
+            if (r.get("employee") or "").lower() == _emp_q.lower()
+            and r.get("project")
+        })
+        # Check each mentioned project; collect those with zero intersection
+        _no_data_projs = []
+        _has_data_projs = []
+        for _pq in _mentioned_q:
+            _inter = [
+                r for r in records
+                if (r.get("employee") or "").lower() == _emp_q.lower()
+                and (r.get("project")  or "").lower() == _pq.lower()
+            ]
+            _canonical = next((r.get("project") for r in records if (r.get("project") or "").lower() == _pq.lower()), _pq)
+            if not _inter:
+                _no_data_projs.append(_canonical)
+            else:
+                _has_data_projs.append(_canonical)
+        # Decide what to do based on intersections:
+        #  • ALL projects have data  → fall through to LLM (grounding already correct)
+        #  • SOME projects have data → early-return: show data for matching ones, note missing
+        #  • NO  projects have data  → early-return: "doesn't belong to any"
+        if _no_data_projs:
+            if not _has_data_projs:
+                # Steve belongs to none of the mentioned projects
+                _msg = (
+                    f"{_emp_q} does not belong to any of the mentioned project(s): "
+                    f"{', '.join(_no_data_projs)}. "
+                    f"{_emp_q} works in: {', '.join(_emp_projects) or 'unknown'}."
+                )
+                _log(f"Early-return: no intersection at all — {_msg}")
+                return {
+                    "summary": _msg,
+                    "visual_type": "text",
+                    "columns": [],
+                    "data": [],
+                    "sources": {
+                        "total_records": len(records),
+                        "months": get_months_available(records),
+                        "time_range": time_range or "ALL",
+                        "no_intersection": True,
+                    },
+                }
+            else:
+                # Steve belongs to some but not all — compute data for matching projects
+                _partial_rows = []
+                for _actual_proj in _has_data_projs:
+                    _ap_recs = [
+                        r for r in records
+                        if (r.get("employee") or "").lower() == _emp_q.lower()
+                        and (r.get("project") or "") == _actual_proj
+                    ]
+                    if _ap_recs:
+                        _ap_rev  = sum(float(r.get("revenue") or 0) for r in _ap_recs)
+                        _ap_cost = sum(float(r.get("cost")    or 0) for r in _ap_recs)
+                        _ap_hrs  = sum(float(r.get("actual_hours") or 0) for r in _ap_recs)
+                        _ap_margin = round((_ap_rev - _ap_cost) / _ap_rev * 100, 2) if _ap_rev > 0 else 0.0
+                        _partial_rows.append({
+                            "Project": _actual_proj,
+                            "Revenue": round(_ap_rev, 2),
+                            "Cost": round(_ap_cost, 2),
+                            "Profit": round(_ap_rev - _ap_cost, 2),
+                            "Margin (%)": _ap_margin,
+                            "Hours": round(_ap_hrs, 2),
+                        })
+                _no_data_note = (
+                    f" Note: {_emp_q} has no records in: {', '.join(_no_data_projs)}."
+                )
+                _summary = (
+                    f"Data for {_emp_q} in {', '.join(_has_data_projs)}.{_no_data_note}"
+                )
+                _log(f"Early-return: partial intersection — {_summary}")
+                return {
+                    "summary": _summary,
+                    "visual_type": "table",
+                    "columns": ["Project", "Revenue", "Cost", "Profit", "Margin (%)", "Hours"],
+                    "data": _partial_rows,
+                    "sources": {
+                        "total_records": len(records),
+                        "months": get_months_available(records),
+                        "time_range": time_range or "ALL",
+                        "no_intersection": True,
+                    },
+                }
+
+    # Early-return for designation queries — skip LLM entirely when no matches exist.
+    # Prevents the LLM from inventing percentages for non-existent roles.
+    _desig_q = _qa_scope.get("specific_designation")
+    if _desig_q and not _qa_scope.get("specific_employee") and not _qa_scope.get("specific_project"):
+        _desig_recs = [r for r in records if _desig_q.lower() in (r.get("designation") or "").lower()]
+        _desig_emps = sorted({r.get("employee") for r in _desig_recs if r.get("employee")})
+        if not _desig_emps:
+            _has_any_desig = any(r.get("designation") for r in records)
+            if _has_any_desig:
+                _actual = sorted({r.get("designation") for r in records if r.get("designation")})
+                _msg = "No employees found with designation '{}'. Available designations: {}.".format(
+                    _desig_q, ", ".join(_actual))
+            else:
+                _msg = "No designation/role information available in the uploaded data."
+            return {
+                "summary": _msg,
+                "visual_type": "text",
+                "columns": [],
+                "data": [],
+                "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
+            }
+        else:
+            # Employees found — compute full answer deterministically (no LLM)
+            _desig_rows = []
+            _desig_margins = []
+            for _e in _desig_emps:
+                _er   = [r for r in _desig_recs if (r.get("employee") or "") == _e]
+                _rev  = sum(float(r.get("revenue") or 0) for r in _er)
+                _cost = sum(float(r.get("cost")    or 0) for r in _er)
+                _hrs  = sum(float(r.get("actual_hours") or 0) for r in _er)
+                _m    = round((_rev - _cost) / _rev * 100, 2) if _rev > 0 else 0.0
+                _desig_margins.append(_m)
+                _desig_rows.append({
+                    "Employee": _e,
+                    "Revenue": round(_rev, 2),
+                    "Cost": round(_cost, 2),
+                    "Profit": round(_rev - _cost, 2),
+                    "Margin (%)": _m,
+                    "Hours": round(_hrs, 2),
+                })
+            _avg_m = round(sum(_desig_margins) / len(_desig_margins), 2)
+            _summary = "{} employees with designation '{}': {}. Average margin: {}%.".format(
+                len(_desig_emps),
+                _desig_q,
+                ", ".join(_desig_emps),
+                _avg_m,
+            )
+            return {
+                "summary": _summary,
+                "visual_type": "table",
+                "columns": ["Employee", "Revenue", "Cost", "Profit", "Margin (%)", "Hours"],
+                "data": _desig_rows,
+                "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
+            }
+
+    _grounding = _compute_grounding_facts(records, _qa_scope)
     context = _get_cached_context(records, question=question)
+    if _grounding:
+        context = _grounding + "\n" + context
     _log(f"Context build took {time.time() - _ctx_start:.2f}s")
     
     # Debug: log context details
@@ -1857,31 +2260,28 @@ def ask(question: str, time_range: str = None) -> dict:
     # Only check for echo if response is NOT valid JSON (valid JSON means LLM processed it)
     is_likely_json = raw_lower.strip().startswith('{') or '{"summary"' in raw_lower
     if raw_lower and q_lower and not is_likely_json:
-        # Remove common prefixes/suffixes for comparison
-        raw_clean = re.sub(r'^(project\s+|details\s+(of|for)\s+|show\s+|get\s+)', '', raw_lower)
-        q_clean = re.sub(r'^(project\s+|details\s+(of|for)\s+|show\s+|get\s+)', '', q_lower)
-        # If response is very similar to question (echo), it's likely hallucination
-        # Must be high similarity (>80% match) to avoid false positives
-        if raw_clean.replace(' ', '') == q_clean.replace(' ', ''):
-            _log(f"WARNING: LLM echoed question back - likely hallucination", "debug")
-            # Return structured response with actual data (lazy-loaded)
-            scope, proj_data = _get_fallback_data()
-            if proj_data:
-                return {
-                    "summary": f"{proj_data['name']}: Revenue=${proj_data['revenue']:,.2f}, Cost=${proj_data['cost']:,.2f}, Profit=${proj_data['profit']:,.2f}, Employees={proj_data['employees']}",
-                    "visual_type": "metric",
-                    "columns": [],
-                    "data": [
-                        {"label": "Revenue", "value": proj_data['revenue']},
-                        {"label": "Cost", "value": proj_data['cost']},
-                        {"label": "Profit", "value": proj_data['profit']},
-                        {"label": "Employees", "value": proj_data['employees']},
-                    ],
-                    "sources": {"total_records": len(records), "fallback": "echo_detection"},
-                }
+        # Word-overlap echo detection: if >60% of meaningful words in the response
+        # come directly from the question and there is no numeric data, it's an echo.
+        _stop = {"the", "a", "an", "is", "of", "in", "for", "and", "to", "what",
+                 "how", "which", "who", "give", "show", "me", "list", "get", "compute"}
+        _q_words   = {w for w in re.findall(r"[a-z]+", q_lower)   if w not in _stop and len(w) > 2}
+        _raw_words = {w for w in re.findall(r"[a-z]+", raw_lower) if w not in _stop and len(w) > 2}
+        _has_digits = bool(re.search(r"\d", raw_lower))
+        _overlap = len(_q_words & _raw_words) / max(len(_raw_words), 1)
+        if _overlap >= 0.6 and not _has_digits:
+            _log("WARNING: LLM echoed question back (overlap={:.0%}) - hallucination".format(_overlap), "debug")
+            return {
+                "summary": "No data found for this query. Please check that the relevant files are uploaded.",
+                "visual_type": "text",
+                "columns": [],
+                "data": [],
+                "sources": {"total_records": len(records), "fallback": "echo_detection"},
+            }
     
     # Parse the JSON from the LLM
     parsed_json = _extract_qa_json(raw_response)
+    if parsed_json and _grounding:
+        parsed_json = _correct_hallucinated_numbers(parsed_json, _grounding)
     
     # Validate and fix LLM response structure
     if not parsed_json or not isinstance(parsed_json, dict):
@@ -1897,29 +2297,27 @@ def ask(question: str, time_range: str = None) -> dict:
     # Only trigger if summary looks like echoed question (not a valid short answer)
     summary = parsed_json.get("summary", "")
     summary_lower = summary.lower().strip()
-    looks_like_echo = summary_lower and (
-        summary_lower in q_lower or 
-        q_lower.rstrip('?').rstrip('.') in summary_lower or
-        summary_lower.endswith('details') or
-        summary_lower.endswith('details.')
+    _s_words = {w for w in re.findall(r"[a-z]+", summary_lower) if len(w) > 2}
+    _q_words2 = {w for w in re.findall(r"[a-z]+", q_lower) if len(w) > 2}
+    _s_overlap = len(_s_words & _q_words2) / max(len(_s_words), 1) if _s_words else 0
+    _s_has_digits = bool(re.search(r"\d", summary_lower))
+    # Echo if: exact substring match OR very high word overlap with no numbers in summary
+    looks_like_echo = bool(summary_lower) and (
+        summary_lower in q_lower
+        or q_lower.rstrip('?').rstrip('.').strip() in summary_lower
+        or summary_lower.endswith('details')
+        or summary_lower.endswith('details.')
+        or (_s_overlap >= 0.6 and not _s_has_digits)
     )
-    if summary and len(summary) < 30 and not parsed_json.get("data") and looks_like_echo:
-        # Very short summary that looks like echoed question - likely hallucination
-        _log(f"WARNING: Short echo-like summary with no data - possible hallucination: '{summary}'", "debug")
-        # Try to provide actual data (reuse lazy-loaded fallback)
-        scope, proj_data = _get_fallback_data()
-        if proj_data:
-            parsed_json = {
-                "summary": f"{proj_data['name']}: Revenue=${proj_data['revenue']:,.2f}, Cost=${proj_data['cost']:,.2f}, Profit=${proj_data['profit']:,.2f}, Employees={proj_data['employees']}",
-                "visual_type": "metric",
-                "columns": [],
-                "data": [
-                    {"label": "Revenue", "value": proj_data['revenue']},
-                    {"label": "Cost", "value": proj_data['cost']},
-                    {"label": "Profit", "value": proj_data['profit']},
-                    {"label": "Employees", "value": proj_data['employees']},
-                ],
-            }
+    # Fire on echo even when data rows exist — hallucinated rows accompany echoed summaries
+    if summary and len(summary) < 120 and looks_like_echo:
+        _log("WARNING: echo-like summary - hallucination: '{}'".format(summary), "debug")
+        parsed_json = {
+            "summary": "No data found for this query.",
+            "visual_type": "text",
+            "columns": [],
+            "data": [],
+        }
     
     # Ensure required fields exist with correct types
     if "summary" not in parsed_json or not isinstance(parsed_json.get("summary"), str):
