@@ -2295,26 +2295,40 @@ def _try_deterministic_answer(question: str, records: list, scope: dict):
         s = rows[0]
         if _is_revenue and not _is_profit and not _is_cost and not _is_margin and not _is_hours:
             return {
-                "summary": "Revenue for {}: ${:,.2f}".format(_proj, s["Revenue"]),
+                "summary": "{} generated revenue of ${:,.2f}.".format(_proj, s["Revenue"]),
                 "visual_type": "text", "columns": [], "data": [], "sources": {},
             }
         if _is_profit and not _is_revenue and not _is_cost and not _is_margin:
             return {
-                "summary": "Profit for {}: ${:,.2f}".format(_proj, s["Profit"]),
+                "summary": "{} earned a profit of ${:,.2f}.".format(_proj, s["Profit"]),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        if _is_cost and not _is_revenue and not _is_profit and not _is_margin:
+            return {
+                "summary": "{} incurred costs of ${:,.2f}.".format(_proj, s["Cost"]),
                 "visual_type": "text", "columns": [], "data": [], "sources": {},
             }
         if _is_margin and not _is_revenue:
             return {
-                "summary": "Margin for {}: {}%".format(_proj, s["Margin (%)"]),
+                "summary": "{}'s margin is {}% — profit ${:,.2f} on revenue ${:,.2f}.".format(
+                    _proj, s["Margin (%)"], s["Profit"], s["Revenue"]),
                 "visual_type": "text", "columns": [], "data": [], "sources": {},
             }
-        # Multiple metrics → table
+        if _is_hours and not _is_revenue and not _is_profit and not _is_cost and not _is_margin:
+            return {
+                "summary": "{} had {:.0f} hours billed.".format(_proj, s["Hours"]),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        # Multiple metrics → full-profile sentence
+        _ps = rows[0]
+        _pp = round((_ps["Profit"] / _ps["Revenue"]) * 100, 1) if _ps["Revenue"] > 0 else 0
         return {
-            "summary": "Summary for project {}.".format(_proj),
-            "visual_type": "table",
-            "columns": ["Project", "Revenue", "Cost", "Profit", "Margin (%)", "Hours"],
-            "data": rows,
-            "sources": {},
+            "summary": (
+                "{} — Revenue: ${:,.2f}, Cost: ${:,.2f}, Profit: ${:,.2f} ({:.1f}% margin), "
+                "Hours: {:.0f}.".format(
+                    _proj, _ps["Revenue"], _ps["Cost"], _ps["Profit"], _pp, _ps["Hours"])
+            ),
+            "visual_type": "text", "columns": [], "data": [], "sources": {},
         }
 
     # ── (4) Specific employee metric ──────────────────────────────────────────
@@ -2324,22 +2338,50 @@ def _try_deterministic_answer(question: str, records: list, scope: dict):
         if not rows:
             return None
         s = rows[0]
-        if _is_leave:
+        rev, cost, profit, margin, hrs, leave = (
+            s["Revenue"], s["Cost"], s["Profit"], s["Margin (%)"], s["Hours"], s["Leave Days"]
+        )
+        # ── Single-metric answers → one clean sentence ────────────────────
+        if _is_leave and not _is_revenue and not _is_profit and not _is_cost and not _is_margin:
             return {
-                "summary": "{} has {:.0f} leave day(s).".format(_emp, s["Leave Days"]),
+                "summary": "{} took {:.0f} leave day(s).".format(_emp, leave),
                 "visual_type": "text", "columns": [], "data": [], "sources": {},
             }
-        if _is_revenue and not _is_profit and not _is_cost and not _is_margin:
+        if _is_revenue and not _is_profit and not _is_cost and not _is_margin and not _is_hours:
             return {
-                "summary": "Revenue for {}: ${:,.2f}".format(_emp, s["Revenue"]),
+                "summary": "{} generated revenue of ${:,.2f}.".format(_emp, rev),
                 "visual_type": "text", "columns": [], "data": [], "sources": {},
             }
+        if _is_profit and not _is_revenue and not _is_cost and not _is_margin:
+            return {
+                "summary": "{} earned a profit of ${:,.2f}.".format(_emp, profit),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        if _is_cost and not _is_revenue and not _is_profit and not _is_margin:
+            return {
+                "summary": "{} incurred costs of ${:,.2f}.".format(_emp, cost),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        if _is_margin and not _is_revenue and not _is_profit:
+            return {
+                "summary": "{}'s margin is {}% — profit ${:,.2f} on revenue ${:,.2f} with costs of ${:,.2f}.".format(
+                    _emp, margin, profit, rev, cost),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        if _is_hours and not _is_revenue and not _is_profit and not _is_cost and not _is_margin:
+            return {
+                "summary": "{} logged {:.0f} hours.".format(_emp, hrs),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        # ── Multi-metric or generic → full-profile sentence ───────────────
+        _prof_pct = round(profit / rev * 100, 1) if rev > 0 else 0
         return {
-            "summary": "Summary for {}.".format(_emp),
-            "visual_type": "table",
-            "columns": ["Employee", "Revenue", "Cost", "Profit", "Margin (%)", "Hours", "Leave Days"],
-            "data": rows,
-            "sources": {},
+            "summary": (
+                "{} — Revenue: ${:,.2f}, Cost: ${:,.2f}, Profit: ${:,.2f} ({:.1f}% margin), "
+                "Hours: {:.0f}, Leave Days: {:.0f}.".format(
+                    _emp, rev, cost, profit, _prof_pct, hrs, leave)
+            ),
+            "visual_type": "text", "columns": [], "data": [], "sources": {},
         }
 
     # ── (5) Ranking: which project/employee has highest/lowest metric ─────────
@@ -2562,6 +2604,89 @@ def ask(question: str, time_range: str = None) -> dict:
             "data": [],
             "sources": {},
         }
+
+    # ── Early-return: "why / explain" questions about an employee ────────────
+    # NOTE: This block is intentionally placed BEFORE the util early-return so that
+    # "explain why Salini has low utilization" produces a narrative, not a bare list.
+    _why_intent_re = re.compile(
+        r"\b(why|explain|reason|what\s+cause[sd]?|how\s+happen|justify|account\s+for)",
+        re.IGNORECASE,
+    )
+    _perf_concern_re = re.compile(
+        r"\b(low.?margin|loss.?mak|underperform|poor.?perform|low.?profit|low.?revenue"
+        r"|low.?util|underutil|high.?leave|low.?bill|not.?generat|low.?contribut)\b",
+        re.IGNORECASE,
+    )
+    _why_emp_early = _detect_question_scope(question, records).get("specific_employee")
+    if (_why_intent_re.search(question) or _perf_concern_re.search(question)) and _why_emp_early:
+        _why_recs = [r for r in records if (r.get("employee") or "").lower() == _why_emp_early.lower()]
+        if _why_recs:
+            _w_rev   = sum(float(r.get("revenue") or 0) for r in _why_recs)
+            _w_cost  = sum(float(r.get("cost")    or 0) for r in _why_recs)
+            _w_hrs   = sum(float(r.get("actual_hours")   or 0) for r in _why_recs)
+            _w_exp   = sum(float(r.get("expected_hours") or r.get("max_hours") or 0) for r in _why_recs)
+            _w_leave = sum(float(r.get("vacation_days")  or 0) for r in _why_recs)
+            _w_work  = sum(float(r.get("working_days")   or 0) for r in _why_recs)
+            _w_profit  = round(_w_rev - _w_cost, 2)
+            _w_margin  = round(_w_profit / _w_rev * 100, 2) if _w_rev > 0 else 0.0
+            _w_util    = round(_w_hrs / _w_exp * 100, 1) if _w_exp > 0 else None
+            _w_leave_pct = round(_w_leave / _w_work * 100, 1) if _w_work > 0 else 0.0
+            _w_latest    = sorted(_why_recs, key=lambda r: r.get("month") or "", reverse=True)[0]
+            _w_bill_rate = float(_w_latest.get("billing_rate") or 0)
+            _w_cost_rate = float(_w_latest.get("cost_rate")    or 0)
+
+            _drivers = []
+            if _w_cost > 0 and _w_rev > 0 and _w_cost / _w_rev > 0.85:
+                _drivers.append(
+                    "costs (${:,.0f}) consume {:.0f}% of revenue (${:,.0f})".format(
+                        _w_cost, _w_cost / _w_rev * 100, _w_rev)
+                )
+            if _w_bill_rate and _w_cost_rate:
+                _rate_ratio = _w_bill_rate / _w_cost_rate
+                if _rate_ratio < 1.25:
+                    _drivers.append(
+                        "billing rate (${:.0f}/h) is only {:.2f}\u00d7 the cost rate (${:.0f}/h), leaving almost no buffer".format(
+                            _w_bill_rate, _rate_ratio, _w_cost_rate)
+                    )
+            if _w_util is not None and _w_util < 80:
+                _drivers.append(
+                    "utilisation is low at {:.1f}% ({:.0f}h actual vs {:.0f}h expected)".format(
+                        _w_util, _w_hrs, _w_exp)
+                )
+            if _w_leave_pct > 15:
+                _drivers.append(
+                    "high leave ({:.0f} days, {:.1f}% of working days) reduced billable output".format(
+                        _w_leave, _w_leave_pct)
+                )
+            if not _drivers:
+                _drivers.append(
+                    "revenue (${:,.0f}) is not significantly above costs (${:,.0f})".format(
+                        _w_rev, _w_cost)
+                )
+
+            _driver_str = (
+                _drivers[0] if len(_drivers) == 1
+                else ", ".join(_drivers[:-1]) + " and " + _drivers[-1]
+            )
+            _sentence = (
+                "{} has a margin of {:.1f}% (profit ${:,.0f} on revenue ${:,.0f}) "
+                "primarily because {}.".format(
+                    _why_emp_early, _w_margin, _w_profit, _w_rev, _driver_str)
+            )
+            if _w_margin < 15 and _w_bill_rate and _w_cost_rate:
+                _target_rate = round(_w_cost_rate / (1 - 0.20), 0)
+                if _target_rate > _w_bill_rate:
+                    _sentence += (
+                        " Raising the billing rate from ${:.0f}/h to ~${:.0f}/h "
+                        "would bring the margin to approximately 20%.".format(_w_bill_rate, _target_rate)
+                    )
+            return {
+                "summary": _sentence,
+                "visual_type": "text",
+                "columns": [],
+                "data": [],
+                "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
+            }
 
     # ── Early-return: utilisation queries ────────────────────────────────────
     _util_re = re.compile(
