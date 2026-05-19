@@ -85,8 +85,10 @@ def _openai_generate(prompt, timeout=60):
 
 
 def _normalized_provider_order() -> list[str]:
-    if AI_PROVIDER in ("ollama", "openai"):
-        return [AI_PROVIDER]
+    if AI_PROVIDER == "ollama":
+        return ["ollama", "openai"]   # ollama preferred, openai as fallback
+    if AI_PROVIDER == "openai":
+        return ["openai", "ollama"]   # openai preferred, ollama as fallback
 
     if AI_PROVIDER != "auto":
         return ["ollama", "openai"]
@@ -112,8 +114,7 @@ def _llm_generate(prompt, timeout=60):
                 return _openai_generate(prompt, timeout=timeout)
         except Exception as exc:
             errors.append(f"{provider}: {exc}")
-            if AI_PROVIDER in ("ollama", "openai"):
-                break
+            print(f"[llm_generate] {provider} failed ({exc}), trying next provider...")
             continue
 
     raise RuntimeError("All configured LLM providers failed: " + " | ".join(errors))

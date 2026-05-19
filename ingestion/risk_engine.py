@@ -1544,8 +1544,10 @@ def get_risks_and_recommendations(
 
     # ── AI strategic insights ─────────────────────────────────────────────
     ai_insights = []
+    print(f"[ai_insights] include_ai_insights={include_ai_insights}, action_risks_count={len(action_risks)}")
     if include_ai_insights and action_risks:
         raw = _get_ai_insights(records, action_risks, scorecards)
+        print(f"[ai_insights] raw response length={len(raw)}, preview={repr(raw[:120])}")
         _FILLER_STARTS = (
             "here are", "below are", "the following", "as requested",
             "strategic", "insights:", "sure,", "certainly,", "of course,",
@@ -1554,6 +1556,14 @@ def get_risks_and_recommendations(
             line.strip() for line in raw.split("\n")
             if line.strip() and not any(line.strip().lower().startswith(f) for f in _FILLER_STARTS)
         ]
+        print(f"[ai_insights] after filler-filter: {len(ai_insights)} insight(s)")
+        if not ai_insights and raw:
+            print(f"[ai_insights] WARNING: all lines removed by filler-filter. Raw lines were: {raw.splitlines()[:5]}")
+    else:
+        if not include_ai_insights:
+            print("[ai_insights] SKIPPED — include_ai_insights=False")
+        if not action_risks:
+            print("[ai_insights] SKIPPED — no action_risks (no non-trend risks detected)")
 
     # ── Clean _score from output (internal field) ─────────────────────────
     for r in all_risks:
