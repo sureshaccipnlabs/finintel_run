@@ -1536,7 +1536,7 @@ def get_risks_and_recommendations(
             "linked_employees": r.get("linked_employees", []),
             "related_risk_type": r.get("type", ""),
         }
-        for r in action_risks[:limit]
+        for r in action_risks
     ]
 
     # ── Employee scorecards ───────────────────────────────────────────────
