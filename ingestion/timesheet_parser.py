@@ -678,14 +678,23 @@ def _parse_with_patterns(rows, inactive_names=None):
     merged = {}
     for h_idx in fortnight_headers:
         header = rows[h_idx]
-        col_map = _map_columns(header, ["name", "project", "leaves", "working_days", "max_hours", "status"])
+        col_map = _map_columns(header)  # detect all fields dynamically
         fort_data = _extract_employees(rows, h_idx, col_map, inactive_names=inactive_names)
+        _numeric_keys = {"actual_hours", "billable_hours", "expected_hours",
+                         "vacation_days", "leave_days", "holiday_days", "working_days"}
         for name, data in fort_data.items():
             if name not in merged:
-                merged[name] = {k: 0 for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "leave_days", "holiday_days", "working_days"]}
-                merged[name]["project"] = data["project"]
-            for k in ["actual_hours", "billable_hours", "expected_hours", "vacation_days", "leave_days", "holiday_days", "working_days"]:
+                merged[name] = {k: 0 for k in _numeric_keys}
+                # Copy all non-numeric fields (project, designation, rates, etc.)
+                for k, v in data.items():
+                    if k not in _numeric_keys:
+                        merged[name][k] = v
+            for k in _numeric_keys:
                 merged[name][k] += data.get(k, 0)
+            # Carry over any newly seen non-numeric field not yet in merged row
+            for k, v in data.items():
+                if k not in _numeric_keys and not merged[name].get(k):
+                    merged[name][k] = v
 
     # Overlay summary (rates + authoritative totals)
     if summary_headers:
@@ -702,19 +711,10 @@ def _parse_with_patterns(rows, inactive_names=None):
                 sm = _fuzzy_get(name, summary_emps)
                 if sm:
                     matched_names += 1
-                    for k in ["billing_rate", "cost_rate"]:
-                        if sm.get(k):
-                            merged[name][k] = sm[k]
-                    if sm.get("actual_hours"):
-                        merged[name]["actual_hours"] = sm["actual_hours"]
-                    if sm.get("billable_hours"):
-                        merged[name]["billable_hours"] = sm["billable_hours"]
-                    if sm.get("expected_hours"):
-                        merged[name]["expected_hours"] = sm["expected_hours"]
-                    if sm.get("vacation_days"):
-                        merged[name]["vacation_days"] = sm["vacation_days"]
-                    if sm.get("leave_days"):
-                        merged[name]["leave_days"] = sm["leave_days"]
+                    # Dynamically copy every field the summary provides
+                    for k, v in sm.items():
+                        if v is not None and v != "" and v != 0:
+                            merged[name][k] = v
                 else:
                     merged[name].setdefault("billing_rate", 0)
                     merged[name].setdefault("cost_rate", 0)
