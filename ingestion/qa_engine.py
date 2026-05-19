@@ -491,13 +491,24 @@ def _detect_question_scope(question: str, records: list = None) -> dict:
                 # Capitalized word not in data - track as missing and try fuzzy match
                 missing_word = word.replace("'s", "")
                 scope["missing_entities"].append(missing_word)
-                # Try fuzzy match for typo correction
-                all_known = list(actual_projects_original.values()) + list(actual_employees_original.values())
-                suggestion = _fuzzy_match_suggestion(missing_word, all_known)
-                if suggestion:
-                    if "suggestions" not in scope:
-                        scope["suggestions"] = []
-                    scope["suggestions"].append(f"Did you mean '{suggestion}'?")
+                # Pick the right suggestion pool based on what is already detected:
+                # - known employee already found → missing word is likely a project
+                # - known project already found  → missing word is likely an employee
+                # - neither found               → skip suggestion (wrong guess is worse than none)
+                _has_emp_scope  = bool(scope.get("specific_employee"))
+                _has_proj_scope = bool(scope.get("specific_project"))
+                if _has_emp_scope and not _has_proj_scope:
+                    _suggest_pool = list(actual_projects_original.values())
+                elif _has_proj_scope and not _has_emp_scope:
+                    _suggest_pool = list(actual_employees_original.values())
+                else:
+                    _suggest_pool = []  # ambiguous — no suggestion
+                if _suggest_pool:
+                    suggestion = _fuzzy_match_suggestion(missing_word, _suggest_pool)
+                    if suggestion:
+                        if "suggestions" not in scope:
+                            scope["suggestions"] = []
+                        scope["suggestions"].append(f"'{missing_word}' not found. Did you mean '{suggestion}'?")
     else:
         # Fallback: Old behavior when no records provided (capitalized words)
         # Require the capitalized token to be surrounded by non-alphanumeric chars
@@ -2091,10 +2102,19 @@ def _normalize_question(question: str, records: list) -> str:
 
     try:
         corrected = (_llm_generate(_norm_prompt, timeout=30) or "").strip()
-        # Sanity: corrected must be shorter than 3× original and non-empty
-        if corrected and len(corrected) < len(question) * 3:
-            _log("Question normalized: '{}' -> '{}'".format(question, corrected), "debug")
-            return corrected
+        # Reject if corrected is empty or longer than 2× original
+        if not corrected or len(corrected) > len(question) * 2:
+            return question
+        # Reject if LLM introduced NEW capitalized words not present in the original
+        # (e.g. LLM adding "Here" or "Note" or rephrasing entirely)
+        _orig_caps = {w for w in re.findall(r"[A-Z][a-z]+", question)}
+        _corr_caps = {w for w in re.findall(r"[A-Z][a-z]+", corrected)}
+        _new_caps  = _corr_caps - _orig_caps
+        if _new_caps:
+            _log("Normalizer rejected: introduced new cap words {}".format(_new_caps), "debug")
+            return question
+        _log("Question normalized: '{}' -> '{}'".format(question, corrected), "debug")
+        return corrected
     except Exception:
         pass
 
@@ -2246,7 +2266,11 @@ def _try_deterministic_answer(question: str, records: list, scope: dict):
             }
 
     # ── (2) Headcount ─────────────────────────────────────────────────────────
-    if _is_headcount:
+    # Skip simple headcount if the question has a qualifier (underutilized, overutilized, etc.)
+    _has_util_qualifier = bool(re.search(
+        r"\b(under.?util|over.?util|idle|bench|unutili|available|free)", q, re.IGNORECASE
+    ))
+    if _is_headcount and not _has_util_qualifier:
         if _proj:
             count = len({r.get("employee") for r in _scoped if r.get("employee")})
             return {
@@ -2539,15 +2563,83 @@ def ask(question: str, time_range: str = None) -> dict:
             "sources": {},
         }
 
+    # ── Early-return: utilisation queries ────────────────────────────────────
+    _util_re = re.compile(
+        r"\b(underutil|under[\s\-]util|over[\s\-]util|overutil|unutili|idle|bench|low[\s\-]?util|high[\s\-]?util)",
+        re.IGNORECASE,
+    )
+    if _util_re.search(question):
+        _is_over = bool(re.search(r"\b(overutil|over[\s\-]util|high[\s\-]?util)", question, re.IGNORECASE))
+        _util_rows = []
+        _seen_emps: dict = {}
+        for _r in records:
+            _e = _r.get("employee") or ""
+            if not _e:
+                continue
+            if _e not in _seen_emps:
+                _seen_emps[_e] = {"actual": 0.0, "expected": 0.0, "max": 0.0}
+            _seen_emps[_e]["actual"]   += float(_r.get("actual_hours")   or 0)
+            _seen_emps[_e]["expected"] += float(_r.get("expected_hours") or _r.get("max_hours") or 0)
+            _seen_emps[_e]["max"]      += float(_r.get("max_hours") or 0)
+        for _e, _s in _seen_emps.items():
+            _act  = _s["actual"]
+            _exp  = _s["expected"] or _s["max"]
+            if _exp <= 0:
+                continue
+            _util_pct = round(_act / _exp * 100, 1)
+            if _is_over:
+                if _util_pct > 100:
+                    _util_rows.append({"Employee": _e, "Actual Hours": round(_act, 1), "Expected Hours": round(_exp, 1), "Utilisation (%)": _util_pct})
+            else:
+                if _util_pct < 80:
+                    _util_rows.append({"Employee": _e, "Actual Hours": round(_act, 1), "Expected Hours": round(_exp, 1), "Utilisation (%)": _util_pct})
+        _util_rows.sort(key=lambda x: x["Utilisation (%)"], reverse=_is_over)
+        _kind = "over-utilised" if _is_over else "under-utilised"
+        if not _util_rows:
+            return {
+                "summary": "No {} employees found.".format(_kind),
+                "visual_type": "text", "columns": [], "data": [],
+                "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
+            }
+        return {
+            "summary": "{} {} employee(s) found.".format(len(_util_rows), _kind),
+            "visual_type": "table",
+            "columns": ["Employee", "Actual Hours", "Expected Hours", "Utilisation (%)"],
+            "data": _util_rows,
+            "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
+        }
+
     # Early-return if scope detects entities not in the dataset (prevents hallucination)
     _scope_check = _detect_question_scope(question, records)
     _missing = _scope_check.get("missing_entities", [])
     if _missing:
         _suggestions = _scope_check.get("suggestions", [])
-        if _suggestions:
-            _msg = f"'{', '.join(_missing)}' not found. {' '.join(_suggestions)}"
-        else:
-            _msg = f"'{', '.join(_missing)}' not found."
+        _q_lower_ctx = question.lower()
+        _known_projs = sorted({r.get("project") for r in records if r.get("project")})
+        _known_emps  = sorted({r.get("employee") for r in records if r.get("employee")})
+        _parts = []
+        for _m in _missing:
+            # "which project does X work in?" or "X is in which project?" →
+            # the question asks FOR a project, so the missing word is an employee.
+            _asking_which_proj = bool(re.search(r"which project|what project|in which project", _q_lower_ctx))
+            _is_proj_ctx = (
+                any(w in _q_lower_ctx for w in ("project", "client", "account"))
+                and not _asking_which_proj
+            )
+            _is_emp_ctx  = any(w in _q_lower_ctx for w in ("employee", "person", "who", "resource", "staff"))
+            if _is_proj_ctx and not _is_emp_ctx:
+                _entity_type = "project"
+                _known_list  = _known_projs
+            elif _is_emp_ctx or not _is_proj_ctx or _asking_which_proj:
+                _entity_type = "employee"
+                _known_list  = _known_emps
+            else:
+                _entity_type = "name"
+                _known_list  = []
+            _base = f"'{_m}' was not found as a known {_entity_type} in the dataset."
+            _parts.append(_base)
+        _sugg_str = (" " + " ".join(_suggestions)) if _suggestions else ""
+        _msg = " ".join(_parts) + _sugg_str
         _elapsed = time.time() - _start_time
         _log(f"Total time: {_elapsed:.2f}s (validation_error)")
         return {
