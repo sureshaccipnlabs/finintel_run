@@ -19,11 +19,30 @@ import re
 import urllib.request
 import urllib.error
 
+# ── Load .env file from project root (if present) ────────────────────────────
+def _load_dotenv():
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    env_path = os.path.normpath(env_path)
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _key, _, _val = _line.partition("=")
+            _key = _key.strip()
+            _val = _val.strip().strip('"').strip("'")
+            if _key and _key not in os.environ:
+                os.environ[_key] = _val
+
+_load_dotenv()
+
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
 
 OPENAI_URL = os.environ.get("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.5")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
@@ -63,7 +82,6 @@ def _openai_generate(prompt, timeout=60):
     payload = json.dumps({
         "model": OPENAI_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
     }).encode()
 
     req = urllib.request.Request(
@@ -75,13 +93,18 @@ def _openai_generate(prompt, timeout=60):
         },
     )
 
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = json.loads(resp.read().decode())
-        choices = body.get("choices") or []
-        if not choices:
-            return ""
-        message = choices[0].get("message") or {}
-        return message.get("content", "")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode())
+            choices = body.get("choices") or []
+            if not choices:
+                return ""
+            message = choices[0].get("message") or {}
+            return message.get("content", "")
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        print(f"[openai] HTTP {e.code} error body: {error_body[:500]}")
+        raise
 
 
 def _normalized_provider_order() -> list[str]:
@@ -189,6 +212,10 @@ def is_llm_available():
             return True
         if provider == "openai" and is_openai_available():
             return True
+    print(f"[is_llm_available] FALSE — AI_PROVIDER={AI_PROVIDER!r}, "
+          f"ollama={is_ollama_available()}, "
+          f"openai_key_set={bool(OPENAI_API_KEY)}, "
+          f"openai_key_preview={repr(OPENAI_API_KEY[:8]) if OPENAI_API_KEY else 'NOT SET'}")
     return False
 
 
