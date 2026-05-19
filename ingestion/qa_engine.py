@@ -2031,6 +2031,76 @@ def _llm_table_name(summary: str, columns, data) -> str:
     
     return "Data"
 
+# ── Question normalizer (spelling / grammar correction) ──────────────────────
+
+_BASIC_WORDS = {
+    "who", "what", "which", "where", "when", "how", "can", "could", "would",
+    "all", "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "shall", "may", "might",
+    "and", "or", "but", "not", "no", "yes", "if", "then", "than", "that", "this",
+    "in", "on", "at", "to", "of", "by", "for", "with", "from", "into", "out",
+    "up", "down", "over", "under", "between", "more", "less", "most", "least",
+    "one", "two", "three", "many", "some", "any", "every", "each", "both", "only",
+    "their", "there", "they", "them", "him", "her", "his", "its", "our", "your",
+    "show", "list", "give", "tell", "find", "get", "compute", "calculate",
+    "total", "average", "avg", "sum", "count", "top", "bottom", "highest", "lowest",
+    "employee", "employees", "project", "projects", "revenue", "cost", "profit",
+    "margin", "hours", "utilization", "performance", "working", "work", "works",
+    "multiple", "single", "across", "about", "also", "just",
+}
+
+
+def _normalize_question(question: str, records: list) -> str:
+    """
+    If the question contains likely spelling errors (>30% unknown tokens),
+    ask the LLM to correct it. Returns the corrected question, or the original
+    if no correction is needed or LLM is unavailable.
+    Only makes a short, fast LLM call — minimal overhead.
+    """
+    if not question or not question.strip():
+        return question
+
+    # Build known-words set: basic vocab + actual entity names from data
+    known = set(_BASIC_WORDS)
+    if records:
+        for r in records:
+            for f in ("employee", "project"):
+                v = r.get(f, "")
+                if v:
+                    for tok in re.findall(r"[a-z]+", v.lower()):
+                        known.add(tok)
+
+    tokens = re.findall(r"[a-z]+", question.lower())
+    if not tokens:
+        return question
+    unknown_count = sum(1 for t in tokens if t not in known and len(t) > 2)
+    unknown_ratio = unknown_count / len(tokens)
+
+    # Only invoke LLM if >15% of meaningful tokens look misspelled
+    if unknown_ratio < 0.15:
+        return question
+
+    if not is_llm_available():
+        return question
+
+    _norm_prompt = (
+        "Correct any spelling or grammar mistakes in the following question "
+        "and return ONLY the corrected question text, nothing else.\n\n"
+        "Question: {q}"
+    ).format(q=question)
+
+    try:
+        corrected = (_llm_generate(_norm_prompt, timeout=30) or "").strip()
+        # Sanity: corrected must be shorter than 3× original and non-empty
+        if corrected and len(corrected) < len(question) * 3:
+            _log("Question normalized: '{}' -> '{}'".format(question, corrected), "debug")
+            return corrected
+    except Exception:
+        pass
+
+    return question
+
+
 # ── Main Q&A function ───────────────────────────────────────────────────────
 
 def ask(question: str, time_range: str = None) -> dict:
@@ -2054,6 +2124,9 @@ def ask(question: str, time_range: str = None) -> dict:
     # Apply time range filter if specified
     if time_range:
         records = filter_by_range(records, time_range)
+
+    # Normalize spelling/grammar errors before any processing
+    question = _normalize_question(question, records)
 
     # ── Check response cache ──
     data_hash = _compute_dataset_hash(records)
@@ -2257,8 +2330,8 @@ def ask(question: str, time_range: str = None) -> dict:
 
     # Early-return for "employees in multiple projects" queries — fully deterministic.
     _multi_proj_re = re.compile(
-        r"(more than\s*(one|1|\d+)\s*project|multiple project|working in.*(more than|multiple)|"
-        r"employees?.*(multiple|more than|2\+|two).*(project)|"
+        r"(m?ore than\s*(one|1|\d+)\s*project|multiple project|work\w*\s+in.*(m?ore than|multiple)|"
+        r"employees?.*(multiple|m?ore than|2\+|two).*(project)|"
         r"how many project.*employee|which project.*employee|employee.*which project)",
         re.IGNORECASE,
     )
