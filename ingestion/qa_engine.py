@@ -2101,6 +2101,338 @@ def _normalize_question(question: str, records: list) -> str:
     return question
 
 
+# ── Deterministic general query engine ───────────────────────────────────────
+
+def _try_deterministic_answer(question: str, records: list, scope: dict):
+    """
+    Try to answer the question entirely from the dataset without calling the LLM.
+    Returns a complete response dict, or None if the question needs the LLM.
+
+    Handles:
+    • "what is the [revenue/profit/cost/margin/hours] of [project/employee]"
+    • "which project/employee has [highest/lowest/most/least] [metric]"
+    • "total/overall [revenue/profit/cost/margin]"
+    • "list all [employees/projects]"
+    • "how many employees/projects"
+    • "what is the [metric] for [month]"
+    • "leave/vacation/utilisation of [employee]"
+    """
+    if not records:
+        return None
+
+    q = question.lower().strip()
+
+    # Helper: aggregate records by key
+    def _agg(recs, key_fn, val_fns):
+        stats = {}
+        for r in recs:
+            k = key_fn(r)
+            if k is None:
+                continue
+            if k not in stats:
+                stats[k] = {f: 0.0 for f in val_fns}
+            for f, fn in val_fns.items():
+                stats[k][f] += fn(r)
+        return stats
+
+    _fv = lambda f: (lambda r: float(r.get(f) or 0))
+
+    _proj_agg = lambda recs: _agg(
+        recs,
+        lambda r: r.get("project") or "",
+        {"rev": _fv("revenue"), "cost": _fv("cost"),
+         "hrs": _fv("actual_hours"), "b_hrs": _fv("billable_hours")},
+    )
+    _emp_agg = lambda recs: _agg(
+        recs,
+        lambda r: r.get("employee") or "",
+        {"rev": _fv("revenue"), "cost": _fv("cost"),
+         "hrs": _fv("actual_hours"), "leave": _fv("leave_days"),
+         "b_hrs": _fv("billable_hours"), "exp_hrs": _fv("expected_hours")},
+    )
+
+    def _margin(rev, cost):
+        return round((rev - cost) / rev * 100, 2) if rev > 0 else 0.0
+
+    def _proj_rows(stats, filter_proj=None):
+        rows = []
+        for p, s in sorted(stats.items(), key=lambda x: -x[1]["rev"]):
+            if not p:
+                continue
+            if filter_proj and p.lower() != filter_proj.lower():
+                continue
+            rev, cost = s["rev"], s["cost"]
+            rows.append({
+                "Project": p,
+                "Revenue": round(rev, 2),
+                "Cost": round(cost, 2),
+                "Profit": round(rev - cost, 2),
+                "Margin (%)": _margin(rev, cost),
+                "Hours": round(s["hrs"], 2),
+            })
+        return rows
+
+    def _emp_rows(stats, filter_emp=None):
+        rows = []
+        for e, s in sorted(stats.items(), key=lambda x: -x[1]["rev"]):
+            if not e:
+                continue
+            if filter_emp and e.lower() != filter_emp.lower():
+                continue
+            rev, cost = s["rev"], s["cost"]
+            rows.append({
+                "Employee": e,
+                "Revenue": round(rev, 2),
+                "Cost": round(cost, 2),
+                "Profit": round(rev - cost, 2),
+                "Margin (%)": _margin(rev, cost),
+                "Hours": round(s["hrs"], 2),
+                "Leave Days": round(s["leave"], 0),
+            })
+        return rows
+
+    # Scope helpers
+    _proj = scope.get("specific_project")
+    _emp  = scope.get("specific_employee")
+
+    # ── (A) Metric detection ──────────────────────────────────────────────────
+    _is_revenue  = any(w in q for w in ("revenue", "rev", "billing", "billed"))
+    _is_cost     = any(w in q for w in ("cost", "expense", "spend"))
+    _is_profit   = any(w in q for w in ("profit", "pft", "earning", "income"))
+    _is_margin   = any(w in q for w in ("margin", "profitability"))
+    _is_hours    = any(w in q for w in ("hours", "hrs", "hour", "utiliz", "utilis"))
+    _is_leave    = any(w in q for w in ("leave", "vacation", "pto", "absent", "off"))
+    _is_headcount = any(w in q for w in ("headcount", "head count", "how many employee", "number of employee", "count of employee"))
+    _has_metric  = _is_revenue or _is_cost or _is_profit or _is_margin or _is_hours or _is_leave or _is_headcount
+
+    # ── (B) Ranking intent ────────────────────────────────────────────────────
+    _is_highest  = bool(re.search(r"\b(highest|most|top|best|maximum|max|greatest)\b", q))
+    _is_lowest   = bool(re.search(r"\b(lowest|least|bottom|worst|minimum|min|fewest)\b", q))
+    _rank_n_m    = re.search(r"\btop\s+(\d+)\b|\bbottom\s+(\d+)\b", q)
+    _rank_n      = int(_rank_n_m.group(1) or _rank_n_m.group(2)) if _rank_n_m else 1
+
+    # ── (C) Subject: project vs employee ─────────────────────────────────────
+    _asks_project  = bool(re.search(r"\bproject(s)?\b", q))
+    _asks_employee = bool(re.search(r"\b(employee|employees|person|people|resource|who|staff)\b", q))
+    _asks_list     = bool(re.search(r"\b(list|show all|all|every)\b", q))
+
+    # Scope-aware records
+    _scoped = records
+    if _proj:
+        _scoped = [r for r in records if (r.get("project") or "").lower() == _proj.lower()]
+    elif _emp:
+        _scoped = [r for r in records if (r.get("employee") or "").lower() == _emp.lower()]
+
+    # ── (1) List all employees/projects ──────────────────────────────────────
+    if _asks_list and not _has_metric:
+        if _asks_employee and not _asks_project:
+            all_emps = sorted({r.get("employee") for r in _scoped if r.get("employee")})
+            proj_label = f" in {_proj}" if _proj else ""
+            return {
+                "summary": "{} employee(s){}.".format(len(all_emps), proj_label),
+                "visual_type": "table",
+                "columns": ["Employee"],
+                "data": [{"Employee": e} for e in all_emps],
+                "sources": {},
+            }
+        if _asks_project and not _asks_employee:
+            all_projs = sorted({r.get("project") for r in records if r.get("project")})
+            return {
+                "summary": "{} project(s) in the dataset.".format(len(all_projs)),
+                "visual_type": "table",
+                "columns": ["Project"],
+                "data": [{"Project": p} for p in all_projs],
+                "sources": {},
+            }
+
+    # ── (2) Headcount ─────────────────────────────────────────────────────────
+    if _is_headcount:
+        if _proj:
+            count = len({r.get("employee") for r in _scoped if r.get("employee")})
+            return {
+                "summary": "{} employee(s) work on {}.".format(count, _proj),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        if not _asks_project:
+            count = len({r.get("employee") for r in records if r.get("employee")})
+            return {
+                "summary": "Total employees in the dataset: {}.".format(count),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+
+    # ── (3) Specific project metric ───────────────────────────────────────────
+    if _proj and not _emp and _has_metric and not (_is_highest or _is_lowest or _asks_list):
+        if not _scoped:
+            return None  # Let LLM handle (missing entity already caught upstream)
+        proj_stats = _proj_agg(_scoped)
+        rows = _proj_rows(proj_stats)
+        if not rows:
+            return None
+        s = rows[0]
+        if _is_revenue and not _is_profit and not _is_cost and not _is_margin and not _is_hours:
+            return {
+                "summary": "Revenue for {}: ${:,.2f}".format(_proj, s["Revenue"]),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        if _is_profit and not _is_revenue and not _is_cost and not _is_margin:
+            return {
+                "summary": "Profit for {}: ${:,.2f}".format(_proj, s["Profit"]),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        if _is_margin and not _is_revenue:
+            return {
+                "summary": "Margin for {}: {}%".format(_proj, s["Margin (%)"]),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        # Multiple metrics → table
+        return {
+            "summary": "Summary for project {}.".format(_proj),
+            "visual_type": "table",
+            "columns": ["Project", "Revenue", "Cost", "Profit", "Margin (%)", "Hours"],
+            "data": rows,
+            "sources": {},
+        }
+
+    # ── (4) Specific employee metric ──────────────────────────────────────────
+    if _emp and not _asks_project and _has_metric and not (_is_highest or _is_lowest):
+        emp_stats = _emp_agg(_scoped)
+        rows = _emp_rows(emp_stats)
+        if not rows:
+            return None
+        s = rows[0]
+        if _is_leave:
+            return {
+                "summary": "{} has {:.0f} leave day(s).".format(_emp, s["Leave Days"]),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        if _is_revenue and not _is_profit and not _is_cost and not _is_margin:
+            return {
+                "summary": "Revenue for {}: ${:,.2f}".format(_emp, s["Revenue"]),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        return {
+            "summary": "Summary for {}.".format(_emp),
+            "visual_type": "table",
+            "columns": ["Employee", "Revenue", "Cost", "Profit", "Margin (%)", "Hours", "Leave Days"],
+            "data": rows,
+            "sources": {},
+        }
+
+    # ── (5) Ranking: which project/employee has highest/lowest metric ─────────
+    if (_is_highest or _is_lowest) and _has_metric:
+        sort_key = None
+        label = ""
+        if _is_revenue:
+            sort_key, label = "rev", "Revenue"
+        elif _is_profit:
+            sort_key, label = "profit", "Profit"
+        elif _is_cost:
+            sort_key, label = "cost", "Cost"
+        elif _is_margin:
+            sort_key, label = "margin", "Margin"
+        elif _is_hours:
+            sort_key, label = "hrs", "Hours"
+        elif _is_leave:
+            sort_key, label = "leave", "Leave Days"
+
+        if sort_key:
+            # Project ranking
+            if _asks_project and not _asks_employee:
+                proj_stats = _proj_agg(_scoped if _proj else records)
+                ranked = sorted(
+                    [(p, s) for p, s in proj_stats.items() if p],
+                    key=lambda x: x[1].get(sort_key, _margin(x[1]["rev"], x[1]["cost"]) if sort_key == "margin" else 0),
+                    reverse=not _is_lowest,
+                )
+                if not ranked:
+                    return None
+                rows = []
+                for p, s in ranked[:max(_rank_n, 1)]:
+                    rev, cost = s["rev"], s["cost"]
+                    rows.append({
+                        "Project": p,
+                        "Revenue": round(rev, 2),
+                        "Cost": round(cost, 2),
+                        "Profit": round(rev - cost, 2),
+                        "Margin (%)": _margin(rev, cost),
+                        "Hours": round(s["hrs"], 2),
+                    })
+                direction = "lowest" if _is_lowest else "highest"
+                return {
+                    "summary": "Project(s) with {} {} (from dataset).".format(direction, label),
+                    "visual_type": "table",
+                    "columns": ["Project", "Revenue", "Cost", "Profit", "Margin (%)", "Hours"],
+                    "data": rows,
+                    "sources": {},
+                }
+            # Employee ranking
+            if _asks_employee and not _asks_project:
+                emp_stats = _emp_agg(_scoped if _proj else records)
+                ranked = sorted(
+                    [(e, s) for e, s in emp_stats.items() if e],
+                    key=lambda x: x[1].get(sort_key, _margin(x[1]["rev"], x[1]["cost"]) if sort_key == "margin" else 0),
+                    reverse=not _is_lowest,
+                )
+                if not ranked:
+                    return None
+                rows = []
+                for e, s in ranked[:max(_rank_n, 1)]:
+                    rev, cost = s["rev"], s["cost"]
+                    rows.append({
+                        "Employee": e,
+                        "Revenue": round(rev, 2),
+                        "Cost": round(cost, 2),
+                        "Profit": round(rev - cost, 2),
+                        "Margin (%)": _margin(rev, cost),
+                        "Hours": round(s["hrs"], 2),
+                        "Leave Days": round(s["leave"], 0),
+                    })
+                direction = "lowest" if _is_lowest else "highest"
+                proj_label = " in {}".format(_proj) if _proj else ""
+                return {
+                    "summary": "Employee(s) with {} {}{} (from dataset).".format(direction, label, proj_label),
+                    "visual_type": "table",
+                    "columns": ["Employee", "Revenue", "Cost", "Profit", "Margin (%)", "Hours", "Leave Days"],
+                    "data": rows,
+                    "sources": {},
+                }
+
+    # ── (6) Overall/total summary ─────────────────────────────────────────────
+    _total_re = re.compile(
+        r"\b(total|overall|aggregate|combined|all project|all employee|summary)\b", re.IGNORECASE
+    )
+    if _total_re.search(question) and _has_metric and not _proj and not _emp and not (_is_highest or _is_lowest):
+        overall = build_overall_summary(records)
+        if _is_revenue and not _is_profit and not _is_cost and not _is_margin:
+            return {
+                "summary": "Total revenue across all projects: ${:,.2f}".format(overall["total_revenue"]),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        if _is_profit and not _is_revenue and not _is_cost:
+            return {
+                "summary": "Total profit: ${:,.2f}".format(overall["total_profit"]),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        if _is_margin:
+            return {
+                "summary": "Overall average margin: {}%".format(overall["avg_margin_pct"]),
+                "visual_type": "text", "columns": [], "data": [], "sources": {},
+            }
+        # Return full project breakdown table
+        proj_stats = _proj_agg(records)
+        rows = _proj_rows(proj_stats)
+        return {
+            "summary": "Overall summary — Revenue: ${:,.2f}, Profit: ${:,.2f}, Margin: {}%".format(
+                overall["total_revenue"], overall["total_profit"], overall["avg_margin_pct"]),
+            "visual_type": "table",
+            "columns": ["Project", "Revenue", "Cost", "Profit", "Margin (%)", "Hours"],
+            "data": rows,
+            "sources": {},
+        }
+
+    return None  # Fall through to LLM
+
+
 # ── Main Q&A function ───────────────────────────────────────────────────────
 
 def ask(question: str, time_range: str = None) -> dict:
@@ -2429,6 +2761,109 @@ def ask(question: str, time_range: str = None) -> dict:
                 "data": _desig_rows,
                 "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
             }
+
+    # ── Early-return: "at risk / project health" queries ─────────────────────
+    _risk_re = re.compile(
+        r"(which|what|list|show).{0,30}(project|projects).{0,30}(at risk|risk|risky|underperform|danger|loss|low margin|health)"
+        r"|project.{0,20}(health|status|risk|at risk)",
+        re.IGNORECASE,
+    )
+    if _risk_re.search(question) and not _qa_scope.get("specific_employee"):
+        _proj_stats: dict = {}
+        for _r in records:
+            _p = _r.get("project") or ""
+            if not _p:
+                continue
+            if _p not in _proj_stats:
+                _proj_stats[_p] = {"rev": 0.0, "cost": 0.0}
+            _proj_stats[_p]["rev"]  += float(_r.get("revenue") or 0)
+            _proj_stats[_p]["cost"] += float(_r.get("cost")    or 0)
+        _risk_rows = []
+        for _p, _s in sorted(_proj_stats.items()):
+            _rev, _cost = _s["rev"], _s["cost"]
+            _margin = round((_rev - _cost) / _rev * 100, 2) if _rev > 0 else 0.0
+            if _margin < 30:
+                _status = "At Risk" if _margin < 20 else "Watch"
+                _risk_rows.append({
+                    "Project": _p,
+                    "Revenue": round(_rev, 2),
+                    "Cost": round(_cost, 2),
+                    "Profit": round(_rev - _cost, 2),
+                    "Margin (%)": _margin,
+                    "Status": _status,
+                })
+        _risk_rows.sort(key=lambda x: x["Margin (%)"])
+        if not _risk_rows:
+            return {
+                "summary": "All projects are healthy (margin ≥ 30%). No projects at risk.",
+                "visual_type": "text", "columns": [], "data": [],
+                "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
+            }
+        _at_risk_names = [r["Project"] for r in _risk_rows]
+        return {
+            "summary": "{} project(s) at risk (margin < 30%): {}.".format(
+                len(_at_risk_names), ", ".join(_at_risk_names)),
+            "visual_type": "table",
+            "columns": ["Project", "Revenue", "Cost", "Profit", "Margin (%)", "Status"],
+            "data": _risk_rows,
+            "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
+        }
+
+    # ── Early-return: "high/top performing employee in [project]" queries ────
+    _perf_re = re.compile(
+        r"(high|top|best|highest).{0,30}(perform|revenue|profit|contribut).{0,40}(employee|resource|person)"
+        r"|(employee|resource|person).{0,30}(high|top|best|highest).{0,30}(perform|revenue|profit)",
+        re.IGNORECASE,
+    )
+    _specific_proj = _qa_scope.get("specific_project")
+    if _perf_re.search(question) and _specific_proj and not _qa_scope.get("specific_employee"):
+        _proj_emp_stats: dict = {}
+        for _r in records:
+            if (_r.get("project") or "").lower() != _specific_proj.lower():
+                continue
+            _e = _r.get("employee") or ""
+            if not _e:
+                continue
+            if _e not in _proj_emp_stats:
+                _proj_emp_stats[_e] = {"rev": 0.0, "cost": 0.0, "hrs": 0.0}
+            _proj_emp_stats[_e]["rev"]  += float(_r.get("revenue")      or 0)
+            _proj_emp_stats[_e]["cost"] += float(_r.get("cost")         or 0)
+            _proj_emp_stats[_e]["hrs"]  += float(_r.get("actual_hours") or 0)
+        if _proj_emp_stats:
+            _canonical_proj = next(
+                (r.get("project") for r in records if (_r.get("project") or "").lower() == _specific_proj.lower()),
+                _specific_proj,
+            )
+            _top_rows = []
+            for _e, _s in sorted(_proj_emp_stats.items(), key=lambda x: -x[1]["rev"]):
+                _rev, _cost = _s["rev"], _s["cost"]
+                _margin = round((_rev - _cost) / _rev * 100, 2) if _rev > 0 else 0.0
+                _top_rows.append({
+                    "Employee": _e,
+                    "Revenue": round(_rev, 2),
+                    "Cost": round(_cost, 2),
+                    "Profit": round(_rev - _cost, 2),
+                    "Margin (%)": _margin,
+                    "Hours": round(_s["hrs"], 2),
+                })
+            _top_emp = _top_rows[0]["Employee"]
+            return {
+                "summary": "Employee performance in {} (ranked by revenue). Top performer: {} with ${:,.2f}.".format(
+                    _specific_proj, _top_emp, _top_rows[0]["Revenue"]),
+                "visual_type": "table",
+                "columns": ["Employee", "Revenue", "Cost", "Profit", "Margin (%)", "Hours"],
+                "data": _top_rows,
+                "sources": {"total_records": len(records), "time_range": time_range or "ALL"},
+            }
+
+    # ── Deterministic general query engine ───────────────────────────────────
+    # Handles "what is the X of Y", "which project/employee has highest/lowest X",
+    # "total/overall X", "list all employees/projects" — zero LLM involvement.
+    _det = _try_deterministic_answer(question, records, _qa_scope)
+    if _det is not None:
+        _det.setdefault("sources", {})["total_records"] = len(records)
+        _det["sources"]["time_range"] = time_range or "ALL"
+        return _det
 
     _grounding = _compute_grounding_facts(records, _qa_scope)
     context = _get_cached_context(records, question=question)
