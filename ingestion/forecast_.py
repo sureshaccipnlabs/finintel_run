@@ -1313,9 +1313,64 @@ def _estimate_sum_band_pct(series: Dict[str, List[float]], key: str, take: int =
         return 10.0
 
 
+def _build_forecast_description(historical_vals: List[float], forecast_vals: List[float], step_idx: int) -> str:
+    """Generate a human-readable description explaining the forecast value for a given step."""
+    method, _ = _choose_model(historical_vals)
+    method_name = {
+        "lin": "Linear Regression",
+        "sma": "Moving Average (3-month)",
+        "holt": "Holt's Exponential Smoothing",
+    }.get(method, "Statistical model")
+
+    clean_hist = [v for v in historical_vals if isinstance(v, (int, float)) and not math.isnan(v) and v > 0]
+    n_hist = len(clean_hist)
+    last_hist = clean_hist[-1] if clean_hist else 0.0
+
+    # Historical trend context: slope over last 3 months
+    hist_trend_phrase = ""
+    if len(clean_hist) >= 2:
+        window = clean_hist[-3:] if len(clean_hist) >= 3 else clean_hist
+        hist_delta_pct = (window[-1] - window[0]) / window[0] * 100 if window[0] > 0 else 0
+        avg_hist = sum(clean_hist) / n_hist
+        if hist_delta_pct < -2:
+            hist_trend_phrase = f"Historical revenue declined {hist_delta_pct:.1f}% over recent months (avg ${avg_hist:,.0f}/month)."
+        elif hist_delta_pct > 2:
+            hist_trend_phrase = f"Historical revenue grew +{hist_delta_pct:.1f}% over recent months (avg ${avg_hist:,.0f}/month)."
+        else:
+            hist_trend_phrase = f"Historical revenue was stable (avg ${avg_hist:,.0f}/month)."
+
+    if not forecast_vals or step_idx >= len(forecast_vals):
+        return f"{hist_trend_phrase} Method: {method_name} on {n_hist} months of history."
+
+    forecast_val = forecast_vals[step_idx]
+
+    if step_idx == 0:
+        baseline = last_hist
+        basis = "last actual"
+    else:
+        baseline = forecast_vals[step_idx - 1]
+        basis = "prior month forecast"
+
+    if baseline > 0 and forecast_val >= 0:
+        pct_change = (forecast_val - baseline) / baseline * 100
+        sign = "+" if pct_change >= 0 else ""
+        if abs(pct_change) < 2.0:
+            step_trend = "Stable (<2% change)"
+        elif pct_change > 0:
+            step_trend = f"Increasing ({sign}{pct_change:.1f}% vs {basis})"
+        else:
+            step_trend = f"Declining ({pct_change:.1f}% vs {basis})"
+    else:
+        step_trend = "Trend unavailable"
+
+    # Note: use em-dash (not pipe) as separator to avoid breaking _extract_rows pipe-split
+    return f"{step_trend}. {hist_trend_phrase} Method: {method_name} on {n_hist} months of history."
+
+
 def _format_month_line(idx: int, label: str, metrics: List[str], fmap: Dict[str, List[float]], step_idx: int,
                        group_type: Optional[str] = None, group_name: Optional[str] = None,
-                       adj_map: Optional[Dict[str, Dict[str, dict]]] = None) -> str:
+                       adj_map: Optional[Dict[str, Dict[str, dict]]] = None,
+                       description: Optional[str] = None) -> str:
     parts: List[str] = []
     adj_map = adj_map or {}
 
@@ -1360,6 +1415,8 @@ def _format_month_line(idx: int, label: str, metrics: List[str], fmap: Dict[str,
     lead = f"- Month: {label}"
     if group_type and group_name:
         lead += f" | {group_type.capitalize()}: {group_name}"
+    if description:
+        parts.append(f"Description: {description}")
     return lead + " | " + " | ".join(parts)
 
 
@@ -1796,9 +1853,10 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
             for idx, d in enumerate(explicit_months, start=1):
                 step = max(1, (d.year - base.year) * 12 + (d.month - base.month))
                 label = d.strftime("%B %Y")
+                desc = _build_forecast_description(ser.get("revenue", []), fmap.get("revenue", []), step - 1)
                 lines.append(
                     _format_month_line(idx, label, metrics, fmap, step - 1, None if scope == "overall" else group_type,
-                                       None if scope == "overall" else gname, adj_map))
+                                       None if scope == "overall" else gname, adj_map, desc))
         header = ", ".join([d.strftime("%B %Y") for d in explicit_months])
         return f"Estimate — {header} —\n" + "\n".join(lines)
 
@@ -1917,8 +1975,9 @@ def try_answer_forecast(question: str, records: List[dict] = None) -> Optional[s
         fmap = _forecast_for_series(ser, steps)
         for i in range(steps):
             label = _add_months(base, i + 1).strftime("%B %Y")
+            desc = _build_forecast_description(ser.get("revenue", []), fmap.get("revenue", []), i)
             lines.append(_format_month_line(i + 1, label, metrics, fmap, i, None if scope == "overall" else group_type,
-                                            None if scope == "overall" else gname, adj_map))
+                                            None if scope == "overall" else gname, adj_map, desc))
     if steps == 1:
         return "Estimate — Next month —\n" + "\n".join(lines)
     return f"Estimate — Next {steps} months —\n" + "\n".join(lines)

@@ -1643,6 +1643,7 @@ def _format_column_name(col: str) -> str:
         "cost_rate": "Cost Rate",
         "actual_hours": "Actual Hours",
         "billable_hours": "Billable Hours",
+        "description": "How Forecasted",
     }
     
     col_lower = col.lower().strip()
@@ -1746,11 +1747,14 @@ def _pivot_table_if_needed(data: list, columns: list) -> tuple:
     entity_col = None
     metric_cols = []
     
+    _non_metric = {"description"}
     for i, c in enumerate(cols_lower):
         if c in ("month", "quarter") and month_col is None:
             month_col = columns[i]
         elif c in ("employee", "project") and entity_col is None:
             entity_col = columns[i]
+        elif c in _non_metric:
+            pass  # skip narrative/text columns — they don't pivot per month
         else:
             metric_cols.append(columns[i])
     
@@ -1872,6 +1876,56 @@ def _format_data_keys(data: list, columns: list) -> list:
         formatted_data.append(new_row)
     
     return formatted_data
+
+
+def _build_forecast_narrative(rows: list, table_name: str) -> str:
+    """Build a human-readable statement + reason from parsed forecast rows."""
+    if not rows:
+        return table_name
+
+    employees = {}
+    for row in rows:
+        emp = row.get("employee") or "Overall"
+        employees.setdefault(emp, []).append(row)
+
+    parts = []
+    for emp, emp_rows in employees.items():
+        rev_entries = [
+            (r.get("month", ""), r.get("revenue"))
+            for r in emp_rows
+            if r.get("revenue") is not None
+        ]
+        if not rev_entries:
+            continue
+
+        months_str = ", ".join(
+            f"{m}: ${v:,.2f}" for m, v in rev_entries
+        )
+
+        # Overall trend across forecast window
+        first_v, last_v = rev_entries[0][1], rev_entries[-1][1]
+        if len(rev_entries) >= 2 and first_v and first_v > 0:
+            overall_pct = (last_v - first_v) / first_v * 100
+            if overall_pct < -2:
+                trend_phrase = f"declining {overall_pct:.1f}% over the forecast period"
+            elif overall_pct > 2:
+                trend_phrase = f"increasing +{overall_pct:.1f}% over the forecast period"
+            else:
+                trend_phrase = "remaining stable over the forecast period"
+        else:
+            trend_phrase = "forecasted"
+
+        subject = "Forecast revenue" if emp == "Overall" else f"{emp}'s forecast revenue"
+        sentence = f"{subject} is {trend_phrase}: {months_str}."
+
+        # Description from first row contains historical context + method (no pipe, safe to use as-is)
+        desc = (emp_rows[0].get("description") or "").strip()
+        if desc:
+            sentence += f" Reason: {desc}"
+
+        parts.append(sentence)
+
+    return " ".join(parts) if parts else table_name
 
 
 def _forecast_table_name(header: str) -> str:
@@ -2554,6 +2608,7 @@ def ask(question: str, time_range: str = None) -> dict:
                 "vacation_days", "vacation_days_variance",
                 "holiday_days", "holiday_days_variance",
                 "working_days", "working_days_variance",
+                "description",
             ]
             present = []
             for c in preferred_cols:
@@ -2562,7 +2617,11 @@ def ask(question: str, time_range: str = None) -> dict:
             data = [{k: r.get(k) for k in present} for r in rows]
             header = fc_answer.splitlines()[0].strip()
             table_name = _forecast_table_name(header)
-            
+            narrative = _build_forecast_narrative(
+                [{k: r.get(k) for k in list(present) + ["description"]} for r in rows],
+                table_name,
+            )
+
             # Pivot table if it has repeating entity+month combinations
             data, present = _pivot_table_if_needed(data, present)
             
@@ -2570,7 +2629,7 @@ def ask(question: str, time_range: str = None) -> dict:
             formatted_cols = _format_columns(present)
             formatted_data = _format_data_keys(data, present)
             return {
-                "summary": table_name,
+                "summary": narrative,
                 "visual_type": "table",
                 "columns": formatted_cols,
                 "data": formatted_data,
